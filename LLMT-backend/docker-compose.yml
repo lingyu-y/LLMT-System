@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+  # 1. 关系型数据库 (存储用户信息、任务配置等)
+  postgres:
+    image: postgres:13
+    container_name: llmt-postgres
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: llmt_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  # 2. 对象存储 (存储数据集、模型文件、Checkpoint)
+  minio:
+    image: minio/minio
+    container_name: llmt-minio
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password123
+    ports:
+      - "9000:9000" # API 端口
+      - "9001:9001" # Web 控制台端口
+    command: server /data --console-address ":9001"
+    volumes:
+      - miniodata:/data
+
+  # 3. 时序数据库 (存储训练指标如 Loss 曲线、资源利用率等)
+  influxdb:
+    image: influxdb:2.0
+    container_name: llmt-influxdb
+    ports:
+      - "8086:8086"
+    volumes:
+      - influxdata:/var/lib/influxdb2
+
+  # 4. 日志存储 (存储应用日志、访问日志)
+  elasticsearch:
+    image: elasticsearch:7.17.0
+    container_name: llmt-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+
+volumes:
+  pgdata:
+  miniodata:
+  influxdata:
+  esdata:
