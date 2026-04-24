@@ -1,56 +1,64 @@
-version: '3.8'
-
 services:
-  # 1. 关系型数据库 (存储用户信息、任务配置等)
+  # 结构化业务数据：用户、角色权限、训练任务、模型和数据集元数据
   postgres:
-    image: postgres:13
+    image: postgres:16
     container_name: llmt-postgres
     environment:
-      POSTGRES_USER: admin
-      POSTGRES_PASSWORD: password
-      POSTGRES_DB: llmt_db
+      POSTGRES_DB: ${POSTGRES_DB:-llmt_system}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
     ports:
       - "5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - llmt_postgres_data:/var/lib/postgresql/data
 
-  # 2. 对象存储 (存储数据集、模型文件、Checkpoint)
-  minio:
-    image: minio/minio
-    container_name: llmt-minio
-    environment:
-      MINIO_ROOT_USER: admin
-      MINIO_ROOT_PASSWORD: password123
-    ports:
-      - "9000:9000" # API 端口
-      - "9001:9001" # Web 控制台端口
-    command: server /data --console-address ":9001"
-    volumes:
-      - miniodata:/data
-
-  # 3. 时序数据库 (存储训练指标如 Loss 曲线、资源利用率等)
+  # 时序指标数据：loss、accuracy、learning rate、GPU、显存、通信延迟
   influxdb:
-    image: influxdb:2.0
+    image: influxdb:2.7
     container_name: llmt-influxdb
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: admin
+      DOCKER_INFLUXDB_INIT_PASSWORD: adminadmin
+      DOCKER_INFLUXDB_INIT_ORG: ${INFLUXDB_ORG:-llmt}
+      DOCKER_INFLUXDB_INIT_BUCKET: ${INFLUXDB_BUCKET:-training_metrics}
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUXDB_TOKEN:-change-this-influxdb-token}
     ports:
       - "8086:8086"
     volumes:
-      - influxdata:/var/lib/influxdb2
+      - llmt_influxdb_data:/var/lib/influxdb2
+      - llmt_influxdb_config:/etc/influxdb2
 
-  # 4. 日志存储 (存储应用日志、访问日志)
+  # 对象存储：数据集文件、模型文件、Checkpoint、导出文档
+  minio:
+    image: minio/minio:latest
+    container_name: llmt-minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - llmt_minio_data:/data
+
+  # 日志检索：系统日志、操作日志、训练日志、异常告警日志
   elasticsearch:
-    image: elasticsearch:7.17.0
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
     container_name: llmt-elasticsearch
     environment:
-      - discovery.type=single-node
-      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
     ports:
       - "9200:9200"
     volumes:
-      - esdata:/usr/share/elasticsearch/data
+      - llmt_elasticsearch_data:/usr/share/elasticsearch/data
 
 volumes:
-  pgdata:
-  miniodata:
-  influxdata:
-  esdata:
+  llmt_postgres_data:
+  llmt_influxdb_data:
+  llmt_influxdb_config:
+  llmt_minio_data:
+  llmt_elasticsearch_data:
