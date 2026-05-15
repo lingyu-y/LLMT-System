@@ -23,13 +23,21 @@ from app.repositories import log_repository
 
 _connected_clients: list[WebSocket] = []
 _lock = threading.Lock()
+_main_loop: asyncio.AbstractEventLoop | None = None
 
 _ES_INDEX = "system-logs"
 
 
 def register_ws_client(websocket: WebSocket) -> None:
+    global _main_loop
     with _lock:
         _connected_clients.append(websocket)
+    # Capture the ASGI event loop from the WebSocket accept handler (runs on it).
+    if _main_loop is None:
+        try:
+            _main_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
 
 
 def unregister_ws_client(websocket: WebSocket) -> None:
@@ -39,20 +47,16 @@ def unregister_ws_client(websocket: WebSocket) -> None:
 
 
 def _broadcast_sync(entry: dict) -> None:
-    """Called from a synchronous context; schedules async broadcast."""
+    """Thread-safe: schedules async sends on the captured main event loop."""
     with _lock:
         clients = list(_connected_clients)
-    if not clients:
+    if not clients or _main_loop is None or not _main_loop.is_running():
         return
     payload = json.dumps(entry, ensure_ascii=False)
     for ws in clients:
-        try:
-            # WebSocket.send_text is async, so we schedule it on the event loop.
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.ensure_future(_safe_send(ws, payload))
-        except RuntimeError:
-            pass  # no event loop available, skip broadcast
+        _main_loop.call_soon_threadsafe(
+            lambda w=ws, p=payload: asyncio.ensure_future(_safe_send(w, p))
+        )
 
 
 async def _safe_send(ws: WebSocket, payload: str) -> None:

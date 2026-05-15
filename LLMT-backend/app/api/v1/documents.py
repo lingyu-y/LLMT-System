@@ -99,15 +99,20 @@ def create_draft(
     return success_response(draft, "草稿保存成功")
 
 
+def _require_owner(draft: dict | None, current_user: User) -> dict:
+    if draft is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="草稿不存在")
+    if draft["user_id"] != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权操作此草稿")
+    return draft
+
+
 @router.get("/drafts/{draft_id}")
 def get_draft(
     draft_id: str,
     current_user: User = Depends(get_current_user),
 ):
-    draft = document_repository.get_draft(draft_id)
-    if draft is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="草稿不存在")
-    return success_response(draft)
+    return success_response(_require_owner(document_repository.get_draft(draft_id), current_user))
 
 
 @router.put("/drafts/{draft_id}")
@@ -116,9 +121,7 @@ def update_draft(
     body: DraftUpdate,
     current_user: User = Depends(get_current_user),
 ):
-    draft = document_repository.get_draft(draft_id)
-    if draft is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="草稿不存在")
+    _require_owner(document_repository.get_draft(draft_id), current_user)
     updated = document_repository.update_draft(draft_id, **body.model_dump(exclude_unset=True))
     return success_response(updated, "草稿修改成功")
 
@@ -128,8 +131,8 @@ def delete_draft(
     draft_id: str,
     current_user: User = Depends(get_current_user),
 ):
-    if not document_repository.delete_draft(draft_id):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="草稿不存在")
+    _require_owner(document_repository.get_draft(draft_id), current_user)
+    document_repository.delete_draft(draft_id)
     return success_response(message="草稿删除成功")
 
 
@@ -142,22 +145,20 @@ def delete_draft(
 def export_document(
     draft_id: str,
     fmt: str = Query("md", description="导出格式: md | html | pdf"),
-    _current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
+    _require_owner(document_repository.get_draft(draft_id), current_user)
     result = document_repository.export_draft(draft_id, fmt=fmt)
-    if result is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在")
     return success_response(result, "导出成功")
 
 
 @router.get("/{draft_id}/download")
 def download_document(
     draft_id: str,
-    _current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
+    _require_owner(document_repository.get_draft(draft_id), current_user)
     draft = document_repository.get_draft(draft_id)
-    if draft is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在")
     return success_response(
         {"filename": f"{draft['title']}.md", "content": draft["content"], "size": len(draft["content"])},
         "下载就绪",
