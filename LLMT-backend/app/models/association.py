@@ -21,3 +21,10 @@ role_permissions = Table(
         primary_key=True,
     ),
 )
+
+role_menus = Table(
+    "role_menus",
+    Base.metadata,
+    Column("role_id", ForeignKey("roles.id", ondelete="CASCADE"), primary_key=True),
+    Column("menu_id", ForeignKey("menus.id", ondelete="CASCADE"), primary_key=True),
+)
