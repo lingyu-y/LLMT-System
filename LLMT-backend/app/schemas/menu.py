@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 
 class MenuTreeOut(BaseModel):
@@ -17,6 +17,11 @@ class MenuTreeOut(BaseModel):
     children: list["MenuTreeOut"] = []
 
     model_config = {"from_attributes": True}
+
+    @field_validator("children", mode="before")
+    @classmethod
+    def _default_children(cls, v):
+        return v if v is not None else []
 
 
 class PermissionListOut(BaseModel):

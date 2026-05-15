@@ -24,7 +24,7 @@ router = APIRouter(prefix="/system", tags=["系统管理"])
 # ============================================================================
 
 @router.get("/users")
-def list_users(       # 已验证功能正常   用户列表
+def list_users(    
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     keyword: str = Query("", description="搜索用户名/姓名/邮箱"),
@@ -40,7 +40,7 @@ def list_users(       # 已验证功能正常   用户列表
 
 
 @router.post("/users", status_code=status.HTTP_201_CREATED)
-def create_user(
+def create_user(    
     body: UserCreate,
     db: Session = Depends(get_db),
     _admin=Depends(require_admin),
