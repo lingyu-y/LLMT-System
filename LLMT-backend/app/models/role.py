@@ -34,3 +34,8 @@ class Role(IdMixin, TimestampMixin, Base):
         secondary=role_permissions,
         back_populates="roles",
     )
+    menus: Mapped[list["Menu"]] = relationship(
+        "Menu",
+        secondary="role_menus",
+        back_populates="roles",
+    )
