@@ -73,7 +73,8 @@ def import_model(
     bucket = settings.MINIO_BUCKET_MODELS
     target_prefix = f"models/{body.model_code}/{body.version}"
 
-    objects = list(minio.list_objects(bucket, prefix=body.source_path, recursive=True))
+    src_prefix = body.source_path.rstrip("/") + "/"
+    objects = list(minio.list_objects(bucket, prefix=src_prefix, recursive=True))
     files = [o for o in objects if not o.is_dir]
     if not files:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="源路径未找到文件")
@@ -81,7 +82,7 @@ def import_model(
     from minio.commonconfig import CopySource
 
     for obj in files:
-        target_name = obj.object_name.replace(body.source_path.rstrip("/"), target_prefix, 1)
+        target_name = obj.object_name.replace(src_prefix, target_prefix + "/", 1)
         minio.copy_object(bucket, target_name, CopySource(bucket, obj.object_name))
 
     model = model_repository.create_model(
@@ -112,7 +113,7 @@ def export_model(
     settings = get_settings()
     minio = get_minio_client()
     bucket = settings.MINIO_BUCKET_MODELS
-    source_prefix = model.storage_path
+    source_prefix = model.storage_path.rstrip("/") + "/"
 
     objects = list(minio.list_objects(bucket, prefix=source_prefix, recursive=True))
     files = [o for o in objects if not o.is_dir]
@@ -121,10 +122,10 @@ def export_model(
 
     from minio.commonconfig import CopySource
 
-    target = body.target_path.rstrip("/")
+    target = body.target_path.rstrip("/") + "/"
     copied = 0
     for obj in files:
-        target_name = obj.object_name.replace(source_prefix.rstrip("/"), target, 1)
+        target_name = obj.object_name.replace(source_prefix, target, 1)
         minio.copy_object(bucket, target_name, CopySource(bucket, obj.object_name))
         copied += 1
 
@@ -232,7 +233,7 @@ def download_model_version(
     settings = get_settings()
     minio = get_minio_client()
     bucket = settings.MINIO_BUCKET_MODELS
-    prefix = model.storage_path
+    prefix = model.storage_path.rstrip("/") + "/"
 
     objects = list(minio.list_objects(bucket, prefix=prefix, recursive=True))
     files = [o for o in objects if not o.is_dir]
@@ -305,6 +306,15 @@ def get_security_reports(
     return success_response(reports)
 
 
+DEFAULT_LIMITS = {
+    "requests_per_minute": 100,
+    "requests_per_hour": 5000,
+    "requests_per_day": 100000,
+    "concurrent": 10,
+    "max_tokens_per_request": 4096,
+}
+
+
 @router.get("/{model_code}/rate-limit")
 def get_rate_limit(
     model_code: str,
@@ -314,16 +324,14 @@ def get_rate_limit(
     if model is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型不存在")
 
+    stored = model.hyperparams_json.get("rate_limit") or {}
+    enabled = stored.get("enabled", True)
+    limits = {**DEFAULT_LIMITS, **stored.get("limits", {})}
+
     return success_response({
         "model_code": model.model_code,
-        "enabled": True,
-        "limits": {
-            "requests_per_minute": 100,
-            "requests_per_hour": 5000,
-            "requests_per_day": 100000,
-            "concurrent": 10,
-            "max_tokens_per_request": 4096,
-        },
+        "enabled": enabled,
+        "limits": limits,
         "updated_at": model.updated_at.isoformat() if model.updated_at else None,
     })
 
@@ -339,27 +347,29 @@ def update_rate_limit(
     if model is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型不存在")
 
-    limits = {
-        "requests_per_minute": 100,
-        "requests_per_hour": 5000,
-        "requests_per_day": 100000,
-        "concurrent": 10,
-        "max_tokens_per_request": 4096,
-    }
+    stored = model.hyperparams_json.get("rate_limit") or {}
+    enabled = body.enabled if body.enabled is not None else stored.get("enabled", True)
+    limits = {**DEFAULT_LIMITS, **stored.get("limits", {})}
+    updates: dict[str, int] = {}
     if body.requests_per_minute is not None:
-        limits["requests_per_minute"] = body.requests_per_minute
+        updates["requests_per_minute"] = body.requests_per_minute
     if body.requests_per_hour is not None:
-        limits["requests_per_hour"] = body.requests_per_hour
+        updates["requests_per_hour"] = body.requests_per_hour
     if body.requests_per_day is not None:
-        limits["requests_per_day"] = body.requests_per_day
+        updates["requests_per_day"] = body.requests_per_day
     if body.concurrent is not None:
-        limits["concurrent"] = body.concurrent
+        updates["concurrent"] = body.concurrent
     if body.max_tokens_per_request is not None:
-        limits["max_tokens_per_request"] = body.max_tokens_per_request
+        updates["max_tokens_per_request"] = body.max_tokens_per_request
+    limits.update(updates)
+
+    model.hyperparams_json = {**model.hyperparams_json, "rate_limit": {"enabled": enabled, "limits": limits}}
+    db.commit()
+    db.refresh(model)
 
     return success_response({
         "model_code": model.model_code,
-        "enabled": body.enabled if body.enabled is not None else True,
+        "enabled": enabled,
         "limits": limits,
         "updated_at": model.updated_at.isoformat() if model.updated_at else None,
     }, "限流策略已更新")
