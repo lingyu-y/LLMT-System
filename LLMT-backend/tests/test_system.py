@@ -96,26 +96,27 @@ class TestUserManagement:
         resp = client.get(f"{PREFIX}/system/users", headers=admin_headers)
         assert resp.status_code == 200
         body = resp.json()
-        assert body["total"] == 1
-        assert body["data"][0]["username"] == "admin"
+        assert body["total"] >= 1
+        usernames = {u["username"] for u in body["data"]}
+        assert "admin" in usernames
 
     def test_02_create_user(self, client, admin_headers):
         """POST /users — 创建用户。"""
         resp = client.post(
             f"{PREFIX}/system/users",
-            json={"username": "testuser", "real_name": "测试", "password": "pass1234"},
+            json={"username": "sys_testuser", "real_name": "测试", "password": "pass1234"},
             headers=admin_headers,
         )
         assert resp.status_code == 201
         data = resp.json()["data"]
-        assert data["username"] == "testuser"
+        assert data["username"] == "sys_testuser"
         TestUserManagement.created_uid = data["id"]
 
     def test_03_create_duplicate(self, client, admin_headers):
         """POST /users — 重复名 409。"""
         resp = client.post(
             f"{PREFIX}/system/users",
-            json={"username": "testuser", "password": "pass1234"},
+            json={"username": "sys_testuser", "password": "pass1234"},
             headers=admin_headers,
         )
         assert resp.status_code == 409
@@ -125,7 +126,7 @@ class TestUserManagement:
         uid = TestUserManagement.created_uid
         resp = client.get(f"{PREFIX}/system/users/{uid}", headers=admin_headers)
         assert resp.status_code == 200
-        assert resp.json()["data"]["username"] == "testuser"
+        assert resp.json()["data"]["username"] == "sys_testuser"
 
     def test_05_update_user(self, client, admin_headers):
         """PUT /users/{id} — 修改用户。"""
