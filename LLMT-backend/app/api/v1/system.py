@@ -4,8 +4,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.responses import paginated_response, success_response
-from app.dependencies.auth import require_admin
+from app.dependencies.auth import get_current_user, require_admin
 from app.dependencies.db import get_db
+from app.models.user import User
 from app.repositories import log_repository, user_repository
 from app.schemas.user import (
     UserCreate,
@@ -291,6 +292,14 @@ def list_permissions(
     return success_response([PermissionListOut.model_validate(p) for p in perms])
 
 
+@router.get("/permissions/current")
+def get_current_user_permissions(
+    current_user: User = Depends(get_current_user),
+):
+    codes = list({perm.code for role in current_user.roles for perm in role.permissions})
+    return success_response(codes)
+
+
 @router.get("/menus")
 def get_menu_tree(
     db: Session = Depends(get_db),
@@ -298,6 +307,34 @@ def get_menu_tree(
 ):
     roots = menu_repository.get_menu_tree(db)
     return success_response([MenuTreeOut.model_validate(m) for m in roots])
+
+
+@router.get("/menus/current")
+def get_current_user_menus(
+    current_user: User = Depends(get_current_user),
+):
+    menu_set = {}
+    for role in current_user.roles:
+        for menu in role.menus:
+            menu_set[menu.id] = menu
+
+    all_menus = list(menu_set.values())
+    roots = [m for m in all_menus if m.parent_id is None]
+
+    def build_children(parent):
+        children = [m for m in all_menus if m.parent_id == parent.id]
+        return {
+            "id": parent.id,
+            "key": parent.key,
+            "name": parent.name,
+            "path": parent.path,
+            "icon": parent.icon,
+            "parent_id": parent.parent_id,
+            "sort_order": parent.sort_order,
+            "children": [build_children(c) for c in sorted(children, key=lambda x: x.sort_order)],
+        }
+
+    return success_response([build_children(r) for r in sorted(roots, key=lambda x: x.sort_order)])
 
 
 @router.get("/roles/{role_id}/menus")
@@ -346,8 +383,6 @@ import json  # noqa: E402
 from datetime import datetime  # noqa: E402
 
 from fastapi import WebSocket, WebSocketDisconnect  # noqa: E402
-from app.dependencies.auth import get_current_user  # noqa: E402
-from app.models.user import User  # noqa: E402
 
 
 @router.get("/logs")
