@@ -25,7 +25,10 @@ class Menu(IdMixin, TimestampMixin, Base):
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
 
     children: Mapped[list["Menu"]] = relationship(
-        "Menu", backref="parent", remote_side="Menu.id", lazy="selectin"
+        "Menu", back_populates="parent", lazy="selectin"
+    )
+    parent: Mapped[Optional["Menu"]] = relationship(
+        "Menu", back_populates="children", remote_side="Menu.id", lazy="selectin"
     )
     roles: Mapped[list["Role"]] = relationship(
         "Role", secondary="role_menus", back_populates="menus"
