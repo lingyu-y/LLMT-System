@@ -1,6 +1,11 @@
 """System management endpoints -- users, roles, menus, permissions, logs."""
 
+import csv
+import io
+from urllib.parse import quote
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.core.responses import paginated_response, success_response
@@ -382,8 +387,19 @@ def save_role_menus(
 import asyncio  # noqa: E402
 import json  # noqa: E402
 from datetime import datetime  # noqa: E402
+from zoneinfo import ZoneInfo  # noqa: E402
 
 from fastapi import WebSocket, WebSocketDisconnect  # noqa: E402
+
+BEIJING_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def _format_beijing_time(value: datetime | None) -> str:
+    if value is None:
+        return ""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=ZoneInfo("UTC"))
+    return value.astimezone(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 @router.get("/logs")
@@ -411,7 +427,7 @@ def list_logs(
             "action": lg.action, "resource": lg.resource,
             "resource_id": lg.resource_id, "detail": lg.detail,
             "ip_address": lg.ip_address,
-            "created_at": lg.created_at.isoformat() if lg.created_at else None,
+            "created_at": _format_beijing_time(lg.created_at),
         }
         for lg in logs
     ]
@@ -434,16 +450,28 @@ def export_logs(
         keyword=keyword, action=action, resource=resource,
         username=username, start_date=start_date, end_date=end_date,
     )
-    lines = [
-        "\t".join([
-            str(lg.id), lg.username, lg.action, lg.resource,
-            lg.detail, lg.ip_address,
-            lg.created_at.isoformat() if lg.created_at else "",
+    output = io.StringIO()
+    output.write("\ufeff")
+    writer = csv.writer(output)
+    writer.writerow(["ID", "用户名", "操作", "资源", "资源ID", "详情", "IP", "时间"])
+    for lg in logs:
+        writer.writerow([
+            lg.id,
+            lg.username,
+            lg.action,
+            lg.resource,
+            lg.resource_id or "",
+            lg.detail,
+            lg.ip_address,
+            _format_beijing_time(lg.created_at),
         ])
-        for lg in logs
-    ]
-    header = "\t".join(["ID", "用户名", "操作", "资源", "详情", "IP", "时间"])
-    return success_response({"header": header, "lines": lines, "total": len(lines)})
+
+    filename = quote("system-logs.csv")
+    return StreamingResponse(
+        iter([output.getvalue().encode("utf-8")]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"},
+    )
 
 
 @router.get("/my-logs")
@@ -461,7 +489,7 @@ def get_my_logs(
             "id": lg.id, "username": lg.username,
             "action": lg.action, "resource": lg.resource,
             "detail": lg.detail, "ip_address": lg.ip_address,
-            "created_at": lg.created_at.isoformat() if lg.created_at else None,
+            "created_at": _format_beijing_time(lg.created_at),
         }
         for lg in logs
     ]
