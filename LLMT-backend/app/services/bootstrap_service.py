@@ -38,6 +38,18 @@ def _get_or_create_role(db: Session, name: str, role_type: str, description: str
     return role
 
 
+def _create_admin_user(db: Session, admin_role: Role) -> None:
+    admin = User(
+        username=ADMIN_USERNAME,
+        real_name="系统管理员",
+        password_hash=hash_password(ADMIN_PASSWORD),
+        status="active",
+        is_superuser=True,
+    )
+    admin.roles = [admin_role]
+    db.add(admin)
+
+
 def _ensure_menus(db: Session) -> list[Menu]:
     created: dict[str, Menu] = {}
     for definition in MENU_DEFINITIONS:
@@ -71,16 +83,7 @@ def ensure_bootstrap_data() -> None:
 
         admin = db.query(User).filter(User.username == ADMIN_USERNAME).first()
         if admin is None:
-            admin = User(
-                username=ADMIN_USERNAME,
-                real_name="系统管理员",
-            )
-            db.add(admin)
-        admin.real_name = admin.real_name or "系统管理员"
-        admin.password_hash = hash_password(ADMIN_PASSWORD)
-        admin.status = "active"
-        admin.is_superuser = True
-        admin.roles = [admin_role]
+            _create_admin_user(db, admin_role)
 
         db.commit()
     except SQLAlchemyError:
@@ -97,8 +100,10 @@ def ensure_bootstrap_data() -> None:
             return
 
         menus = _ensure_menus(db)
-        admin_role.menus = menus
-        user_role.menus = [menu for menu in menus if menu.key in {"dashboard", "document"}]
+        if not admin_role.menus:
+            admin_role.menus = menus
+        if not user_role.menus:
+            user_role.menus = [menu for menu in menus if menu.key in {"dashboard", "document"}]
         db.commit()
     except SQLAlchemyError:
         db.rollback()
