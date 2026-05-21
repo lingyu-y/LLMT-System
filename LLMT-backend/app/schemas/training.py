@@ -29,6 +29,8 @@ class PrivacyConfigRequest(BaseModel):
 class TrainingConfigDict(BaseModel):
     """Training hyper-params + model + strategy config, stored in config_json."""
 
+    model_config = {"protected_namespaces": ()}
+
     # Model
     model_type: str = "gpt2"
     vocab_size: int = 50257
@@ -90,6 +92,19 @@ class TrainingTaskCreate(BaseModel):
         "ddp", "zero1", "zero2", "zero3", "zero3_offload", "tp", "pp", "3d",
     ] = "zero2"
     config: TrainingConfigDict = Field(default_factory=TrainingConfigDict)
+
+
+class SubmitTaskRequest(BaseModel):
+    """Request body for submitting an existing created training task."""
+
+    task_code: str = Field(..., min_length=1, max_length=64)
+
+
+class ScaleTaskRequest(BaseModel):
+    """Request body for scaling a running or paused training task."""
+
+    gpu_count: int = Field(..., ge=1, le=64)
+    parallel_strategy: Optional[str] = Field(default=None, max_length=64)
 
 
 # ---------------------------------------------------------------------------
