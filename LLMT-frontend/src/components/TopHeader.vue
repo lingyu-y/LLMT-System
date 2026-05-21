@@ -6,21 +6,27 @@
       <strong>{{ pageTitle }}</strong>
     </div>
 
-    <div class="header-right">
-      <el-input v-model="keyword" class="search" placeholder="搜索功能、模型、数据..." :prefix-icon="Search" clearable />
-      <el-button :icon="Bell" circle />
-      <el-button :icon="QuestionFilled" circle />
-    </div>
+    <el-button :icon="QuestionFilled" circle @click="helpVisible = true" />
+
+    <el-dialog v-model="helpVisible" title="使用提示" width="520px">
+      <div class="help-content">
+        <p>这里展示系统使用提示占位内容。</p>
+        <p>后续可以补充登录账号、菜单权限、训练任务和日志查看等说明。</p>
+      </div>
+      <template #footer>
+        <el-button type="primary" @click="helpVisible = false">知道了</el-button>
+      </template>
+    </el-dialog>
   </header>
 </template>
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { useRoute } from 'vue-router'
-import { ArrowRight, Bell, QuestionFilled, Search } from '@element-plus/icons-vue'
+import { ArrowRight, QuestionFilled } from '@element-plus/icons-vue'
 
 const route = useRoute()
-const keyword = ref('')
+const helpVisible = ref(false)
 const pageTitle = computed(() => String(route.meta.title ?? '仪表盘'))
 </script>
 
@@ -38,8 +44,7 @@ const pageTitle = computed(() => String(route.meta.title ?? '仪表盘'))
   background: var(--card-bg);
 }
 
-.breadcrumb,
-.header-right {
+.breadcrumb {
   display: flex;
   align-items: center;
   gap: 12px;
@@ -50,7 +55,8 @@ const pageTitle = computed(() => String(route.meta.title ?? '仪表盘'))
   font-size: 14px;
 }
 
-.search {
-  width: 280px;
+.help-content {
+  color: var(--text-secondary);
+  line-height: 1.8;
 }
 </style>

@@ -92,6 +92,10 @@ def update_user(
     user = user_repository.get_user_by_id(db, user_id)
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
+    if body.username and body.username != user.username:
+        existing = user_repository.get_user_by_username(db, body.username)
+        if existing is not None:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="用户名已存在")
     user = user_repository.update_user(db, user, **body.model_dump(exclude_unset=True))
     log_service.create_log(
         db, user_id=None, username="admin",
@@ -402,6 +406,17 @@ def _format_beijing_time(value: datetime | None) -> str:
     return value.astimezone(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _log_level(action: str, detail: str = "") -> str:
+    text = f"{action} {detail}".lower()
+    if any(keyword in text for keyword in ("error", "failed", "fail", "exception", "错误", "失败", "异常")):
+        return "ERROR"
+    if action in {"delete", "status_change", "quality_repair"} or any(
+        keyword in detail for keyword in ("删除", "禁用", "修复")
+    ):
+        return "WARN"
+    return "INFO"
+
+
 @router.get("/logs")
 def list_logs(
     page: int = Query(1, ge=1),
@@ -425,6 +440,7 @@ def list_logs(
         {
             "id": lg.id, "user_id": lg.user_id, "username": lg.username,
             "action": lg.action, "resource": lg.resource,
+            "level": _log_level(lg.action, lg.detail),
             "resource_id": lg.resource_id, "detail": lg.detail,
             "ip_address": lg.ip_address,
             "created_at": _format_beijing_time(lg.created_at),
@@ -453,10 +469,11 @@ def export_logs(
     output = io.StringIO()
     output.write("\ufeff")
     writer = csv.writer(output)
-    writer.writerow(["ID", "用户名", "操作", "资源", "资源ID", "详情", "IP", "时间"])
+    writer.writerow(["ID", "级别", "用户名", "操作", "资源", "资源ID", "详情", "IP", "时间"])
     for lg in logs:
         writer.writerow([
             lg.id,
+            _log_level(lg.action, lg.detail),
             lg.username,
             lg.action,
             lg.resource,
@@ -488,6 +505,7 @@ def get_my_logs(
         {
             "id": lg.id, "username": lg.username,
             "action": lg.action, "resource": lg.resource,
+            "level": _log_level(lg.action, lg.detail),
             "detail": lg.detail, "ip_address": lg.ip_address,
             "created_at": _format_beijing_time(lg.created_at),
         }

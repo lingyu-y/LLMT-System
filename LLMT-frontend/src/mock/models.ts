@@ -17,10 +17,10 @@ export const modelParams = [
 ]
 
 export const versionHistory = [
-  { version: 'v3.2.0', status: '当前版本', date: '2024-01-15 14:30', metrics: '准确率 94.5% · 延迟 45ms · 1.25M样本', params: 'lr=2e-5, batch=32, epochs=10, warmup=1000, weight_decay=0.01', current: true },
-  { version: 'v3.1.0', status: '稳定版本', date: '2024-01-12 09:15', metrics: '准确率 93.8% · 延迟 42ms · 1.0M样本', params: 'lr=3e-5, batch=32, epochs=8, warmup=500, weight_decay=0.01' },
-  { version: 'v3.0.0', status: '', date: '2024-01-08 16:45', metrics: '准确率 92.1% · 延迟 40ms · 800K样本', params: 'lr=5e-5, batch=16, epochs=5, warmup=200, weight_decay=0.02' },
-  { version: 'v2.0.0', status: '', date: '2024-01-01 10:00', metrics: '准确率 89.5% · 延迟 38ms · 500K样本', params: 'lr=1e-4, batch=16, epochs=3, warmup=100, weight_decay=0.05' },
+  { version: 'v3.2.0', status: '当前版本', date: '2024-01-15 14:30', metrics: '准确率 94.5% · 延迟 45ms · 1.25M样本', params: '框架 DeepSpeed · 4x A100 · 数据并行 + 流水线并行', training: '来源任务 TR-20260425-01 · 数据集 电商评论文本数据 v2.3', current: true },
+  { version: 'v3.1.0', status: '稳定版本', date: '2024-01-12 09:15', metrics: '准确率 93.8% · 延迟 42ms · 1.0M样本', params: '框架 DeepSpeed · 4x A100 · 数据并行', training: '来源任务 TR-20260412-04 · 数据集 电商评论文本数据 v2.1' },
+  { version: 'v3.0.0', status: '', date: '2024-01-08 16:45', metrics: '准确率 92.1% · 延迟 40ms · 800K样本', params: '框架 PyTorch · 2x A100 · 数据并行', training: '来源任务 TR-20260408-03 · 数据集 电商评论文本数据 v1.8' },
+  { version: 'v2.0.0', status: '', date: '2024-01-01 10:00', metrics: '准确率 89.5% · 延迟 38ms · 500K样本', params: '框架 PyTorch · 1x A100 · 数据并行', training: '来源任务 TR-20260401-01 · 数据集 电商评论文本数据 v1.0' },
 ]
 
 export const performanceTrend = [89.5, 92.1, 93.8, 94.5]
