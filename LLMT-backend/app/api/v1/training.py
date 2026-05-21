@@ -349,6 +349,9 @@ def get_training_logs(
         "keyword": keyword,
         "logs": logs,
     })
+
+
+@router.get("/options")
 def get_training_options(db: Session = Depends(get_db)):
     models = model_repository.get_models(db, page=1, page_size=1000)[0]
     model_options = [
@@ -557,7 +560,7 @@ def launch_check(
     })
 
     running = db.query(TrainingTask).filter(
-        TrainingTask.model_versions.any(model_code=body.model_code),
+        TrainingTask.config_json["model_code"].as_string() == body.model_code,
         TrainingTask.status.in_(["running", "launching"]),
     ).count()
     checks.append({
