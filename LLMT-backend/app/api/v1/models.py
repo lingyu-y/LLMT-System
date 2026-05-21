@@ -22,6 +22,7 @@ from app.schemas.model import (
     ModelMetrics,
     ModelOut,
     RateLimitUpdate,
+    RollbackRequest,
     TrainingMetadata,
     VersionCreate,
 )
@@ -252,14 +253,53 @@ def compare_model_versions(
 def rollback_model_version(
     model_code: str,
     version: str,
+    body: RollbackRequest = RollbackRequest(),
     db: Session = Depends(get_db),
     _admin=Depends(require_admin),
 ):
     model = model_repository.get_model_by_code_and_version(db, model_code, version)
     if model is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型版本不存在")
-    model = model_repository.rollback_version(db, model)
-    return success_response(_build_model_out(model), "版本已回滚")
+
+    # 校验 MinIO 目标文件存在
+    settings = get_settings()
+    minio = get_minio_client()
+    bucket = settings.MINIO_BUCKET_MODELS
+    prefix = model.storage_path.rstrip("/") + "/"
+    objects = list(minio.list_objects(bucket, prefix=prefix, recursive=True))
+    if not [o for o in objects if not o.is_dir]:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"版本 {version} 的模型文件在 MinIO 中不存在，无法回滚",
+        )
+
+    # 执行回滚
+    result = model_repository.rollback_version(db, model)
+    file_count = len([o for o in objects if not o.is_dir])
+
+    # 记录操作日志
+    try:
+        from app.services import log_service
+        log_service.create_log(
+            db, user_id=None, username="admin",
+            action="rollback", resource="model_version", resource_id=model.id,
+            detail=f"回滚模型 {model_code} 从 {result['previous_current']['version'] if result['previous_current'] else '?'} 到 {version}，原因: {body.reason or '未填写'}",
+        )
+    except Exception:
+        pass
+
+    summary = {
+        **_build_model_out(model),
+        "rollback": {
+            "from_version": result["previous_current"]["version"] if result["previous_current"] else None,
+            "to_version": version,
+            "reason": body.reason or None,
+            "files_restored": file_count,
+            "storage_path": model.storage_path,
+            "rolled_back_at": datetime.now(timezone.utc).isoformat(),
+        },
+    }
+    return success_response(summary, f"已回滚到版本 {version}")
 
 
 @router.get("/{model_code}/versions/{version}/download")
@@ -314,14 +354,19 @@ def trigger_security_scan(
     if model is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型不存在")
 
-    scan_id = uuid.uuid4().hex[:12]
+    from app.services.scan_service import run_security_scan
+
+    result = run_security_scan(db, model, triggered_by="admin")
     return success_response({
-        "scan_id": scan_id,
+        "scan_id": result["scan_id"],
         "model_code": model.model_code,
         "version": model.version,
-        "status": "pending",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }, "漏洞扫描任务已触发")
+        "status": "completed",
+        "score": result["score"],
+        "summary": result["summary"],
+        "alerts_triggered": result["alerts_triggered"],
+        "vulnerabilities": result["vulnerabilities"],
+    }, "安全扫描完成")
 
 
 @router.get("/{model_code}/security/reports")
@@ -334,18 +379,22 @@ def get_security_reports(
     if not versions:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型不存在")
 
-    reports = []
+    all_reports = []
     for v in versions:
-        reports.append({
-            "scan_id": uuid.uuid4().hex[:12],
-            "model_code": v.model_code,
-            "version": v.version,
-            "status": "completed",
-            "summary": {"critical": 0, "high": 1, "medium": 3, "low": 5},
-            "scanned_at": datetime.now(timezone.utc).isoformat(),
-        })
+        stored = (v.hyperparams_json or {}).get("security_scans", [])
+        for r in stored:
+            all_reports.append({
+                "scan_id": r["scan_id"],
+                "model_code": r["model_code"],
+                "version": r["version"],
+                "status": "completed",
+                "score": r.get("score"),
+                "summary": r.get("summary"),
+                "vulnerabilities": r.get("vulnerabilities", []),
+                "scanned_at": r["scanned_at"],
+            })
 
-    return success_response(reports)
+    return success_response(all_reports)
 
 
 DEFAULT_LIMITS = {

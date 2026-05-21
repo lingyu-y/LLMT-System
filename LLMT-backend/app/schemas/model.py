@@ -67,6 +67,10 @@ class RateLimitUpdate(BaseModel):
     max_tokens_per_request: int | None = Field(default=None, ge=1)
 
 
+class RollbackRequest(BaseModel):
+    reason: str = Field(default="", max_length=512, description="回滚原因")
+
+
 class ModelExport(BaseModel):
     model_config = {"protected_namespaces": ()}
 
