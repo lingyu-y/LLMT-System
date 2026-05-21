@@ -1,0 +1,51 @@
+{
+    "task_code": "gpt2-pretrain-demo",
+    "framework": "deepspeed",
+    "parallel_strategy": "zero2",
+    "model": {
+        "model_type": "gpt2",
+        "vocab_size": 50257,
+        "hidden_size": 768,
+        "num_layers": 12,
+        "num_attention_heads": 12,
+        "seq_length": 1024
+    },
+    "data": {
+        "dataset_path": "",
+        "dataset_format": "npy",
+        "train_split": 0.95,
+        "seed": 42
+    },
+    "hyperparams": {
+        "batch_size": 8,
+        "learning_rate": 2e-5,
+        "min_lr": 1e-5,
+        "weight_decay": 0.01,
+        "max_epochs": 3,
+        "warmup_steps": 1000,
+        "max_grad_norm": 1.0,
+        "gradient_accumulation_steps": 4,
+        "optimizer": "adamw",
+        "scheduler": "cosine",
+        "precision": "fp16"
+    },
+    "strategy": {
+        "num_gpus": 4,
+        "num_nodes": 1,
+        "tensor_model_parallel_size": 1,
+        "pipeline_model_parallel_size": 1
+    },
+    "checkpoint": {
+        "save_interval": 500,
+        "eval_interval": 200,
+        "max_checkpoints": 5,
+        "upload_to_minio": true,
+        "checkpoint_dir": "./checkpoints/gpt2-pretrain-demo"
+    },
+    "reporting": {
+        "influxdb_url": "http://localhost:8086",
+        "influxdb_org": "llmt",
+        "influxdb_bucket": "training_metrics",
+        "report_interval_steps": 10
+    }
+}

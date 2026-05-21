@@ -1,0 +1,42 @@
+# Megatron-LM GPT-345M 默认配置
+model_type: gpt2
+num_layers: 24
+hidden_size: 1024
+num_attention_heads: 16
+seq_length: 1024
+max_position_embeddings: 1024
+
+# 并行策略
+tensor_model_parallel_size: 1
+pipeline_model_parallel_size: 1
+
+# 训练超参
+micro_batch_size: 8
+global_batch_size: 64
+train_iters: 100000
+lr: 1.5e-4
+min_lr: 1.0e-5
+lr_decay_style: cosine
+lr_warmup_iters: 2000
+weight_decay: 0.1
+clip_grad: 1.0
+adam_beta1: 0.9
+adam_beta2: 0.95
+adam_eps: 1.0e-8
+
+# 精度
+bf16: true
+
+# Checkpoint
+save_interval: 2000
+eval_interval: 1000
+save: ./checkpoints/gpt-345m
+load: ./checkpoints/gpt-345m
+
+# 数据
+data_path: ""
+data_impl: mmap
+vocab_file: gpt2-vocab.json
+merge_file: gpt2-merges.txt
+tokenizer_type: GPT2BPETokenizer
+seed: 42
