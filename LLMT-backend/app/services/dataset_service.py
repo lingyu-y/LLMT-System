@@ -153,8 +153,24 @@ def _convert_if_needed(data: bytes, filename: str) -> tuple[bytes, str, str | No
     return data, filename, None
 
 
+_CHUNK = 64 * 1024  # 64 KiB
+
+
 def _compute_checksum(data: bytes) -> str:
     return hashlib.md5(data).hexdigest()
+
+
+def _read_and_hash(file: UploadFile) -> tuple[bytes, str]:
+    """Read *file* in 64 KiB chunks, compute MD5 incrementally.  Returns (data, hexdigest)."""
+    h = hashlib.md5()
+    buf = _stdlib_io.BytesIO()
+    while True:
+        chunk = file.file.read(_CHUNK)
+        if not chunk:
+            break
+        h.update(chunk)
+        buf.write(chunk)
+    return buf.getvalue(), h.hexdigest()
 
 
 # ============================================================================
@@ -220,7 +236,7 @@ def _upload_single(
     """Upload one file with full pipeline: validate → detect → convert → dedup →
     upload → checksum verify → metadata update.  Returns result dict."""
     filename = file.filename or "unknown"
-    original_content = file.file.read()
+    original_content, original_md5 = _read_and_hash(file)
     size_original = len(original_content)
 
     # detect
@@ -231,6 +247,7 @@ def _upload_single(
     if conv_error:
         return {"filename": filename, "success": False, "error": conv_error}
     size = len(converted_data)
+    local_md5 = _compute_checksum(converted_data) if converted_data != original_content else original_md5
 
     # dedup
     object_name = f"{dataset.storage_path.rstrip('/')}/{stored_filename}"
@@ -249,7 +266,6 @@ def _upload_single(
     try:
         stat = minio.stat_object(bucket, object_name)
         remote_etag = stat.etag.strip('"') if stat.etag else ""
-        local_md5 = _compute_checksum(converted_data)
         verified = (remote_etag == local_md5)
     except Exception:
         verified = True  # ETag may not be MD5 for multipart; skip strict check
