@@ -1,6 +1,10 @@
 """Model API endpoints."""
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+import json
+import uuid
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
@@ -10,12 +14,39 @@ from app.core.responses import paginated_response, success_response
 from app.dependencies.auth import require_admin
 from app.dependencies.db import get_db
 from app.repositories import model_repository
-from app.schemas.model import ModelCreate, ModelExport, ModelImport, ModelListOut, ModelOut, RateLimitUpdate, VersionCreate
-
-import uuid
-from datetime import datetime, timezone
+from app.schemas.model import (
+    ModelCreate,
+    ModelExport,
+    ModelImport,
+    ModelListOut,
+    ModelMetrics,
+    ModelOut,
+    RateLimitUpdate,
+    TrainingMetadata,
+    VersionCreate,
+)
 
 router = APIRouter(prefix="/models", tags=["模型管理"])
+
+
+def _build_model_out(model) -> dict:
+    metrics_dict = model.metrics_json or {}
+    meta_dict = model.hyperparams_json or {}
+    return ModelOut(
+        id=model.id,
+        model_name=model.model_name,
+        model_code=model.model_code,
+        version=model.version,
+        tag=model.tag,
+        description=model.description,
+        framework=model.framework,
+        metrics=ModelMetrics(**metrics_dict) if isinstance(metrics_dict, dict) else ModelMetrics(),
+        training_metadata=TrainingMetadata(**meta_dict) if isinstance(meta_dict, dict) else TrainingMetadata(),
+        storage_path=model.storage_path,
+        is_current=model.is_current,
+        created_at=model.created_at,
+        updated_at=model.updated_at,
+    ).model_dump(mode="json")
 
 
 @router.get("")
@@ -34,27 +65,49 @@ def list_models(
 
 @router.post("", status_code=status.HTTP_201_CREATED)
 def create_model(
-    body: ModelCreate,
+    file: UploadFile = File(..., description="模型权重文件（.pt / .bin / .safetensors）"),
+    metadata: str = Form(..., description="JSON 格式的模型元数据"),
     db: Session = Depends(get_db),
     _admin=Depends(require_admin),
 ):
-    if model_repository.get_model_by_code_and_version(db, body.model_code, body.version):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="该模型代码与版本已存在"
-        )
+    try:
+        meta = json.loads(metadata)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="metadata 不是有效的 JSON")
+
+    try:
+        body = ModelCreate.model_validate(meta)
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"元数据校验失败: {e}")
+
+    # 上传文件到 MinIO
+    settings = get_settings()
+    minio = get_minio_client()
+    bucket = settings.MINIO_BUCKET_MODELS
+    version = model_repository.auto_version(db, body.model_code)
+    object_name = f"models/{body.model_code}/{version}/{file.filename}"
+
+    import io
+    content = file.file.read()
+    minio.put_object(bucket, object_name, io.BytesIO(content), len(content))
+
+    # 构建结构化 metrics 和 training_metadata
+    metrics_dict = body.metrics.model_dump(exclude_defaults=True)
+    training_dict = body.training_metadata.model_dump(exclude_defaults=True)
+
+    # 写入 DB
     model = model_repository.create_model(
         db,
         model_name=body.model_name,
         model_code=body.model_code,
-        version=body.version,
         tag=body.tag,
         description=body.description,
-        framework=body.framework,
-        dataset_version=body.dataset_version,
-        metrics_json=body.metrics_json,
-        hyperparams_json=body.hyperparams_json,
+        framework=body.training_metadata.framework,
+        metrics=metrics_dict,
+        training_metadata=training_dict,
     )
-    return success_response(ModelOut.model_validate(model), "模型创建成功")
+
+    return success_response(_build_model_out(model), "模型版本保存成功")
 
 
 @router.post("/repository/import", status_code=status.HTTP_201_CREATED)
@@ -63,15 +116,12 @@ def import_model(
     db: Session = Depends(get_db),
     _admin=Depends(require_admin),
 ):
-    if model_repository.get_model_by_code_and_version(db, body.model_code, body.version):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="该模型代码与版本已存在"
-        )
+    version = model_repository.auto_version(db, body.model_code)
 
     settings = get_settings()
     minio = get_minio_client()
     bucket = settings.MINIO_BUCKET_MODELS
-    target_prefix = f"models/{body.model_code}/{body.version}"
+    target_prefix = f"models/{body.model_code}/{version}"
 
     src_prefix = body.source_path.rstrip("/") + "/"
     objects = list(minio.list_objects(bucket, prefix=src_prefix, recursive=True))
@@ -89,15 +139,13 @@ def import_model(
         db,
         model_name=body.model_name,
         model_code=body.model_code,
-        version=body.version,
         tag=body.tag,
         description=body.description,
         framework=body.framework,
-        dataset_version=body.dataset_version,
-        metrics_json=body.metrics_json,
-        hyperparams_json=body.hyperparams_json,
+        metrics=body.metrics_json,
+        training_metadata=body.hyperparams_json,
     )
-    return success_response(ModelOut.model_validate(model), "模型导入成功")
+    return success_response(_build_model_out(model), "模型导入成功")
 
 
 @router.post("/repository/export")
@@ -153,23 +201,17 @@ def create_model_version(
     existing = model_repository.get_versions(db, model_code)
     if not existing:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型不存在")
-    if model_repository.get_model_by_code_and_version(db, model_code, body.version):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="该版本已存在"
-        )
     model = model_repository.create_model(
         db,
         model_name=body.model_name or existing[0].model_name,
         model_code=model_code,
-        version=body.version,
         tag=body.tag,
         description=body.description,
         framework=body.framework,
-        dataset_version=body.dataset_version,
-        metrics_json=body.metrics_json,
-        hyperparams_json=body.hyperparams_json,
+        metrics=body.metrics_json,
+        training_metadata=body.hyperparams_json,
     )
-    return success_response(ModelOut.model_validate(model), "版本创建成功")
+    return success_response(_build_model_out(model), "版本创建成功")
 
 
 @router.get("/{model_code}/versions/compare")
@@ -217,7 +259,7 @@ def rollback_model_version(
     if model is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型版本不存在")
     model = model_repository.rollback_version(db, model)
-    return success_response(ModelOut.model_validate(model), "版本已回滚")
+    return success_response(_build_model_out(model), "版本已回滚")
 
 
 @router.get("/{model_code}/versions/{version}/download")
@@ -259,7 +301,7 @@ def get_model_version_detail(
     model = model_repository.get_model_by_code_and_version(db, model_code, version)
     if model is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型版本不存在")
-    return success_response(ModelOut.model_validate(model))
+    return success_response(_build_model_out(model))
 
 
 @router.post("/{model_code}/security/scan")
@@ -383,4 +425,4 @@ def get_model(
     model = model_repository.get_model_by_code(db, model_code)
     if model is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型不存在")
-    return success_response(ModelOut.model_validate(model))
+    return success_response(_build_model_out(model))

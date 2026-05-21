@@ -6,18 +6,41 @@ from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 
+class ModelMetrics(BaseModel):
+    """结构化模型性能指标。"""
+    accuracy_train: float | None = None
+    accuracy_val: float | None = None
+    f1_score: float | None = None
+    precision: float | None = None
+    recall: float | None = None
+    loss_final: float | None = None
+    inference_speed_ms: float | None = Field(default=None, description="单次推理耗时(毫秒)")
+    latency_p99_ms: float | None = Field(default=None, description="P99延迟(毫秒)")
+    loss_curve: list[dict[str, Any]] = Field(default_factory=list, description="[{step, loss}] 训练损失曲线")
+
+
+class TrainingMetadata(BaseModel):
+    """训练过程元数据。"""
+    training_started_at: str | None = Field(default=None, description="训练开始时间 ISO 8601")
+    training_duration_hours: float | None = Field(default=None, description="训练耗时(小时)")
+    dataset_version: str | None = None
+    data_source: str | None = Field(default=None, description="数据集来源/名称")
+    learning_rate: float | None = None
+    batch_size: int | None = None
+    optimizer: str | None = None
+    loss_function: str | None = None
+    framework: str | None = Field(default=None, description="PyTorch/DeepSpeed/Megatron-LM")
+
+
 class ModelCreate(BaseModel):
     model_config = {"protected_namespaces": ()}
 
     model_name: str = Field(..., min_length=1, max_length=128)
     model_code: str = Field(..., min_length=1, max_length=64)
-    version: str = Field(..., min_length=1, max_length=32)
     tag: Optional[str] = Field(default=None, max_length=32)
     description: Optional[str] = None
-    framework: Optional[str] = Field(default=None, max_length=32)
-    dataset_version: Optional[str] = Field(default=None, max_length=32)
-    metrics_json: dict[str, Any] = Field(default_factory=dict)
-    hyperparams_json: dict[str, Any] = Field(default_factory=dict)
+    training_metadata: TrainingMetadata = Field(default_factory=TrainingMetadata)
+    metrics: ModelMetrics = Field(default_factory=ModelMetrics)
 
 
 class ModelImport(BaseModel):
@@ -88,9 +111,9 @@ class ModelOut(BaseModel):
     tag: Optional[str] = None
     description: Optional[str] = None
     framework: Optional[str] = None
-    metrics_json: dict[str, Any] = Field(default_factory=dict)
-    hyperparams_json: dict[str, Any] = Field(default_factory=dict)
-    dataset_version: Optional[str] = None
+    metrics: ModelMetrics = Field(default_factory=ModelMetrics)
+    training_metadata: TrainingMetadata = Field(default_factory=TrainingMetadata)
+    storage_path: str = ""
     is_current: bool
     created_at: datetime
     updated_at: datetime

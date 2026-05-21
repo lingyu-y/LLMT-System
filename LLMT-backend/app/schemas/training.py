@@ -142,6 +142,19 @@ class TrainingTaskListOut(BaseModel):
 
 class TrainingMetricsQuery(BaseModel):
     """Query parameters for fetching training metrics from InfluxDB."""
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatible schemas for existing routes
+# ---------------------------------------------------------------------------
+
+class SubmitTaskRequest(BaseModel):
+    task_code: str = Field(..., description="训练配置的任务代码")
+
+
+class ScaleTaskRequest(BaseModel):
+    gpu_count: int = Field(..., ge=1, le=64, description="目标 GPU 数量")
+    parallel_strategy: str | None = Field(default=None, description="目标并行策略（可选）")
     task_code: str
     metric_type: Literal["training_step", "gpu_metrics", "communication_metrics"] = "training_step"
     start_time: Optional[str] = None
