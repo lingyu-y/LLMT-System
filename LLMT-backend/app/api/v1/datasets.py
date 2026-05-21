@@ -8,7 +8,7 @@ from app.dependencies.auth import get_current_user
 from app.dependencies.db import get_db
 from app.models.user import User
 from app.repositories import dataset_repository
-from app.services import log_service
+from app.services import dataset_service, log_service
 from app.schemas.dataset import (
     DatasetCreate,
     DatasetListOut,
@@ -41,14 +41,15 @@ def upload_dataset_file(
     ds = dataset_repository.get_dataset_by_id(db, dataset_id)
     if ds is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="数据集不存在")
+    result = dataset_service.upload_file(db, ds, file, current_user.username)
+    if not result.get("success"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=result.get("error"))
     log_service.create_log(
         db, user_id=current_user.id, username=current_user.username,
         action="upload", resource="dataset", resource_id=ds.id,
-        detail=f"上传文件 {file.filename} ({file.content_type})",
+        detail=f"上传文件 {file.filename} ({result.get('size', 0)} bytes)",
     )
-    return success_response(
-        {"filename": file.filename, "content_type": file.content_type}, "文件上传成功"
-    )
+    return success_response(result, "文件上传成功")
 
 
 @router.post("/upload/{upload_id}/resume")
@@ -210,7 +211,7 @@ def start_preprocess(
     ds = dataset_repository.get_dataset_by_id(db, dataset_id)
     if ds is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="数据集不存在")
-    job = dataset_repository.create_processing_job(db, ds, "preprocess")
+    job = dataset_service.start_preprocess(db, ds)
     log_service.create_log(
         db, user_id=current_user.id, username=current_user.username,
         action="preprocess", resource="dataset", resource_id=ds.id,
@@ -233,7 +234,7 @@ def get_quality_report(
     ds = dataset_repository.get_dataset_by_id(db, dataset_id)
     if ds is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="数据集不存在")
-    return success_response(dataset_repository.get_quality_report(ds))
+    return success_response(dataset_service.check_quality(db, ds))
 
 
 @router.post("/{dataset_id}/quality/check")
@@ -245,7 +246,7 @@ def trigger_quality_check(
     ds = dataset_repository.get_dataset_by_id(db, dataset_id)
     if ds is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="数据集不存在")
-    report = dataset_repository.run_quality_check(db, ds)
+    report = dataset_service.check_quality(db, ds)
     log_service.create_log(
         db, user_id=current_user.id, username=current_user.username,
         action="quality_check", resource="dataset", resource_id=ds.id,
@@ -263,7 +264,7 @@ def trigger_quality_repair(
     ds = dataset_repository.get_dataset_by_id(db, dataset_id)
     if ds is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="数据集不存在")
-    result = dataset_repository.run_quality_repair(db, ds)
+    result = dataset_service.repair_quality(db, ds)
     log_service.create_log(
         db, user_id=current_user.id, username=current_user.username,
         action="quality_repair", resource="dataset", resource_id=ds.id,
@@ -281,7 +282,7 @@ def get_lineage(
     ds = dataset_repository.get_dataset_by_id(db, dataset_id)
     if ds is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="数据集不存在")
-    return success_response(dataset_repository.get_lineage(ds))
+    return success_response(dataset_service.get_lineage(ds))
 
 
 @router.get("/{dataset_id}/lineage/impact")
@@ -293,4 +294,4 @@ def get_lineage_impact(
     ds = dataset_repository.get_dataset_by_id(db, dataset_id)
     if ds is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="数据集不存在")
-    return success_response(dataset_repository.get_lineage_impact(ds))
+    return success_response(dataset_service.get_lineage_impact(ds))
