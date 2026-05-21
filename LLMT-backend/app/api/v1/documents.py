@@ -187,7 +187,11 @@ def delete_draft(
 @router.get("/{doc_id}/export")
 def export_document(
     doc_id: str,
+    current_user: User = Depends(get_current_user),
 ):
+    draft = _drafts.get(doc_id)
+    if draft is None or draft["user_id"] != current_user.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在")
     return success_response({
         "export_url": f"/exports/documents/{doc_id}.docx",
         "format": "docx",
@@ -196,13 +200,16 @@ def export_document(
 
 
 @router.get("/{doc_id}/download")
-def download_document(doc_id: str):
+def download_document(
+    doc_id: str,
+    current_user: User = Depends(get_current_user),
+):
     from urllib.parse import quote
 
     from fastapi.responses import PlainTextResponse
 
     draft = _drafts.get(doc_id)
-    if draft is None:
+    if draft is None or draft["user_id"] != current_user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在")
 
     filename = quote(draft["title"] + ".md")

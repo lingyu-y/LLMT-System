@@ -503,10 +503,8 @@ def save_training_config(
     }, "训练配置已保存")
 
 
-def _check_minio_files(prefix: str) -> bool:
-    settings = get_settings()
+def _check_minio_files(prefix: str, bucket: str) -> bool:
     minio = get_minio_client()
-    bucket = settings.MINIO_BUCKET_MODELS
     objects = list(minio.list_objects(bucket, prefix=prefix.rstrip("/") + "/", recursive=True))
     return len([o for o in objects if not o.is_dir]) > 0
 
@@ -534,8 +532,9 @@ def launch_check(
         "detail": f"数据集 {dataset.name} 已注册" if dataset else "数据集不存在",
     })
 
+    settings = get_settings()
     if model:
-        has_files = _check_minio_files(model.storage_path)
+        has_files = _check_minio_files(model.storage_path, settings.MINIO_BUCKET_MODELS)
         checks.append({
             "item": "模型文件就绪",
             "pass": has_files,
@@ -544,7 +543,7 @@ def launch_check(
 
     if dataset:
         ds_prefix = dataset.storage_path
-        has_ds_files = _check_minio_files(ds_prefix) if ds_prefix else False
+        has_ds_files = _check_minio_files(ds_prefix, settings.MINIO_BUCKET_DATASETS) if ds_prefix else False
         checks.append({
             "item": "数据集文件就绪",
             "pass": has_ds_files,
