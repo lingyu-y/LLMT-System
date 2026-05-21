@@ -62,6 +62,18 @@ export interface Lineage {
   downstream: string[]
 }
 
+export interface LineageImpact {
+  dataset_id: number
+  affected_models: string[]
+  affected_tasks: string[]
+  affected_datasets: string[]
+}
+
+export interface QualityRepairResult {
+  status: string
+  fixed_anomalies: Record<string, unknown>[]
+}
+
 export interface DatasetCreatePayload {
   name: string
   description?: string
@@ -99,4 +111,10 @@ export const getQualityReport = async (datasetId: number) =>
 export const triggerQualityCheck = async (datasetId: number) =>
   unwrap(await post<ApiMessage<QualityReport>>(`/datasets/${datasetId}/quality/check`))
 
+export const triggerQualityRepair = async (datasetId: number) =>
+  unwrap(await post<ApiMessage<QualityRepairResult>>(`/datasets/${datasetId}/quality/repair`))
+
 export const getLineage = async (datasetId: number) => unwrap(await get<ApiMessage<Lineage>>(`/datasets/${datasetId}/lineage`))
+
+export const getLineageImpact = async (datasetId: number) =>
+  unwrap(await get<ApiMessage<LineageImpact>>(`/datasets/${datasetId}/lineage/impact`))
