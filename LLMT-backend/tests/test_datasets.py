@@ -66,11 +66,45 @@ class TestUpload:
     def test_09_upload(self, client, admin_headers, db):
         ds = Dataset(name="up", data_type="text", storage_path="/t", owner_id=1); db.add(ds); db.commit(); db.refresh(ds)
         resp = client.post(f"{PREFIX}/datasets/upload?dataset_id={ds.id}", files={"file": ("t.csv", io.BytesIO(b"a,b\n1,2"), "text/csv")}, headers=admin_headers)
-        # MinIO may not be available in test env; accept 200 (success) or 400 (MinIO unreachable)
+        assert resp.status_code in (200, 400)  # 400 = MinIO unavailable in test
+        if resp.status_code == 200:
+            data = resp.json()["data"]
+            assert "checksum_verified" in data
+
+    def test_10_upload_unsupported_format(self, client, admin_headers, db):
+        ds = Dataset(name="up2", data_type="text", storage_path="/t2", owner_id=1); db.add(ds); db.commit(); db.refresh(ds)
+        resp = client.post(f"{PREFIX}/datasets/upload?dataset_id={ds.id}", files={"file": ("x.png", io.BytesIO(b"fake-png"), "image/png")}, headers=admin_headers)
+        assert resp.status_code == 400  # format blocked
+
+    def test_11_batch_upload(self, client, admin_headers, db):
+        ds = Dataset(name="batch", data_type="text", storage_path="/tb", owner_id=1); db.add(ds); db.commit(); db.refresh(ds)
+        resp = client.post(f"{PREFIX}/datasets/upload/batch?dataset_id={ds.id}",
+            files=[("files", ("a.txt", io.BytesIO(b"hello"), "text/plain")),
+                   ("files", ("b.csv", io.BytesIO(b"x,y\n1,2"), "text/csv"))],
+            headers=admin_headers)
         assert resp.status_code in (200, 400)
-    def test_10_resume(self, client, admin_headers):
-        assert client.post(f"{PREFIX}/datasets/upload/U-001/resume", headers=admin_headers).status_code == 200
-    def test_11_import(self, client, admin_headers):
+        if resp.status_code == 200:
+            data = resp.json()["data"]
+            assert data["total"] == 2
+
+    def test_12_batch_too_many(self, client, admin_headers, db):
+        ds = Dataset(name="toomany", data_type="text", storage_path="/tx", owner_id=1); db.add(ds); db.commit(); db.refresh(ds)
+        too_many = [("files", (f"f{i}.txt", io.BytesIO(b"x"), "text/plain")) for i in range(11)]
+        resp = client.post(f"{PREFIX}/datasets/upload/batch?dataset_id={ds.id}", files=too_many, headers=admin_headers)
+        assert resp.status_code == 400
+
+    def test_13_resume_not_found(self, client, admin_headers):
+        assert client.post(f"{PREFIX}/datasets/upload/no-such-uuid/resume", headers=admin_headers).status_code == 404
+
+    def test_14_resume_ok(self, client, admin_headers):
+        # Register a fake upload session then resume
+        from app.services.dataset_service import save_resume_state
+        save_resume_state("UPLOAD-DEMO", "data.csv", 1024000, 512000)
+        resp = client.post(f"{PREFIX}/datasets/upload/UPLOAD-DEMO/resume", headers=admin_headers)
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert data["total_size"] == 1024000 and data["offset"] == 512000
+    def test_15_import(self, client, admin_headers):
         import tempfile
         tmp = tempfile.mkdtemp()
         # 创建示例数据文件
@@ -84,12 +118,12 @@ class TestUpload:
         assert resp.status_code in (200, 400)
 
 class TestProcessing:
-    def test_12_preprocess(self, client, admin_headers, db):
+    def test_16_preprocess(self, client, admin_headers, db):
         ds = Dataset(name="pp", data_type="text", storage_path="/t", owner_id=1); db.add(ds); db.commit(); db.refresh(ds)
         assert client.post(f"{PREFIX}/datasets/{ds.id}/preprocess", headers=admin_headers).status_code == 200
-    def test_13_list_jobs(self, client, admin_headers):
+    def test_17_list_jobs(self, client, admin_headers):
         assert client.get(f"{PREFIX}/datasets/processing-jobs", headers=admin_headers).status_code == 200
-    def test_14_get_job(self, client, admin_headers):
+    def test_18_get_job(self, client, admin_headers):
         # Get the first job from the list and fetch it by its actual ID
         list_resp = client.get(f"{PREFIX}/datasets/processing-jobs", headers=admin_headers)
         jobs = list_resp.json()["data"]
@@ -98,33 +132,49 @@ class TestProcessing:
             assert client.get(f"{PREFIX}/datasets/processing-jobs/{job_id}", headers=admin_headers).status_code == 200
 
 class TestQuality:
-    def test_15_report(self, client, admin_headers, db):
+    def test_19_report(self, client, admin_headers, db):
         ds = Dataset(name="qr", data_type="text", storage_path="/t", owner_id=1); db.add(ds); db.commit(); db.refresh(ds)
         assert client.get(f"{PREFIX}/datasets/{ds.id}/quality", headers=admin_headers).status_code == 200
-    def test_16_check(self, client, admin_headers, db):
+    def test_20_check(self, client, admin_headers, db):
         ds = Dataset(name="qc", data_type="text", storage_path="/t", owner_id=1); db.add(ds); db.commit(); db.refresh(ds)
         assert client.post(f"{PREFIX}/datasets/{ds.id}/quality/check", headers=admin_headers).status_code == 200
-    def test_17_repair(self, client, admin_headers, db):
+    def test_21_repair(self, client, admin_headers, db):
         ds = Dataset(name="qp", data_type="text", storage_path="/t", owner_id=1); db.add(ds); db.commit(); db.refresh(ds)
         assert client.post(f"{PREFIX}/datasets/{ds.id}/quality/repair", headers=admin_headers).status_code == 200
-    def test_18_lineage(self, client, admin_headers, db):
-        ds = Dataset(name="ln", data_type="text", storage_path="/t", source="kafka", owner_id=1)
+    def test_22_lineage(self, client, admin_headers, db):
+        ds = Dataset(name="ln", data_type="text", storage_path="/t", source="kafka",
+                     owner_id=1, file_count=100, quality_status="passed")
         db.add(ds); db.commit(); db.refresh(ds)
         # Build dependency chain: dataset → task → model
-        t = TrainingTask(task_name="血缘任务", task_code="LN-TASK", status="running",
+        u = db.query(User).first()
+        t = TrainingTask(task_name="血缘任务", task_code="LN-TASK99", status="running",
                          config_json={}, current_epoch=3, current_step=500, max_epoch=10,
-                         dataset_id=ds.id, creator_id=1)
+                         dataset_id=ds.id, creator_id=u.id if u else 1)
         db.add(t); db.commit(); db.refresh(t)
         m = ModelVersion(model_name="血缘模型", model_code="ln-model", version="v1",
                          storage_path="m/ln/v1", task_id=t.id, is_current=True,
-                         metrics_json={}, hyperparams_json={}, dataset_version=ds.version)
+                         metrics_json={"accuracy": 0.9}, hyperparams_json={},
+                         dataset_version=ds.version)
         db.add(m); db.commit()
         resp = client.get(f"{PREFIX}/datasets/{ds.id}/lineage", headers=admin_headers)
         assert resp.status_code == 200
         data = resp.json()["data"]
+        # R1: 来源记录（上传者、时间、原始位置）
+        assert data["origin"]["uploaded_by"] is not None
+        assert data["origin"]["uploaded_at"] is not None
+        assert data["origin"]["original_source"] is not None
+        # R2: 转换过程（规则、时间、版本）
+        assert len(data["transformations"]) >= 1
+        for tx in data["transformations"]:
+            assert "rule" in tx and "timestamp" in tx
+        # R3: 下游使用（训练任务ID、时间、结果）
         assert len(data["downstream"]) >= 2  # task + model
+        task_entry = [d for d in data["downstream"] if d["type"] == "training_task"][0]
+        assert "task_id" in task_entry
+        assert "status" in task_entry
+        assert "started_at" in task_entry
 
-    def test_19_impact(self, client, admin_headers, db):
+    def test_23_impact(self, client, admin_headers, db):
         ds = Dataset(name="im", data_type="text", storage_path="/t", source="mysql", owner_id=1)
         db.add(ds); db.commit(); db.refresh(ds)
         t = TrainingTask(task_name="影响任务", task_code="IM-TASK", status="completed",

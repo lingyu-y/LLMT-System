@@ -1,5 +1,7 @@
 """Dataset management endpoints -- 数据处理接口 (Part 3 of jiekou.md)."""
 
+from typing import List
+
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, status
 from sqlalchemy.orm import Session
 
@@ -47,9 +49,30 @@ def upload_dataset_file(
     log_service.create_log(
         db, user_id=current_user.id, username=current_user.username,
         action="upload", resource="dataset", resource_id=ds.id,
-        detail=f"上传文件 {file.filename} ({result.get('size', 0)} bytes)",
+        detail=f"上传文件 {file.filename} ({result.get('size_stored', 0)} bytes)",
     )
     return success_response(result, "文件上传成功")
+
+
+@router.post("/upload/batch")
+def upload_files_batch(
+    files: List[UploadFile],
+    dataset_id: int = Query(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    ds = dataset_repository.get_dataset_by_id(db, dataset_id)
+    if ds is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="数据集不存在")
+    result = dataset_service.upload_files_batch(db, ds, files, current_user.username)
+    if not result.get("files"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=result.get("error", "上传失败"))
+    log_service.create_log(
+        db, user_id=current_user.id, username=current_user.username,
+        action="upload_batch", resource="dataset", resource_id=ds.id,
+        detail=f"批量上传 {result.get('total', 0)} 个文件，成功 {result.get('uploaded', 0)}",
+    )
+    return success_response(result, "批量上传完成")
 
 
 @router.post("/upload/{upload_id}/resume")
@@ -57,7 +80,15 @@ def resume_upload(
     upload_id: str,
     _current_user: User = Depends(get_current_user),
 ):
-    return success_response({"upload_id": upload_id, "resumed": True, "offset": 0}, "断点续传已就绪")
+    state = dataset_service.get_resume_state(upload_id)
+    if state is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="上传会话不存在")
+    return success_response(
+        {"upload_id": upload_id, "filename": state["filename"],
+         "total_size": state["total_size"], "offset": state["offset"],
+         "resumed": True},
+        "断点续传已就绪",
+    )
 
 
 @router.post("/import/external")
