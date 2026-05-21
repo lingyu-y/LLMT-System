@@ -112,6 +112,7 @@ class TrainingTaskOut(BaseModel):
     dataset_id: int
     checkpoint_path: Optional[str]
     error_message: Optional[str]
+    celery_task_id: Optional[str] = None
     started_at: Optional[datetime]
     ended_at: Optional[datetime]
     created_at: datetime

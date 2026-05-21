@@ -85,6 +85,23 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
         from llmt_training.reporting.callback_bridge import ReportingCallbackBridge
         reporting_callback = ReportingCallbackBridge.from_config(config_dict)
 
+        # Build model from config via ModelRegistry
+        from llmt_training.models.registry import ModelRegistry
+        model_type = config_dict.get("model", {}).get("model_type", "gpt2")
+        model_provider = ModelRegistry.get(model_type)
+        model = model_provider.get_model(config_dict.get("model", {}))
+
+        # Build dataloaders from config
+        from llmt_training.data.data_utils import create_dataset_from_config, build_dataloaders
+        is_distributed = config_dict.get("strategy", {}).get("num_gpus", 1) > 1
+        dataset = create_dataset_from_config(config_dict)
+        train_dataloader, eval_dataloader = build_dataloaders(
+            dataset, config_dict, distributed=is_distributed,
+        )
+
+        # Build loss function from model provider
+        loss_fn = model_provider.get_loss_fn(config_dict.get("model", {}))
+
         # Create trainer
         from llmt_training.trainers.factory import create_trainer
         from llmt_training.core.callbacks import CallbackList
@@ -95,14 +112,18 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
             max_epochs=config_dict.get("hyperparams", {}).get("max_epochs", 10),
             max_steps=config_dict.get("hyperparams", {}).get("max_steps"),
         )
-        callbacks = CallbackList([reporting_callback])
+        callbacks = CallbackList([reporting_callback, _CancellationCheckCallback(task_code)])
 
         trainer = create_trainer(
             framework=framework,
             parallel_strategy=parallel_strategy,
             config=config_dict,
+            model=model,
+            train_dataloader=train_dataloader,
+            eval_dataloader=eval_dataloader,
             callbacks=callbacks,
             state=state,
+            loss_fn=loss_fn,
         )
 
         # For in-process training (pytorch/deepspeed single-node)
@@ -151,6 +172,59 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+class _CancellationCheckCallback:
+    """Callback that polls the DB for cancellation status.
+
+    Celery ``revoke(..., terminate=True)`` only sends SIGTERM to the worker
+    process, which may be ignored or arrive late.  This callback provides
+    cooperative cancellation: on every ``on_step_end`` it queries PostgreSQL
+    for the current task status and, if the row has been marked
+    ``cancelled``, propagates that into ``state.status`` so the trainer's
+    ``_should_stop()`` check will exit the loop cleanly.
+    """
+
+    def __init__(self, task_code: str, poll_every: int = 10):
+        self._task_code = task_code
+        self._poll_every = poll_every  # check DB every N steps
+        self._step_counter = 0
+
+    # -- TrainingCallback interface ------------------------------------------
+
+    def on_train_begin(self, state, **kwargs):
+        pass
+
+    def on_train_end(self, state, **kwargs):
+        pass
+
+    def on_epoch_begin(self, state, **kwargs):
+        pass
+
+    def on_epoch_end(self, state, **kwargs):
+        pass
+
+    def on_step_end(self, state, **kwargs):
+        self._step_counter += 1
+        if self._step_counter % self._poll_every != 0:
+            return
+        try:
+            from sqlalchemy import create_engine as _ce
+            from sqlalchemy.orm import Session as _S
+            from app.models.training_task import TrainingTask as _TT
+            _engine = _ce(settings.postgres_database_url)
+            with _S(_engine) as db:
+                row = db.query(_TT).filter(_TT.task_code == self._task_code).first()
+                if row is not None and row.status == "cancelled":
+                    state.status = "cancelled"
+        except Exception:
+            pass  # best-effort; don't crash training on a DB hiccup
+
+    def on_checkpoint(self, state, **kwargs):
+        pass
+
+    def on_error(self, state, **kwargs):
+        pass
+
 
 def _build_training_config(
     task_code: str,
@@ -257,13 +331,45 @@ def _should_run_in_process(config: dict) -> bool:
 
 
 def _get_trainer_script(framework: str) -> str:
-    """Get the path to the appropriate trainer entry script."""
-    module_path = settings.LLMT_TRAINING_MODULE_PATH
-    # Look for example scripts
-    base = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    scripts_dir = os.path.join(base, "LLMT-training", "examples")
+    """Get the path to the appropriate trainer entry script.
 
-    if framework == "megatron":
-        return os.path.join(scripts_dir, "gpt_pretrain.py")
-    else:
-        return os.path.join(scripts_dir, "gpt_pretrain.py")
+    Resolution order:
+      1. ``LLMT_TRAINING_SCRIPTS_DIR`` env-var / settings key (absolute path)
+      2. ``LLMT_TRAINING_MODULE_PATH`` if it points to an existing directory
+      3. Relative path derived from this file's location:
+         ``__file__`` is ``<repo>/LLMT-backend/app/tasks/training_tasks.py``
+         so 4 levels up → ``<repo>/``, then ``LLMT-training/examples/``
+    """
+    # 1. Explicit override via settings / env
+    scripts_dir = getattr(settings, "LLMT_TRAINING_SCRIPTS_DIR", None)
+    if scripts_dir and os.path.isdir(scripts_dir):
+        script = os.path.join(scripts_dir, _script_name(framework))
+        if os.path.isfile(script):
+            return script
+
+    # 2. LLMT_TRAINING_MODULE_PATH as filesystem path
+    module_path = settings.LLMT_TRAINING_MODULE_PATH
+    candidate = os.path.join(module_path, "examples")
+    if os.path.isdir(candidate):
+        script = os.path.join(candidate, _script_name(framework))
+        if os.path.isfile(script):
+            return script
+
+    # 3. Derive from repo layout: LLMT-training is a sibling of LLMT-backend
+    #    __file__ = <repo>/LLMT-backend/app/tasks/training_tasks.py
+    #    4 dirname hops → <repo>/
+    repo_root = os.path.dirname(
+        os.path.dirname(
+            os.path.dirname(
+                os.path.dirname(os.path.abspath(__file__))
+            )
+        )
+    )
+    scripts_dir = os.path.join(repo_root, "LLMT-training", "examples")
+    return os.path.join(scripts_dir, _script_name(framework))
+
+
+def _script_name(framework: str) -> str:
+    """Return the entry-point script filename for *framework*."""
+    # Currently all strategies use gpt_pretrain.py; extend as needed.
+    return "gpt_pretrain.py"

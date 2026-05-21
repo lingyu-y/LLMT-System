@@ -57,6 +57,7 @@ class Settings(BaseSettings):
 
     # Training framework
     LLMT_TRAINING_MODULE_PATH: str = "llmt_training"
+    LLMT_TRAINING_SCRIPTS_DIR: str | None = None  # absolute path to LLMT-training/examples/
     TRAINING_DEFAULT_TIMEOUT_HOURS: int = 168  # 7 days
 
     @field_validator("DEBUG", mode="before")

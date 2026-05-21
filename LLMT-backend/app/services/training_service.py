@@ -44,7 +44,10 @@ def create_task(db: Session, body: TrainingTaskCreate, creator_id: int) -> Train
     # Dispatch to Celery (lazy import to avoid circular deps at module level)
     try:
         from app.tasks.training_tasks import run_training_task
-        run_training_task.delay(task.task_code)
+        async_result = run_training_task.delay(task.task_code)
+        # Store the real Celery task ID so we can revoke it later
+        task.celery_task_id = async_result.id
+        db.commit()
         repo.update_status(db, task.id, status="queued")
     except Exception:
         # Celery not available (e.g. dev mode without worker) – keep as "created"
@@ -86,10 +89,12 @@ def cancel_task(db: Session, task_id: int) -> TrainingTaskOut | None:
     task = repo.cancel_task(db, task_id)
     if task is None:
         return None
-    # Try to revoke Celery task
+    # Revoke the real Celery task using its broker task ID
     try:
         from app.core.celery_app import celery_app
-        celery_app.control.revoke(task.task_code, terminate=True)
+        celery_id = task.celery_task_id
+        if celery_id:
+            celery_app.control.revoke(celery_id, terminate=True)
     except Exception:
         pass
     return TrainingTaskOut.model_validate(task)
