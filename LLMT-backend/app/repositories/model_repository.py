@@ -70,18 +70,40 @@ def get_model_by_code_and_version(
     )
 
 
+def auto_version(db: Session, model_code: str) -> str:
+    """自动生成语义化版本号：查已有版本，累加 patch；首个版本为 v1.0.0。"""
+    existing = (
+        db.query(ModelVersion.version)
+        .filter(ModelVersion.model_code == model_code)
+        .all()
+    )
+    max_patch = -1
+    max_minor = 0
+    max_major = 1
+    for (ver,) in existing:
+        try:
+            parts = ver.lstrip("v").split(".")
+            if len(parts) == 3:
+                maj, minor, patch = int(parts[0]), int(parts[1]), int(parts[2])
+                if patch > max_patch:
+                    max_major, max_minor, max_patch = maj, minor, patch
+        except (ValueError, IndexError):
+            pass
+    return f"v{max_major}.{max_minor}.{max_patch + 1}"
+
+
 def create_model(
     db: Session,
     model_name: str,
     model_code: str,
-    version: str,
     tag: str | None = None,
     description: str | None = None,
     framework: str | None = None,
-    dataset_version: str | None = None,
-    metrics_json: dict | None = None,
-    hyperparams_json: dict | None = None,
+    metrics: dict | None = None,
+    training_metadata: dict | None = None,
 ) -> ModelVersion:
+    version = auto_version(db, model_code)
+
     db.query(ModelVersion).filter(
         ModelVersion.model_code == model_code, ModelVersion.is_current.is_(True)
     ).update({"is_current": False})
@@ -92,11 +114,11 @@ def create_model(
         version=version,
         tag=tag,
         description=description,
-        framework=framework,
+        framework=framework or (training_metadata or {}).get("framework"),
         storage_path=f"models/{model_code}/{version}",
-        dataset_version=dataset_version,
-        metrics_json=metrics_json or {},
-        hyperparams_json=hyperparams_json or {},
+        dataset_version=(training_metadata or {}).get("dataset_version"),
+        metrics_json=metrics or {},
+        hyperparams_json=training_metadata or {},
         is_current=True,
     )
     db.add(model)
