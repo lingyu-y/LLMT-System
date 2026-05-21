@@ -66,20 +66,34 @@ def import_external(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    source = body.get("source", "unknown")
-    ds = dataset_repository.create_dataset(
+    source_type = body.get("source_type", "filesystem")
+    source_path = body.get("source_path", "")
+    if not source_path:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="source_path 不能为空")
+
+    result = dataset_service.import_from_external(
         db,
-        name=body.get("name", f"import-{source}"),
+        name=body.get("name", f"import-{source_type}"),
         data_type=body.get("data_type", "text"),
         owner_id=current_user.id,
-        source=source,
+        source_type=source_type,
+        source_path=source_path,
+        description=body.get("description"),
+        version=body.get("version", "v1.0.0"),
     )
+    ds = result["dataset"]
+    db.refresh(ds)
     log_service.create_log(
         db, user_id=current_user.id, username=current_user.username,
         action="import", resource="dataset", resource_id=ds.id,
-        detail=f"从 {source} 导入数据集",
+        detail=f"从 {source_type}:{source_path} 导入 {result['imported_files']} 个文件",
     )
-    return success_response(DatasetOut.model_validate(ds), "外部数据导入成功")
+    return success_response({
+        "dataset": DatasetOut.model_validate(ds).model_dump(),
+        "imported_files": result["imported_files"],
+        "total_size": result["total_size"],
+        "errors": result["errors"],
+    }, "外部数据导入成功")
 
 
 @router.get("/processing-jobs")
@@ -282,7 +296,7 @@ def get_lineage(
     ds = dataset_repository.get_dataset_by_id(db, dataset_id)
     if ds is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="数据集不存在")
-    return success_response(dataset_service.get_lineage(ds))
+    return success_response(dataset_service.get_lineage(db, ds))
 
 
 @router.get("/{dataset_id}/lineage/impact")
@@ -294,4 +308,4 @@ def get_lineage_impact(
     ds = dataset_repository.get_dataset_by_id(db, dataset_id)
     if ds is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="数据集不存在")
-    return success_response(dataset_service.get_lineage_impact(ds))
+    return success_response(dataset_service.get_lineage_impact(db, ds))

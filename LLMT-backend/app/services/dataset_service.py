@@ -5,6 +5,7 @@ tracking per the software design specification (Section 4.4.1).
 """
 
 import hashlib
+import io as _stdlib_io
 import re
 import uuid
 from datetime import datetime, timezone
@@ -15,6 +16,8 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.database import get_minio_client
 from app.models.dataset import Dataset
+from app.models.model_version import ModelVersion
+from app.models.training_task import TrainingTask
 from app.repositories import dataset_repository
 
 _SUPPORTED_EXTENSIONS = {
@@ -113,18 +116,9 @@ def upload_file(
 
 
 def start_preprocess(db: Session, dataset: Dataset) -> dict:
-    job_id = f"JOB-{str(uuid.uuid4())[:8]}"
     dataset_repository.update_dataset(db, dataset, quality_status="checking")
-    return {
-        "job_id": job_id,
-        "dataset_id": dataset.id,
-        "dataset_name": dataset.name,
-        "job_type": "preprocess",
-        "status": "running",
-        "progress": 10,
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "finished_at": None,
-    }
+    job = dataset_repository.create_processing_job(db, dataset, "preprocess")
+    return job
 
 
 # ============================================================================
@@ -238,12 +232,46 @@ def repair_quality(db: Session, dataset: Dataset) -> dict:
 # ============================================================================
 
 
-def get_lineage(dataset: Dataset) -> dict:
+def get_lineage(db: Session, dataset: Dataset) -> dict:
+    """Build the data lineage graph from source → transforms → downstream consumers.
+
+    Three-level chain per requirement (Table 4):
+    1. dataset → training tasks (via dataset_id FK)
+    2. training tasks → model versions (via task_id FK)
+    3. model versions → downstream datasets (via dataset_version match)
+    """
+    # --- Transformations applied to this dataset ---
     transformations: list[str] = []
     if dataset.quality_status in ("checking", "passed", "failed"):
         transformations.append("quality_validated")
     if dataset.file_count and dataset.file_count > 0:
         transformations.append("data_loaded")
+
+    # --- Upstream: what produced this dataset ---
+    upstream: list[str] = []
+    if dataset.source:
+        upstream.append(dataset.source)
+
+    # --- Downstream: training tasks that consume this dataset ---
+    downstream: list[str] = []
+    tasks = (
+        db.query(TrainingTask)
+        .filter(TrainingTask.dataset_id == dataset.id)
+        .all()
+    )
+    for t in tasks:
+        downstream.append(f"task:{t.task_code} (epoch {t.current_epoch}/{t.max_epoch})")
+
+        # --- Deeper: model versions produced by those tasks ---
+        models = (
+            db.query(ModelVersion)
+            .filter(ModelVersion.task_id == t.id)
+            .all()
+        )
+        for m in models:
+            models_str = f"model:{m.model_code}:{m.version}"
+            if models_str not in downstream:
+                downstream.append(models_str)
 
     return {
         "dataset_id": dataset.id,
@@ -251,16 +279,169 @@ def get_lineage(dataset: Dataset) -> dict:
         "source": dataset.source,
         "version": dataset.version,
         "transformations": transformations,
-        "upstream": [],
-        "downstream": [],
+        "upstream": upstream,
+        "downstream": downstream,
         "lineage_status": dataset.lineage_status or "tracked",
     }
 
 
-def get_lineage_impact(dataset: Dataset) -> dict:
+def get_lineage_impact(db: Session, dataset: Dataset) -> dict:
+    """Analyse impact: which downstream artifacts would be affected if this
+    dataset changes.  Queries the real FK graph dataset → task → model."""
+    # Tasks directly using this dataset
+    tasks = (
+        db.query(TrainingTask)
+        .filter(TrainingTask.dataset_id == dataset.id)
+        .all()
+    )
+    affected_tasks = [t.task_code for t in tasks]
+
+    # Models produced by those tasks
+    task_ids = [t.id for t in tasks]
+    models: list[ModelVersion] = []
+    if task_ids:
+        models = (
+            db.query(ModelVersion)
+            .filter(ModelVersion.task_id.in_(task_ids))
+            .all()
+        )
+    affected_models = [f"{m.model_code}:{m.version}" for m in models]
+
+    # Datasets that reference this dataset's version string
+    siblings = (
+        db.query(Dataset)
+        .filter(Dataset.id != dataset.id)
+        .filter(
+            (Dataset.source == dataset.source)
+            | (Dataset.version == dataset.version)
+        )
+        .limit(20)
+        .all()
+    )
+    affected_datasets = [d.name for d in siblings]
+
     return {
         "dataset_id": dataset.id,
-        "affected_models": [],
-        "affected_tasks": [],
-        "affected_datasets": [],
+        "affected_models": affected_models,
+        "affected_tasks": affected_tasks,
+        "affected_datasets": affected_datasets,
     }
+
+
+# ============================================================================
+# External Import — 外部数据源同步
+# ============================================================================
+
+import os as _os
+import urllib.request as _urllib
+
+
+def import_from_external(
+    db: Session,
+    name: str,
+    data_type: str,
+    owner_id: int,
+    source_type: str,
+    source_path: str,
+    description: str | None = None,
+    version: str = "v1.0.0",
+) -> dict:
+    """Pull data from an external source (filesystem or HTTP) into the managed
+    MinIO bucket, create the dataset record, and return a summary.
+
+    source_type: "filesystem" | "http"
+    source_path: local directory path or HTTP(S) URL prefix
+    """
+    settings = get_settings()
+    minio = get_minio_client()
+    bucket = settings.MINIO_BUCKET_DATASETS
+
+    # 1. Create the dataset record first (without file count yet)
+    ds = dataset_repository.create_dataset(
+        db, name=name, data_type=data_type, owner_id=owner_id,
+        description=description, version=version,
+        source=f"{source_type}:{source_path}",
+    )
+
+    imported: list[dict] = []
+    errors: list[str] = []
+
+    try:
+        storage_prefix = ds.storage_path.rstrip("/")
+
+        if source_type == "filesystem":
+            imported, errors = _import_filesystem(minio, bucket, storage_prefix, source_path)
+        elif source_type == "http":
+            imported, errors = _import_http(minio, bucket, storage_prefix, source_path)
+        else:
+            errors.append(f"不支持的源类型: {source_type}")
+
+        # 2. Update metadata
+        total_files = len(imported)
+        total_size = sum(f["size"] for f in imported)
+        dataset_repository.update_dataset(
+            db, ds,
+            file_count=total_files,
+            total_size=total_size,
+            data_type=data_type or "other",
+        )
+    except Exception as exc:
+        errors.append(str(exc))
+
+    return {
+        "dataset": ds,
+        "imported_files": total_files if imported else 0,
+        "total_size": total_size if imported else 0,
+        "errors": errors,
+    }
+
+
+def _import_filesystem(
+    minio, bucket: str, prefix: str, root: str,
+) -> tuple[list[dict], list[str]]:
+    """Walk *root* directory, upload each file to MinIO."""
+    imported: list[dict] = []
+    errors: list[str] = []
+
+    for dirpath, _, filenames in _os.walk(root):
+        for fn in filenames:
+            full = _os.path.join(dirpath, fn)
+            try:
+                rel = _os.path.relpath(full, root)
+                obj_name = f"{prefix}/{rel}"
+                with open(full, "rb") as fh:
+                    data = fh.read()
+                size = len(data)
+                minio.put_object(bucket, obj_name, data=_stdlib_io.BytesIO(data), length=size)
+                imported.append({
+                    "filename": fn, "object": obj_name,
+                    "size": size, "checksum": _compute_checksum(data),
+                })
+            except Exception as exc:
+                errors.append(f"{fn}: {exc}")
+
+    return imported, errors
+
+
+def _import_http(
+    minio, bucket: str, prefix: str, url: str,
+) -> tuple[list[dict], list[str]]:
+    """Fetch a single file from *url* and store it.  (Batch URLs can be extended.)"""
+    imported: list[dict] = []
+    errors: list[str] = []
+    fn = url.rstrip("/").rsplit("/", 1)[-1] or "downloaded"
+
+    try:
+        with _urllib.urlopen(url, timeout=30) as resp:
+            data = resp.read()
+        size = len(data)
+        obj_name = f"{prefix}/{fn}"
+        minio.put_object(bucket, obj_name, data=_stdlib_io.BytesIO(data), length=size)
+        imported.append({
+            "filename": fn, "object": obj_name,
+            "size": size, "checksum": _compute_checksum(data),
+        })
+    except Exception as exc:
+        errors.append(f"{url}: {exc}")
+
+    return imported, errors
