@@ -53,7 +53,7 @@ export const listUsers = (params?: { page?: number; page_size?: number; keyword?
 export const createUser = async (payload: { username: string; password: string; real_name?: string; email?: string; phone?: string; role_ids?: number[] }) =>
   unwrap(await post<ApiMessage<SystemUser>>('/system/users', payload))
 
-export const updateUser = async (id: number, payload: { real_name?: string; email?: string; phone?: string; password?: string }) =>
+export const updateUser = async (id: number, payload: { username?: string; real_name?: string; email?: string; phone?: string; password?: string }) =>
   unwrap(await put<ApiMessage<SystemUser>>(`/system/users/${id}`, payload))
 
 export const deleteUser = async (id: number) => await del<ApiMessage>(`/system/users/${id}`)

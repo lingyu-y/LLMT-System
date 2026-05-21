@@ -32,7 +32,7 @@ const buildUrl = (path: string, params?: Record<string, string | number | boolea
     }
   })
 
-  return `${url.pathname}${url.search}`
+  return url.toString()
 }
 
 const parseErrorMessage = async (response: Response) => {

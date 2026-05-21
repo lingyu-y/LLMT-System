@@ -387,9 +387,20 @@ const saveUser = async () => {
   }
 
   if (editingUser.value) {
-    await updateUser(editingUser.value.id, { real_name: userForm.name })
+    await updateUser(editingUser.value.id, {
+      username: userForm.account,
+      real_name: userForm.name,
+    })
+    const nextStatus = labelToStatus(userForm.status)
+    if (nextStatus !== labelToStatus(editingUser.value.status)) {
+      await updateUserStatus(editingUser.value.id, nextStatus)
+    }
   } else {
-    await createUser({ username: userForm.account, real_name: userForm.name, password: '123456' })
+    const createdUser = await createUser({ username: userForm.account, real_name: userForm.name, password: '123456' })
+    const nextStatus = labelToStatus(userForm.status)
+    if (nextStatus !== 'active') {
+      await updateUserStatus(createdUser.id, nextStatus)
+    }
   }
   userDialogVisible.value = false
   await loadSystemData()

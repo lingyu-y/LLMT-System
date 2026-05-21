@@ -92,6 +92,10 @@ def update_user(
     user = user_repository.get_user_by_id(db, user_id)
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
+    if body.username and body.username != user.username:
+        existing = user_repository.get_user_by_username(db, body.username)
+        if existing is not None:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="用户名已存在")
     user = user_repository.update_user(db, user, **body.model_dump(exclude_unset=True))
     log_service.create_log(
         db, user_id=None, username="admin",
