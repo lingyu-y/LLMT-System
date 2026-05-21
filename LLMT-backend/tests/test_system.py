@@ -119,5 +119,5 @@ class TestLogs:
         assert client.get(f"{PREFIX}/system/my-logs", headers=admin_headers).status_code == 200
     def test_24_ws(self, client):
         with client.websocket_connect(f"{PREFIX}/system/logs/stream") as ws:
-            ws.send_text("p"); msg = json.loads(ws.receive_text())
+            msg = json.loads(ws.receive_text())  # 服务端主动推送
             assert "created_at" in msg
