@@ -1,8 +1,13 @@
 <template>
   <div>
-    <div class="page-header">
-      <h1 class="page-title">软件文档自动生成</h1>
-      <p class="page-description">基于大语言模型自动生成需求分析、系统设计等软件开发文档</p>
+    <div class="page-header doc-header">
+      <div>
+        <h1 class="page-title">对话式文档生成</h1>
+        <p class="page-description">选择文档模型后，通过多轮对话生成提纲、段落草稿和修订建议</p>
+      </div>
+      <el-button :icon="Management" @click="modelDrawerVisible = true">
+        当前模型：{{ selectedModel.name }}
+      </el-button>
     </div>
 
     <div class="chat-container">
@@ -12,17 +17,20 @@
           <div class="chat-bubble">
             <p>{{ message.content }}</p>
             <div v-if="message.quick" class="quick-actions">
-              <el-button v-for="item in quickActions" :key="item.type" @click="selectQuick(item.label)">{{ item.label }}</el-button>
+              <el-button v-for="item in quickActions" :key="item.type" @click="selectQuick(item.prompt)">{{ item.label }}</el-button>
             </div>
             <div v-if="message.preview" class="doc-preview">
-              <h3>{{ message.preview.title }}</h3>
+              <div class="preview-head">
+                <h3>{{ message.preview.title }}</h3>
+                <span>{{ message.preview.model }}</span>
+              </div>
               <div v-for="section in message.preview.sections" :key="section.title" class="document-section">
                 <strong>{{ section.title }}</strong>
                 <p>{{ section.content }}</p>
               </div>
               <div class="preview-actions">
-                <el-button type="primary" :icon="Download" @click="ElMessage.success('已生成导出任务')">导出文档</el-button>
-                <el-button :icon="Edit">编辑文档</el-button>
+                <el-button type="primary" :icon="Download" @click="saveDraft(message.preview)">保存草稿</el-button>
+                <el-button :icon="Edit" @click="ElMessage.info('可继续通过对话修改草稿')">继续修改</el-button>
               </div>
             </div>
           </div>
@@ -34,60 +42,136 @@
           v-model="input"
           type="textarea"
           :autosize="{ minRows: 1, maxRows: 4 }"
-          placeholder="描述您的项目需求，例如：生成离线大数据训练系统的需求分析文档..."
+          placeholder="输入文档生成需求，例如：帮我补写模型训练模块的需求描述..."
           @keydown.enter.exact.prevent="send"
         />
         <el-button type="primary" :icon="Promotion" circle @click="send" />
       </div>
     </div>
+
+    <el-drawer v-model="modelDrawerVisible" title="选择文档生成模型" size="520px">
+      <div class="model-drawer">
+        <button
+          v-for="model in docModels"
+          :key="model.id"
+          class="doc-model-card"
+          :class="{ active: selectedModel.id === model.id }"
+          @click="selectModel(model)"
+        >
+          <span class="model-name">{{ model.name }}</span>
+          <span class="model-meta">{{ model.provider }} · {{ model.context }}</span>
+          <p>{{ model.desc }}</p>
+          <span class="model-tags">
+            <span v-for="tag in model.tags" :key="tag">{{ tag }}</span>
+          </span>
+        </button>
+      </div>
+    </el-drawer>
   </div>
 </template>
 
 <script setup lang="ts">
-import { nextTick, ref } from 'vue'
+import { nextTick, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { Download, Edit, Promotion } from '@element-plus/icons-vue'
+import { Download, Edit, Management, Promotion } from '@element-plus/icons-vue'
+import { chatGenerate, createDraft, listDocumentModels } from '@/api/documents'
 
 interface Message {
   id: number
   role: 'ai' | 'user'
   content: string
   quick?: boolean
-  preview?: { title: string; sections: { title: string; content: string }[] }
+  preview?: { title: string; model: string; sections: { title: string; content: string }[] }
+}
+
+interface DocModel {
+  id: string
+  name: string
+  provider: string
+  context: string
+  desc: string
+  tags: string[]
 }
 
 const quickActions = [
-  { type: 'requirement', label: '需求分析文档' },
-  { type: 'design', label: '系统设计文档' },
-  { type: 'api', label: 'API接口文档' },
-  { type: 'test', label: '测试用例文档' },
+  { type: 'outline', label: '生成文档提纲', prompt: '请帮我生成离线大数据训练与应用系统的需求文档提纲' },
+  { type: 'section', label: '补写模块段落', prompt: '请帮我补写模型训练模块的功能需求段落' },
+  { type: 'polish', label: '润色已有内容', prompt: '请帮我把下面这段需求描述改得更规范：' },
+  { type: 'test', label: '生成测试要点', prompt: '请帮我生成模型训练模块的验收测试要点' },
+]
+
+const defaultDocModels: DocModel[] = [
+  {
+    id: 'gpt-doc',
+    name: 'GPT-Generator v1.5',
+    provider: '文本生成模型',
+    context: '32K 上下文',
+    desc: '适合生成需求描述、概要设计段落和测试说明，输出更偏通用文档草稿。',
+    tags: ['需求段落', '测试要点', '润色'],
+  },
+  {
+    id: 'layout-doc',
+    name: 'LayoutLMv3-Doc v2.0',
+    provider: '文档理解模型',
+    context: '16K 上下文',
+    desc: '适合基于已有文档内容进行结构整理、章节补全和格式化改写。',
+    tags: ['结构整理', '章节补全', '格式规范'],
+  },
+  {
+    id: 'llmt-assistant',
+    name: 'LLMT-Assistant',
+    provider: '项目定制模型',
+    context: '8K 上下文',
+    desc: '适合围绕本系统需求进行对话式补写，强调功能范围收敛和术语一致。',
+    tags: ['项目需求', '范围收敛', '术语一致'],
+  },
 ]
 
 const input = ref('')
 const messageBox = ref<HTMLDivElement>()
+const modelDrawerVisible = ref(false)
+const docModels = ref<DocModel[]>(defaultDocModels)
+const selectedModel = ref<DocModel>(defaultDocModels[0]!)
 const messages = ref<Message[]>([
   {
     id: 1,
     role: 'ai',
-    content: '您好！我是软件文档生成助手，可以帮您自动生成以下类型的文档：',
+    content: '您好！我是对话式文档助手。请先确认右上角选择的模型，然后通过对话生成提纲、段落草稿、润色建议或测试要点。',
     quick: true,
   },
 ])
 
 const scrollBottom = () => nextTick(() => messageBox.value?.scrollTo({ top: messageBox.value.scrollHeight, behavior: 'smooth' }))
 
-const buildPreview = (prompt: string) => ({
-  title: prompt.includes('API') ? '离线大数据训练与应用系统 API 接口文档' : '离线大数据训练与应用系统文档预览',
+const buildPreview = (prompt: string, content?: string) => ({
+  title: prompt.includes('测试') ? '模型训练模块测试要点草稿' : '离线大数据训练与应用系统文档片段草稿',
+  model: selectedModel.value.name,
   sections: [
-    { title: '1. 项目概述', content: '系统面向离线大数据训练场景，覆盖数据导入、预处理、训练配置、监控、模型版本管理与文档生成。' },
-    { title: '2. 核心功能', content: '包括多模态数据处理、GPU训练任务编排、损失曲线监控、模型版本回滚、系统用户权限与日志审计。' },
-    { title: '3. 非功能需求', content: '要求训练过程可观测、配置可复用、权限边界清晰，并为后续 FastAPI 后端接口预留扩展能力。' },
+    { title: '1. 建议写入位置', content: '可作为需求规格说明书中对应模块的小节草稿，后续需要人工确认后再纳入正式文档。' },
+    { title: '2. 草稿内容', content: content ?? '系统支持通过对话方式生成文档提纲、模块描述、验收测试点和修订建议，生成内容以片段形式保存。' },
+    { title: '3. 后续确认项', content: '需确认术语是否与需求文档一致、功能范围是否过度承诺、是否需要补充接口字段或截图。' },
   ],
 })
 
-const selectQuick = (label: string) => {
-  input.value = `请生成一份${label}，项目是离线大数据训练与应用系统`
+const saveDraft = async (preview: Message['preview']) => {
+  if (!preview) return
+  await createDraft({
+    doc_type: '对话草稿',
+    title: preview.title,
+    content: preview.sections.map((section) => `## ${section.title}\n\n${section.content}`).join('\n\n'),
+  })
+  ElMessage.success('已保存到草稿箱')
+}
+
+const selectQuick = (prompt: string) => {
+  input.value = prompt
   send()
+}
+
+const selectModel = (model: DocModel) => {
+  selectedModel.value = model
+  modelDrawerVisible.value = false
+  ElMessage.success(`已切换到 ${model.name}`)
 }
 
 const send = () => {
@@ -95,20 +179,48 @@ const send = () => {
   if (!content) return
   messages.value.push({ id: Date.now(), role: 'user', content })
   input.value = ''
-  window.setTimeout(() => {
+  chatGenerate({ prompt: content, model_code: selectedModel.value.id })
+    .then((result) => {
     messages.value.push({
       id: Date.now() + 1,
       role: 'ai',
-      content: '已根据您的描述生成文档概要，以下是可导出的预览版本：',
-      preview: buildPreview(content),
+      content: `已使用 ${selectedModel.value.name} 生成一段可继续修改的文档草稿。`,
+      preview: buildPreview(content, result.reply),
     })
     scrollBottom()
-  }, 450)
+    })
+    .catch((error) => {
+      ElMessage.error(error instanceof Error ? error.message : '文档生成失败')
+    })
   scrollBottom()
 }
+
+onMounted(async () => {
+  try {
+    const models = await listDocumentModels()
+    docModels.value = models.map((model) => ({
+      id: model.code,
+      name: model.name,
+      provider: '后端文档模型',
+      context: '项目配置',
+      desc: model.description,
+      tags: ['文档生成'],
+    }))
+    selectedModel.value = docModels.value[0] ?? defaultDocModels[0]!
+  } catch {
+    docModels.value = defaultDocModels
+  }
+})
 </script>
 
 <style scoped>
+.doc-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
 .chat-container {
   display: flex;
   height: calc(100vh - 176px);
@@ -186,7 +298,20 @@ const send = () => {
 }
 
 .doc-preview h3 {
-  margin: 0 0 12px;
+  margin: 0;
+}
+
+.preview-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.preview-head span {
+  color: var(--text-muted);
+  font-size: 12px;
 }
 
 .document-section {
@@ -208,5 +333,70 @@ const send = () => {
   padding: 16px;
   border-top: 1px solid var(--border-color);
   background: #fff;
+}
+
+.model-drawer {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.doc-model-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 16px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: #fff;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.doc-model-card.active {
+  border-color: var(--primary-color);
+  background: rgb(37 99 235 / 5%);
+}
+
+.model-name {
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.model-meta,
+.doc-model-card p {
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.doc-model-card p {
+  margin: 0;
+  line-height: 1.6;
+}
+
+.model-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.model-tags span {
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: var(--bg-color);
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+@media (max-width: 700px) {
+  .doc-header {
+    flex-direction: column;
+  }
+
+  .chat-bubble {
+    max-width: 86%;
+  }
 }
 </style>

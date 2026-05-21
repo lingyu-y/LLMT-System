@@ -14,52 +14,96 @@
 
     <nav class="sidebar-nav">
       <div class="nav-section-title">主要功能</div>
-      <RouterLink v-for="item in menuItems.slice(0, 4)" :key="item.path" :to="item.path" class="nav-item">
+      <RouterLink v-for="item in businessMenus" :key="item.path" :to="item.path" class="nav-item">
         <el-icon><component :is="item.icon" /></el-icon>
         <span>{{ item.title }}</span>
-        <span v-if="item.badge" class="nav-badge">{{ item.badge }}</span>
       </RouterLink>
 
-      <div class="nav-section-title nav-gap">应用与服务</div>
-      <RouterLink v-for="item in menuItems.slice(4)" :key="item.path" :to="item.path" class="nav-item">
-        <el-icon><component :is="item.icon" /></el-icon>
-        <span>{{ item.title }}</span>
-      </RouterLink>
+      <template v-if="systemMenu">
+        <div class="nav-section-title nav-gap">系统管理</div>
+        <RouterLink :to="systemMenu.path" class="nav-item">
+          <el-icon><component :is="systemMenu.icon" /></el-icon>
+          <span>{{ systemMenu.title }}</span>
+        </RouterLink>
+      </template>
     </nav>
 
-    <div class="sidebar-footer">
+    <div class="sidebar-footer" v-if="currentUser">
       <div class="user-info">
-        <div class="user-avatar">AD</div>
+        <div class="user-avatar">{{ userInitials }}</div>
         <div class="user-details">
-          <div class="user-name">Admin User</div>
-          <div class="user-role">系统管理员</div>
+          <div class="user-name">{{ currentUser.realName }}</div>
+          <div class="user-role">{{ currentUser.role }}</div>
         </div>
-        <el-icon><ArrowDown /></el-icon>
+        <el-tooltip content="退出登录" placement="top">
+          <el-button class="logout-button" :icon="SwitchButton" circle text @click="handleLogout" />
+        </el-tooltip>
       </div>
     </div>
   </aside>
 </template>
 
 <script setup lang="ts">
-import {
-  ArrowDown,
-  Cpu,
-  DataAnalysis,
-  Document,
-  Files,
-  Management,
-  Monitor,
-  Setting,
-} from '@element-plus/icons-vue'
+import type { Component } from 'vue'
+import { computed } from 'vue'
+import { useRouter } from 'vue-router'
+import { Cpu, DataAnalysis, Document, Files, Management, Monitor, Setting, SwitchButton } from '@element-plus/icons-vue'
+import { ElMessageBox } from 'element-plus'
 
-const menuItems = [
-  { title: '仪表盘', path: '/dashboard', icon: Monitor, badge: '3' },
-  { title: '数据处理', path: '/data-processing', icon: Files },
-  { title: '模型训练', path: '/model-training', icon: DataAnalysis },
-  { title: '模型管理', path: '/model-management', icon: Management },
-  { title: '文档生成', path: '/doc-generation', icon: Document },
-  { title: '系统管理', path: '/system-management', icon: Setting },
+import { systemMenuKeys } from '@/mock/auth'
+import { useAuthStore } from '@/stores/auth'
+import { filterMenusByPermission } from '@/utils/permission'
+
+interface MenuItem {
+  title: string
+  path: string
+  icon?: Component
+  permission?: string
+  children?: MenuItem[]
+}
+
+const menuItems: MenuItem[] = [
+  { title: '仪表盘', path: '/dashboard', icon: Monitor, permission: 'dashboard' },
+  { title: '数据处理', path: '/data-processing', icon: Files, permission: 'dataset' },
+  { title: '模型训练', path: '/model-training', icon: DataAnalysis, permission: 'training' },
+  { title: '模型管理', path: '/model-management', icon: Management, permission: 'model' },
+  { title: '文档生成', path: '/doc-generation', icon: Document, permission: 'document' },
+  {
+    title: '系统管理',
+    path: '/system',
+    icon: Setting,
+    children: [
+      { title: '用户管理', path: '/system/users', permission: 'system:user' },
+      { title: '角色管理', path: '/system/roles', permission: 'system:role' },
+      { title: '菜单管理', path: '/system/menus', permission: 'system:menu' },
+      { title: '日志管理', path: '/system/log', permission: 'system:log' },
+    ],
+  },
 ]
+
+const router = useRouter()
+const authStore = useAuthStore()
+const currentUser = computed(() => authStore.user)
+const userInitials = computed(() => currentUser.value?.realName.slice(0, 2).toUpperCase() ?? '用户')
+const filteredMenus = computed(() => filterMenusByPermission(menuItems, authStore.visibleMenuKeys))
+const businessMenus = computed(() => filteredMenus.value.filter((item) => item.path !== '/system'))
+const systemMenu = computed(() =>
+  authStore.hasAnyPermission(systemMenuKeys) ? filteredMenus.value.find((item) => item.path === '/system') : undefined,
+)
+
+const handleLogout = async () => {
+  try {
+    await ElMessageBox.confirm('确认退出当前账号？', '退出登录', {
+      type: 'warning',
+      confirmButtonText: '退出',
+      cancelButtonText: '取消',
+    })
+    authStore.logout()
+    await router.push('/login')
+  } catch {
+    // User cancelled logout.
+  }
+}
 </script>
 
 <style scoped>
@@ -148,15 +192,6 @@ const menuItems = [
   font-weight: 600;
 }
 
-.nav-badge {
-  margin-left: auto;
-  padding: 2px 8px;
-  border-radius: 999px;
-  background: var(--primary-color);
-  color: #fff;
-  font-size: 11px;
-}
-
 .sidebar-footer {
   padding: 16px 12px;
   border-top: 1px solid var(--border-color);
@@ -191,5 +226,9 @@ const menuItems = [
 .user-role {
   color: var(--text-muted);
   font-size: 12px;
+}
+
+.logout-button {
+  color: var(--text-secondary);
 }
 </style>

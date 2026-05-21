@@ -75,6 +75,21 @@ cd LLMT-backend
 docker compose --env-file .env up -d
 ```
 
+如果需要初始化四类后端存储：
+
+```bash
+cd LLMT-backend
+conda activate llmt-backend
+python scripts/init_datastores.py
+```
+
+这个脚本会自动：
+
+- 执行 PostgreSQL 迁移
+- 初始化 InfluxDB bucket
+- 初始化 MinIO buckets
+- 初始化 Elasticsearch 日志 index
+
 后端健康检查接口：
 
 ```text
