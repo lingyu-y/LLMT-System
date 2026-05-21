@@ -87,8 +87,7 @@ class TestAlerts:
 class TestStream:
     def test_06_stream(self, client):
         with client.websocket_connect(f"{PREFIX}/dashboard/stream") as ws:
-            ws.send_text("ping")
-            msg = ws.receive_text()
+            msg = ws.receive_text()  # 服务端主动推送，无需客户端发送
             import json
             body = json.loads(msg)
             assert "summary" in body

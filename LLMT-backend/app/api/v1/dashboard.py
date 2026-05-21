@@ -63,7 +63,6 @@ async def dashboard_stream(websocket: WebSocket):
     await websocket.accept()
     try:
         while True:
-            await websocket.receive_text()
             payload = {
                 "summary": {"running_tasks": 0, "gpu_utilization": 72.5, "updated_at": datetime.now().isoformat()},
                 "alerts": [],

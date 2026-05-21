@@ -506,7 +506,6 @@ async def logs_stream(websocket: WebSocket):
     log_service.register_ws_client(websocket)
     try:
         while True:
-            await websocket.receive_text()
             entry = {
                 "username": "system",
                 "action": "heartbeat",
@@ -516,6 +515,6 @@ async def logs_stream(websocket: WebSocket):
                 "created_at": datetime.now().isoformat(),
             }
             await websocket.send_text(json.dumps(entry, ensure_ascii=False))
-            await asyncio.sleep(30)
+            await asyncio.sleep(5)
     except WebSocketDisconnect:
         log_service.unregister_ws_client(websocket)
