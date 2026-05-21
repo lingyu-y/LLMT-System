@@ -1,7 +1,16 @@
-"""Training schemas."""
+"""Training schemas – request / response models for the training API."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
+
+# ---------------------------------------------------------------------------
+# Existing: privacy config
+# ---------------------------------------------------------------------------
 
 class PrivacyConfigRequest(BaseModel):
     epsilon: float = Field(..., ge=0.01, le=100.0, description="隐私预算 ε")
@@ -13,90 +22,128 @@ class PrivacyConfigRequest(BaseModel):
     algorithm: str = Field(default="dp-sgd", description="差分隐私算法")
 
 
-class RecommendationRequest(BaseModel):
-    model_config = {"protected_namespaces": ()}
+# ---------------------------------------------------------------------------
+# Training config dict (embedded in create request)
+# ---------------------------------------------------------------------------
 
-    model_code: str = Field(..., description="模型代码")
-    dataset_id: int = Field(..., ge=1, description="数据集 ID")
-    gpu_count: int = Field(..., ge=1, le=64, description="可用 GPU 数量")
-    batch_size: int = Field(default=32, ge=1, description="每 GPU batch size")
-    max_seq_length: int = Field(default=2048, ge=128, le=32768, description="最大序列长度")
+class TrainingConfigDict(BaseModel):
+    """Training hyper-params + model + strategy config, stored in config_json."""
+
+    # Model
+    model_type: str = "gpt2"
+    vocab_size: int = 50257
+    hidden_size: int = 768
+    num_layers: int = 12
+    num_attention_heads: int = 12
+    seq_length: int = 1024
+
+    # Hyper-params
+    batch_size: int = Field(default=32, description="Per-GPU micro batch size")
+    learning_rate: float = 2e-5
+    weight_decay: float = 0.01
+    max_epochs: int = 10
+    max_steps: int | None = None
+    warmup_steps: int = 1000
+    max_grad_norm: float = 1.0
+    gradient_accumulation_steps: int = 1
+    optimizer: Literal["adamw", "adam", "sgd", "adafactor"] = "adamw"
+    scheduler: Literal["linear_warmup_decay", "cosine", "constant_warmup", "polynomial"] = "linear_warmup_decay"
+    precision: Literal["fp16", "bf16", "fp32"] = "fp16"
+    min_lr: float = 0.0
+    beta1: float = 0.9
+    beta2: float = 0.999
+
+    # Data
+    dataset_path: str | None = None
+    dataset_format: Literal["jsonl", "parquet", "megatron_bin_idx", "npy"] = "jsonl"
+    train_split: float = 0.95
+    seed: int = 42
+
+    # Strategy / parallelism
+    num_gpus: int = 1
+    num_nodes: int = 1
+    tensor_model_parallel_size: int = 1
+    pipeline_model_parallel_size: int = 1
+
+    # Checkpoint
+    save_interval: int = 500
+    eval_interval: int = 100
+    max_checkpoints: int = 5
+    upload_to_minio: bool = True
+
+    # Framework-specific overrides
+    deepspeed_overrides: Optional[dict] = None
+    megatron_overrides: Optional[dict] = None
 
 
-class ConfigPreviewRequest(BaseModel):
-    model_config = {"protected_namespaces": ()}
+# ---------------------------------------------------------------------------
+# Create / update requests
+# ---------------------------------------------------------------------------
 
-    model_code: str = Field(...)
-    dataset_id: int = Field(..., ge=1)
-    gpu_count: int = Field(..., ge=1, le=64)
-    framework: str = Field(default="PyTorch")
-    parallel_strategy: str = Field(default="ddp")
-    learning_rate: float = Field(default=1e-4, gt=0)
-    batch_size: int = Field(default=32, ge=1)
-    max_epoch: int = Field(default=3, ge=1, le=1000)
-    max_seq_length: int = Field(default=2048, ge=128, le=32768)
-    optimizer: str = Field(default="AdamW")
-    scheduler: str = Field(default="cosine")
-    warmup_steps: int = Field(default=500, ge=0)
-    gradient_accumulation_steps: int = Field(default=1, ge=1)
-    output_dir: str = Field(default="./output")
-
-
-class SaveConfigRequest(ConfigPreviewRequest):
+class TrainingTaskCreate(BaseModel):
+    """Request body for creating a new training task."""
     task_name: str = Field(..., min_length=1, max_length=128)
-    description: str | None = None
+    description: Optional[str] = None
+    dataset_id: int
+    framework: Literal["pytorch", "deepspeed", "megatron"] = "deepspeed"
+    parallel_strategy: Literal[
+        "ddp", "zero1", "zero2", "zero3", "zero3_offload", "tp", "pp", "3d",
+    ] = "zero2"
+    config: TrainingConfigDict = Field(default_factory=TrainingConfigDict)
 
 
-from datetime import datetime
-from typing import Any
+# ---------------------------------------------------------------------------
+# Response models
+# ---------------------------------------------------------------------------
 
-
-class TaskListOut(BaseModel):
-    id: str
-    taskName: str
-    taskCode: str
-    model: str
-    datasetId: int
-    framework: str | None = None
-    parallelStrategies: list[str] = []
-    gpu: str | None = None
+class TrainingTaskOut(BaseModel):
+    """Full training task response."""
+    id: int
+    task_name: str
+    task_code: str
+    description: Optional[str]
     status: str
-    progress: int = 0
-    currentEpoch: int
-    currentStep: int
-    maxEpoch: int | None = None
-    loss: float | None = None
-    latency: int | None = None
-    checkpointPath: str | None = None
+    framework: Optional[str]
+    parallel_strategy: Optional[str]
+    config_json: dict[str, Any]
+    current_epoch: int
+    current_step: int
+    max_epoch: Optional[int]
+    dataset_id: int
+    checkpoint_path: Optional[str]
+    error_message: Optional[str]
+    celery_task_id: Optional[str] = None
+    started_at: Optional[datetime]
+    ended_at: Optional[datetime]
+    created_at: datetime
 
-    model_config = {"from_attributes": False}
-
-
-class TaskOut(TaskListOut):
-    id: str
-    description: str | None = None
-    configJson: dict[str, Any] = {}
-    errorMessage: str | None = None
-    startedAt: datetime | None = None
-    endedAt: datetime | None = None
-    createdAt: datetime | None = None
-    updatedAt: datetime | None = None
-
-    model_config = {"from_attributes": False}
+    model_config = {"from_attributes": True}
 
 
-class ScaleTaskRequest(BaseModel):
-    gpu_count: int = Field(..., ge=1, le=64, description="目标 GPU 数量")
-    parallel_strategy: str | None = Field(default=None, description="目标并行策略（可选）")
+class TrainingTaskListOut(BaseModel):
+    """Paginated list item."""
+    id: int
+    task_name: str
+    task_code: str
+    status: str
+    framework: Optional[str]
+    parallel_strategy: Optional[str]
+    current_epoch: int
+    current_step: int
+    max_epoch: Optional[int]
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
 
 
-class SubmitTaskRequest(BaseModel):
-    task_code: str = Field(..., description="训练配置的任务代码")
+# ---------------------------------------------------------------------------
+# Metrics query
+# ---------------------------------------------------------------------------
 
-
-class LaunchCheckRequest(BaseModel):
-    model_config = {"protected_namespaces": ()}
-
-    model_code: str = Field(...)
-    dataset_id: int = Field(..., ge=1)
-    gpu_count: int = Field(..., ge=1, le=64)
+class TrainingMetricsQuery(BaseModel):
+    """Query parameters for fetching training metrics from InfluxDB."""
+    task_code: str
+    metric_type: Literal["training_step", "gpu_metrics", "communication_metrics"] = "training_step"
+    start_time: Optional[str] = None
+    stop_time: Optional[str] = None
+    window: str = "10s"

@@ -1,13 +1,19 @@
 """System management endpoints -- users, roles, menus, permissions, logs."""
 
+import csv
+import io
+from urllib.parse import quote
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.core.responses import paginated_response, success_response
 from app.dependencies.auth import get_current_user, require_admin
 from app.dependencies.db import get_db
 from app.models.user import User
-from app.repositories import log_repository, user_repository
+from app.repositories import log_repository, user_repository  # log_repository used for queries only
+from app.services import log_service  # log_service is the single write entry-point
 from app.schemas.user import (
     UserCreate,
     UserListOut,
@@ -56,7 +62,7 @@ def create_user(
         phone=body.phone,
         role_ids=body.role_ids,
     )
-    log_repository.create_log(
+    log_service.create_log(
         db, user_id=None, username="admin",
         action="create", resource="user", resource_id=user.id,
         detail=f"创建用户 {user.username}",
@@ -86,8 +92,12 @@ def update_user(
     user = user_repository.get_user_by_id(db, user_id)
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
+    if body.username and body.username != user.username:
+        existing = user_repository.get_user_by_username(db, body.username)
+        if existing is not None:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="用户名已存在")
     user = user_repository.update_user(db, user, **body.model_dump(exclude_unset=True))
-    log_repository.create_log(
+    log_service.create_log(
         db, user_id=None, username="admin",
         action="update", resource="user", resource_id=user.id,
         detail=f"修改用户 {user.username}",
@@ -105,7 +115,7 @@ def delete_user(
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
     user_repository.delete_user(db, user)
-    log_repository.create_log(
+    log_service.create_log(
         db, user_id=None, username="admin",
         action="delete", resource="user", resource_id=user_id,
         detail=f"删除用户 {user.username}",
@@ -124,7 +134,7 @@ def update_user_status(
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
     user = user_repository.set_user_status(db, user, body.status)
-    log_repository.create_log(
+    log_service.create_log(
         db, user_id=None, username="admin",
         action="status_change", resource="user", resource_id=user.id,
         detail=f"修改用户 {user.username} 状态为 {body.status}",
@@ -143,7 +153,7 @@ def update_user_roles(
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
     user = user_repository.set_user_roles(db, user, body.role_ids)
-    log_repository.create_log(
+    log_service.create_log(
         db, user_id=None, username="admin",
         action="assign_roles", resource="user", resource_id=user.id,
         detail=f"分配角色给 {user.username}",
@@ -198,7 +208,7 @@ def create_role(
         role_type=body.role_type,
         permission_ids=body.permission_ids,
     )
-    log_repository.create_log(
+    log_service.create_log(
         db, user_id=None, username="admin",
         action="create", resource="role", resource_id=role.id,
         detail=f"创建角色 {role.name}",
@@ -229,7 +239,7 @@ def update_role(
     if role is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="角色不存在")
     role = role_repository.update_role(db, role, **body.model_dump(exclude_unset=True))
-    log_repository.create_log(
+    log_service.create_log(
         db, user_id=None, username="admin",
         action="update", resource="role", resource_id=role.id,
         detail=f"修改角色 {role.name}",
@@ -247,7 +257,7 @@ def delete_role(
     if role is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="角色不存在")
     role_repository.delete_role(db, role)
-    log_repository.create_log(
+    log_service.create_log(
         db, user_id=None, username="admin",
         action="delete", resource="role", resource_id=role_id,
         detail=f"删除角色 {role.name}",
@@ -266,7 +276,7 @@ def update_role_status(
     if role is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="角色不存在")
     role = role_repository.set_role_status(db, role, body.status)
-    log_repository.create_log(
+    log_service.create_log(
         db, user_id=None, username="admin",
         action="status_change", resource="role", resource_id=role.id,
         detail=f"修改角色 {role.name} 状态为 {body.status}",
@@ -366,7 +376,7 @@ def save_role_menus(
     if role is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="角色不存在")
     role_repository.set_role_menus(db, role, body.menu_ids)
-    log_repository.create_log(
+    log_service.create_log(
         db, user_id=None, username="admin",
         action="assign_menus", resource="role", resource_id=role.id,
         detail=f"分配菜单给角色 {role.name}",
@@ -381,8 +391,30 @@ def save_role_menus(
 import asyncio  # noqa: E402
 import json  # noqa: E402
 from datetime import datetime  # noqa: E402
+from zoneinfo import ZoneInfo  # noqa: E402
 
 from fastapi import WebSocket, WebSocketDisconnect  # noqa: E402
+
+BEIJING_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def _format_beijing_time(value: datetime | None) -> str:
+    if value is None:
+        return ""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=ZoneInfo("UTC"))
+    return value.astimezone(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _log_level(action: str, detail: str = "") -> str:
+    text = f"{action} {detail}".lower()
+    if any(keyword in text for keyword in ("error", "failed", "fail", "exception", "错误", "失败", "异常")):
+        return "ERROR"
+    if action in {"delete", "status_change", "quality_repair"} or any(
+        keyword in detail for keyword in ("删除", "禁用", "修复")
+    ):
+        return "WARN"
+    return "INFO"
 
 
 @router.get("/logs")
@@ -408,9 +440,10 @@ def list_logs(
         {
             "id": lg.id, "user_id": lg.user_id, "username": lg.username,
             "action": lg.action, "resource": lg.resource,
+            "level": _log_level(lg.action, lg.detail),
             "resource_id": lg.resource_id, "detail": lg.detail,
             "ip_address": lg.ip_address,
-            "created_at": lg.created_at.isoformat() if lg.created_at else None,
+            "created_at": _format_beijing_time(lg.created_at),
         }
         for lg in logs
     ]
@@ -433,16 +466,29 @@ def export_logs(
         keyword=keyword, action=action, resource=resource,
         username=username, start_date=start_date, end_date=end_date,
     )
-    lines = [
-        "\t".join([
-            str(lg.id), lg.username, lg.action, lg.resource,
-            lg.detail, lg.ip_address,
-            lg.created_at.isoformat() if lg.created_at else "",
+    output = io.StringIO()
+    output.write("\ufeff")
+    writer = csv.writer(output)
+    writer.writerow(["ID", "级别", "用户名", "操作", "资源", "资源ID", "详情", "IP", "时间"])
+    for lg in logs:
+        writer.writerow([
+            lg.id,
+            _log_level(lg.action, lg.detail),
+            lg.username,
+            lg.action,
+            lg.resource,
+            lg.resource_id or "",
+            lg.detail,
+            lg.ip_address,
+            _format_beijing_time(lg.created_at),
         ])
-        for lg in logs
-    ]
-    header = "\t".join(["ID", "用户名", "操作", "资源", "详情", "IP", "时间"])
-    return success_response({"header": header, "lines": lines, "total": len(lines)})
+
+    filename = quote("system-logs.csv")
+    return StreamingResponse(
+        iter([output.getvalue().encode("utf-8")]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"},
+    )
 
 
 @router.get("/my-logs")
@@ -459,8 +505,9 @@ def get_my_logs(
         {
             "id": lg.id, "username": lg.username,
             "action": lg.action, "resource": lg.resource,
+            "level": _log_level(lg.action, lg.detail),
             "detail": lg.detail, "ip_address": lg.ip_address,
-            "created_at": lg.created_at.isoformat() if lg.created_at else None,
+            "created_at": _format_beijing_time(lg.created_at),
         }
         for lg in logs
     ]
@@ -471,16 +518,12 @@ def get_my_logs(
 # WebSocket - 实时日志流
 # ============================================================================
 
-connected_clients: list[WebSocket] = []
-
-
 @router.websocket("/logs/stream")
 async def logs_stream(websocket: WebSocket):
     await websocket.accept()
-    connected_clients.append(websocket)
+    log_service.register_ws_client(websocket)
     try:
         while True:
-            await websocket.receive_text()
             entry = {
                 "username": "system",
                 "action": "heartbeat",
@@ -490,6 +533,6 @@ async def logs_stream(websocket: WebSocket):
                 "created_at": datetime.now().isoformat(),
             }
             await websocket.send_text(json.dumps(entry, ensure_ascii=False))
-            await asyncio.sleep(30)
+            await asyncio.sleep(5)
     except WebSocketDisconnect:
-        connected_clients.remove(websocket)
+        log_service.unregister_ws_client(websocket)

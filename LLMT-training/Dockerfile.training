@@ -1,0 +1,53 @@
+# LLMT-Training GPU Dockerfile
+# Usage: docker build -f Dockerfile.training -t llmt-training:latest .
+# Run:   docker run --gpus all llmt-training:latest llmt-train train --config /configs/gpt2.json
+
+FROM nvidia/cuda:12.1.0-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+
+# System dependencies
+RUN apt-get update && apt-get install -y \
+    python3.10 python3-pip python3.10-venv \
+    git wget curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set python3 as default
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 && \
+    update-alternatives --install /usr/bin/pip pip /usr/bin/pip3 1
+
+# Install PyTorch with CUDA 12.1
+RUN pip install --no-cache-dir \
+    torch==2.2.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# Install DeepSpeed
+RUN pip install --no-cache-dir deepspeed==0.13.2
+
+# Install LLMT-Training dependencies
+RUN pip install --no-cache-dir \
+    pydantic>=2.0 \
+    click>=8.0 \
+    pyyaml>=6.0 \
+    influxdb-client>=1.30.0 \
+    minio>=7.0.0 \
+    httpx>=0.27.0
+
+# Megatron-LM (install from source)
+RUN git clone --depth 1 https://github.com/NVIDIA/Megatron-LM.git /opt/megatron-lm && \
+    cd /opt/megatron-lm && \
+    pip install -e .
+
+ENV PYTHONPATH="/opt/megatron-lm:${PYTHONPATH}"
+
+# Copy LLMT-Training framework
+WORKDIR /app
+COPY LLMT-training/ /app/LLMT-training/
+COPY LLMT-backend/app/core/ /app/LLMT-backend/app/core/
+
+RUN pip install -e /app/LLMT-training[all]
+
+# Configs directory
+RUN mkdir -p /configs /checkpoints /data
+
+ENTRYPOINT ["llmt-train"]

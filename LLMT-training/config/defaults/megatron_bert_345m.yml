@@ -1,0 +1,45 @@
+# Megatron-LM BERT-345M 默认配置
+model_type: bert
+num_layers: 24
+hidden_size: 1024
+num_attention_heads: 16
+seq_length: 512
+max_position_embeddings: 512
+
+# 并行策略
+tensor_model_parallel_size: 1
+pipeline_model_parallel_size: 1
+
+# 训练超参
+micro_batch_size: 8
+global_batch_size: 64
+train_iters: 100000
+lr: 1.0e-4
+min_lr: 1.0e-5
+lr_decay_style: linear
+lr_warmup_iters: 2000
+weight_decay: 0.01
+clip_grad: 1.0
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_eps: 1.0e-8
+
+# 精度
+bf16: true
+
+# BERT 特定
+bert_no_embedding_sync: false
+bert_no_head_binary: false
+
+# Checkpoint
+save_interval: 2000
+eval_interval: 1000
+save: ./checkpoints/bert-345m
+load: ./checkpoints/bert-345m
+
+# 数据
+data_path: ""
+data_impl: mmap
+vocab_file: bert-vocab.txt
+tokenizer_type: BertWordPieceTokenizer
+seed: 42

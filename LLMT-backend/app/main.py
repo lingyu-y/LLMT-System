@@ -4,6 +4,7 @@ from fastapi import FastAPI
 
 from app.api.router import api_router
 from app.core.config import get_settings
+from app.services.bootstrap_service import ensure_bootstrap_data
 
 settings = get_settings()
 
@@ -13,3 +14,16 @@ app = FastAPI(
 )
 
 app.include_router(api_router, prefix=settings.API_PREFIX)
+
+
+@app.on_event("startup")
+def bootstrap_development_data() -> None:
+    ensure_bootstrap_data()
+
+
+# Register Celery tasks (import to register with the broker)
+try:
+    from app.core.celery_app import celery_app  # noqa: F401
+    import app.tasks.training_tasks  # noqa: F401
+except Exception:
+    pass  # Celery/Redis not available in dev mode

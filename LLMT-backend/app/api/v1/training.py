@@ -1,23 +1,18 @@
-"""Training API endpoints."""
+"""Training API endpoints – full CRUD + metrics + validation."""
 
-import asyncio
-import json
-import random
-import yaml
-from datetime import datetime, timezone
-
-from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from app.core.config import get_settings
-from app.core.database import get_minio_client
 from app.core.responses import paginated_response, success_response
-from app.dependencies.auth import require_admin
+from app.dependencies.auth import get_current_user, require_admin
 from app.dependencies.db import get_db
-from app.models.dataset import Dataset
-from app.models.training_task import TrainingTask
-from app.repositories import model_repository
-from app.schemas.training import ConfigPreviewRequest, LaunchCheckRequest, PrivacyConfigRequest, RecommendationRequest, SaveConfigRequest, ScaleTaskRequest, SubmitTaskRequest
+from app.schemas.training import (
+    PrivacyConfigRequest,
+    TrainingConfigDict,
+    TrainingMetricsQuery,
+    TrainingTaskCreate,
+)
+from app.services import training_service
 
 router = APIRouter(prefix="/training", tags=["训练管理"])
 
@@ -374,6 +369,10 @@ def get_training_options(db: Session = Depends(get_db)):
     })
 
 
+# ---------------------------------------------------------------------------
+# Legacy: privacy config
+# ---------------------------------------------------------------------------
+
 @router.post("/privacy-config")
 def set_privacy_config(
     body: PrivacyConfigRequest,
@@ -383,276 +382,128 @@ def set_privacy_config(
     return success_response(body.model_dump(), "差分隐私配置已保存")
 
 
-def _recommend_strategy(gpu_count: int, model_code: str) -> dict:
-    small_models = {"bert-base", "t5-translation", "test-prefix", "comp-test"}
-    mid_models = {"gpt2-distil", "roberta-base", "qwen-7b"}
-    if model_code in small_models or gpu_count <= 2:
-        strategy = "ddp"
-        reason = "小规模模型或 1-2 GPU 推荐数据并行 (DDP)，实现简单、通信开销低"
-    elif model_code in mid_models or gpu_count <= 4:
-        strategy = "fsdp"
-        reason = "中等规模模型推荐全分片数据并行 (FSDP)，显存效率高"
-    elif gpu_count <= 8:
-        strategy = "tp"
-        reason = "大规模模型推荐张量并行 (TP)，将单层参数切分到多卡"
-    else:
-        strategy = "3d"
-        reason = "超大规模推荐 3D 混合并行 (TP+PP+DP)，充分利用多节点 GPU"
+# ---------------------------------------------------------------------------
+# Task CRUD
+# ---------------------------------------------------------------------------
 
-    return {
-        "strategy": strategy,
-        "reason": reason,
-        "estimated_memory_per_gpu_mb": {1: 80000, 2: 42000, 4: 22000, 8: 12000}.get(gpu_count, 10000),
-        "estimated_time_hours": round(max(0.5, 48 / gpu_count), 1),
-        "suggested_framework": "DeepSpeed" if strategy in ("fsdp", "3d") else "PyTorch",
-    }
-
-
-@router.post("/config-preview")
-def generate_config_preview(
-    body: ConfigPreviewRequest,
+@router.post("/tasks")
+def create_training_task(
+    body: TrainingTaskCreate,
     db: Session = Depends(get_db),
+    user=Depends(get_current_user),
 ):
-    model = model_repository.get_model_by_code(db, body.model_code)
-    if model is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型不存在")
-
-    dataset = db.query(Dataset).filter(Dataset.id == body.dataset_id).first()
-    if dataset is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="数据集不存在")
-
-    config = {
-        "training": {
-            "model_name": model.model_name,
-            "model_code": model.model_code,
-            "dataset": dataset.name,
-            "dataset_version": dataset.version,
-            "framework": body.framework,
-            "parallel_strategy": body.parallel_strategy,
-            "gpu_count": body.gpu_count,
-            "output_dir": body.output_dir,
-        },
-        "hyperparameters": {
-            "learning_rate": body.learning_rate,
-            "batch_size": body.batch_size,
-            "max_epoch": body.max_epoch,
-            "max_seq_length": body.max_seq_length,
-            "optimizer": body.optimizer,
-            "scheduler": body.scheduler,
-            "warmup_steps": body.warmup_steps,
-            "gradient_accumulation_steps": body.gradient_accumulation_steps,
-        },
-    }
-
-    yaml_str = yaml.dump(config, allow_unicode=True, default_flow_style=False, sort_keys=False)
-    return success_response({"yaml": yaml_str, "config": config})
+    """Create a new training task and queue it for execution."""
+    result = training_service.create_task(db, body, creator_id=user.id)
+    return success_response(result.model_dump(), "训练任务已创建")
 
 
-@router.post("/configs")
-def save_training_config(
-    body: SaveConfigRequest,
+@router.get("/tasks")
+def list_training_tasks(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    status: str = Query(""),
+    framework: str = Query(""),
     db: Session = Depends(get_db),
-    current_user=Depends(require_admin),
+    _user=Depends(get_current_user),
 ):
-    model = model_repository.get_model_by_code(db, body.model_code)
-    if model is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型不存在")
-
-    dataset = db.query(Dataset).filter(Dataset.id == body.dataset_id).first()
-    if dataset is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="数据集不存在")
-
-    import time
-    task_code = f"{body.model_code}-{int(time.time())}"
-
-    task = TrainingTask(
-        task_name=body.task_name,
-        task_code=task_code,
-        description=body.description,
-        framework=body.framework,
-        parallel_strategy=body.parallel_strategy,
-        max_epoch=body.max_epoch,
-        dataset_id=body.dataset_id,
-        creator_id=current_user.id,
-        config_json={
-            "model_code": body.model_code,
-            "model_name": model.model_name,
-            "dataset_name": dataset.name,
-            "gpu_count": body.gpu_count,
-            "learning_rate": body.learning_rate,
-            "batch_size": body.batch_size,
-            "max_seq_length": body.max_seq_length,
-            "optimizer": body.optimizer,
-            "scheduler": body.scheduler,
-            "warmup_steps": body.warmup_steps,
-            "gradient_accumulation_steps": body.gradient_accumulation_steps,
-            "output_dir": body.output_dir,
-        },
+    """List training tasks with pagination and optional filters."""
+    items, total = training_service.list_tasks(
+        db, page=page, page_size=page_size, status=status, framework=framework,
     )
-    db.add(task)
-    db.commit()
-    db.refresh(task)
-
-    return success_response({
-        "id": task.id,
-        "task_name": task.task_name,
-        "task_code": task.task_code,
-        "model_code": body.model_code,
-        "dataset_id": body.dataset_id,
-        "framework": task.framework,
-        "parallel_strategy": task.parallel_strategy,
-        "status": task.status,
-        "created_at": task.created_at.isoformat() if task.created_at else None,
-    }, "训练配置已保存")
+    return paginated_response(
+        [item.model_dump() for item in items],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
 
 
-def _check_minio_files(prefix: str, bucket: str) -> bool:
-    minio = get_minio_client()
-    objects = list(minio.list_objects(bucket, prefix=prefix.rstrip("/") + "/", recursive=True))
-    return len([o for o in objects if not o.is_dir]) > 0
-
-
-@router.post("/launch-check")
-def launch_check(
-    body: LaunchCheckRequest,
-    db: Session = Depends(get_db),
-    _admin=Depends(require_admin),
-):
-    model = model_repository.get_model_by_code(db, body.model_code)
-    dataset = db.query(Dataset).filter(Dataset.id == body.dataset_id).first()
-
-    checks = []
-
-    checks.append({
-        "item": "模型存在",
-        "pass": model is not None,
-        "detail": f"模型 {body.model_code} 已注册" if model else f"模型 {body.model_code} 不存在",
-    })
-
-    checks.append({
-        "item": "数据集存在",
-        "pass": dataset is not None,
-        "detail": f"数据集 {dataset.name} 已注册" if dataset else "数据集不存在",
-    })
-
-    settings = get_settings()
-    if model:
-        has_files = _check_minio_files(model.storage_path, settings.MINIO_BUCKET_MODELS)
-        checks.append({
-            "item": "模型文件就绪",
-            "pass": has_files,
-            "detail": f"MinIO 路径 {model.storage_path} 已有文件" if has_files else f"MinIO 路径 {model.storage_path} 无文件",
-        })
-
-    if dataset:
-        ds_prefix = dataset.storage_path
-        has_ds_files = _check_minio_files(ds_prefix, settings.MINIO_BUCKET_DATASETS) if ds_prefix else False
-        checks.append({
-            "item": "数据集文件就绪",
-            "pass": has_ds_files,
-            "detail": f"MinIO 路径 {ds_prefix} 已有文件" if has_ds_files else f"MinIO 路径 {ds_prefix} 无文件",
-        })
-
-    checks.append({
-        "item": "GPU 资源充足",
-        "pass": body.gpu_count <= 8,
-        "detail": f"请求 {body.gpu_count} GPU，集群可用 8 GPU" if body.gpu_count <= 8 else f"请求 {body.gpu_count} GPU 超出上限",
-    })
-
-    running = db.query(TrainingTask).filter(
-        TrainingTask.config_json["model_code"].as_string() == body.model_code,
-        TrainingTask.status.in_(["running", "launching"]),
-    ).count()
-    checks.append({
-        "item": "无重复运行任务",
-        "pass": running == 0,
-        "detail": "无冲突任务" if running == 0 else f"已有 {running} 个运行中任务",
-    })
-
-    all_pass = all(c["pass"] for c in checks)
-    return success_response({
-        "ready": all_pass,
-        "checks": checks,
-    })
-
-
-@router.post("/recommendation")
-def get_training_recommendation(
-    body: RecommendationRequest,
-    db: Session = Depends(get_db),
-):
-    model = model_repository.get_model_by_code(db, body.model_code)
-    if model is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型不存在")
-
-    dataset = db.query(Dataset).filter(Dataset.id == body.dataset_id).first()
-    if dataset is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="数据集不存在")
-
-    rec = _recommend_strategy(body.gpu_count, body.model_code)
-    return success_response({
-        "model_code": model.model_code,
-        "model_name": model.model_name,
-        "dataset_name": dataset.name,
-        "gpu_count": body.gpu_count,
-        "batch_size": body.batch_size,
-        "max_seq_length": body.max_seq_length,
-        **rec,
-    })
-
-
-@router.websocket("/tasks/{task_id}/stream")
-async def stream_training_metrics(
-    websocket: WebSocket,
+@router.get("/tasks/{task_id}")
+def get_training_task(
     task_id: int,
+    db: Session = Depends(get_db),
+    _user=Depends(get_current_user),
 ):
-    await websocket.accept()
+    """Get a single training task by ID."""
+    result = training_service.get_task(db, task_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="训练任务不存在")
+    return success_response(result.model_dump())
 
-    db = next(get_db())
-    task = db.query(TrainingTask).filter(TrainingTask.id == task_id).first()
-    db.close()
 
+@router.post("/tasks/{task_id}/cancel")
+def cancel_training_task(
+    task_id: int,
+    db: Session = Depends(get_db),
+    _user=Depends(get_current_user),
+):
+    """Cancel a running or queued training task."""
+    result = training_service.cancel_task(db, task_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="训练任务不存在或无法取消")
+    return success_response(result.model_dump(), "训练任务已取消")
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+
+@router.get("/tasks/{task_id}/metrics")
+def get_training_metrics(
+    task_id: int,
+    metric_type: str = Query("training_step"),
+    start_time: str = Query(""),
+    stop_time: str = Query(""),
+    window: str = Query("10s"),
+    db: Session = Depends(get_db),
+    _user=Depends(get_current_user),
+):
+    """Query training metrics from InfluxDB for a given task."""
+    task = training_service.get_task(db, task_id)
     if task is None:
-        await websocket.send_json({"type": "error", "message": "训练任务不存在"})
-        await websocket.close()
-        return
+        raise HTTPException(status_code=404, detail="训练任务不存在")
 
-    await websocket.send_json({
-        "type": "connected",
-        "task_id": task_id,
-        "task_name": task.task_name,
-        "status": task.status,
-    })
+    query = TrainingMetricsQuery(
+        task_code=task.task_code,
+        metric_type=metric_type,
+        start_time=start_time or None,
+        stop_time=stop_time or None,
+        window=window,
+    )
+    metrics = training_service.get_metrics(query)
+    return success_response(metrics)
 
-    step = 1
-    loss = 3.0
-    try:
-        while True:
-            await asyncio.sleep(2)
-            step += random.randint(10, 50)
-            loss = max(0.1, loss - random.uniform(0.01, 0.15))
 
-            await websocket.send_json({
-                "type": "metrics",
-                "step": step,
-                "epoch": round(step / 500, 2),
-                "loss": round(loss, 4),
-                "accuracy": round(min(0.98, 0.5 + (3.0 - loss) * 0.2), 4),
-                "perplexity": round(10 ** loss, 2),
-                "learning_rate": round(1e-4 * (0.95 ** (step / 100)), 8),
-                "gpu_utilization_pct": random.randint(65, 95),
-                "gpu_memory_mb": random.randint(45000, 78000),
-                "throughput_samples_per_sec": random.randint(200, 500),
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            })
+# ---------------------------------------------------------------------------
+# Checkpoints
+# ---------------------------------------------------------------------------
 
-            if loss < 0.3:
-                await websocket.send_json({
-                    "type": "completed",
-                    "message": "训练完成",
-                    "final_loss": round(loss, 4),
-                })
-                break
+@router.get("/tasks/{task_id}/checkpoints")
+def get_training_checkpoints(
+    task_id: int,
+    db: Session = Depends(get_db),
+    _user=Depends(get_current_user),
+):
+    """List checkpoint files for a training task from MinIO."""
+    task = training_service.get_task(db, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="训练任务不存在")
 
-    except WebSocketDisconnect:
-        pass
+    checkpoints = training_service.get_checkpoints(task.task_code)
+    return success_response(checkpoints)
+
+
+# ---------------------------------------------------------------------------
+# Config validation
+# ---------------------------------------------------------------------------
+
+@router.post("/validate-config")
+def validate_training_config(
+    body: TrainingTaskCreate,
+    _user=Depends(get_current_user),
+):
+    """Validate a training configuration for compatibility issues."""
+    result = training_service.validate_config(
+        body.config, body.framework, body.parallel_strategy,
+    )
+    return success_response(result)
