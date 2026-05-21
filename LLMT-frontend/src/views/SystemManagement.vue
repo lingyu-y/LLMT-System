@@ -133,6 +133,11 @@
             <div class="table-wrap">
               <el-table :data="filteredLogs" stripe>
                 <el-table-column prop="created_at" label="时间" width="180" />
+                <el-table-column prop="level" label="级别" width="90">
+                  <template #default="{ row }">
+                    <el-tag :type="logLevelTagType(row.level)">{{ row.level ?? 'INFO' }}</el-tag>
+                  </template>
+                </el-table-column>
                 <el-table-column prop="action" label="操作" width="110">
                   <template #default="{ row }">
                     <el-tag type="success">{{ row.action }}</el-tag>
@@ -305,8 +310,14 @@ const filteredUsers = computed(() => {
   return userRows.value.filter((item) => `${item.name}${item.account}`.toLowerCase().includes(keyword))
 })
 const filteredLogs = computed(() =>
-  logs.value.filter((item) => (!level.value || item.action === level.value) && (!module.value || item.resource === module.value)),
+  logs.value.filter((item) => (!level.value || (item.level ?? 'INFO') === level.value) && (!module.value || item.resource === module.value)),
 )
+
+const logLevelTagType = (logLevel?: string) => {
+  if (logLevel === 'ERROR') return 'danger'
+  if (logLevel === 'WARN') return 'warning'
+  return 'info'
+}
 
 const formatRoleNames = (roleCodes: string[]) =>
   roleCodes.map((roleCode) => roleRows.value.find((role) => role.code === roleCode)?.name ?? roleCode).join('、')

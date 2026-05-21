@@ -39,6 +39,7 @@ export interface SystemLog {
   id: number
   user_id?: number | null
   username: string
+  level?: 'INFO' | 'WARN' | 'ERROR' | string
   action: string
   resource: string
   resource_id?: number | null
