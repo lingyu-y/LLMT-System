@@ -11,6 +11,7 @@ from app.dependencies.auth import require_admin
 from app.dependencies.db import get_db
 from app.repositories import model_repository
 from app.schemas.model import ModelCreate, ModelExport, ModelImport, ModelListOut, ModelOut, RateLimitUpdate, VersionCreate
+from app.services import model_service
 
 import uuid
 from datetime import datetime, timezone
@@ -68,35 +69,22 @@ def import_model(
             status_code=status.HTTP_409_CONFLICT, detail="该模型代码与版本已存在"
         )
 
-    settings = get_settings()
-    minio = get_minio_client()
-    bucket = settings.MINIO_BUCKET_MODELS
-    target_prefix = f"models/{body.model_code}/{body.version}"
-
-    src_prefix = body.source_path.rstrip("/") + "/"
-    objects = list(minio.list_objects(bucket, prefix=src_prefix, recursive=True))
-    files = [o for o in objects if not o.is_dir]
-    if not files:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="源路径未找到文件")
-
-    from minio.commonconfig import CopySource
-
-    for obj in files:
-        target_name = obj.object_name.replace(src_prefix, target_prefix + "/", 1)
-        minio.copy_object(bucket, target_name, CopySource(bucket, obj.object_name))
-
-    model = model_repository.create_model(
-        db,
-        model_name=body.model_name,
-        model_code=body.model_code,
-        version=body.version,
-        tag=body.tag,
-        description=body.description,
-        framework=body.framework,
-        dataset_version=body.dataset_version,
-        metrics_json=body.metrics_json,
-        hyperparams_json=body.hyperparams_json,
-    )
+    try:
+        model = model_service.import_from_repository(
+            db,
+            model_name=body.model_name,
+            model_code=body.model_code,
+            version=body.version,
+            source_path=body.source_path,
+            tag=body.tag,
+            description=body.description,
+            framework=body.framework,
+            dataset_version=body.dataset_version,
+            metrics_json=body.metrics_json,
+            hyperparams_json=body.hyperparams_json,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
     return success_response(ModelOut.model_validate(model), "模型导入成功")
 
 
@@ -110,26 +98,11 @@ def export_model(
     if model is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型版本不存在")
 
-    settings = get_settings()
-    minio = get_minio_client()
-    bucket = settings.MINIO_BUCKET_MODELS
-    source_prefix = model.storage_path.rstrip("/") + "/"
-
-    objects = list(minio.list_objects(bucket, prefix=source_prefix, recursive=True))
-    files = [o for o in objects if not o.is_dir]
-    if not files:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型文件不存在")
-
-    from minio.commonconfig import CopySource
-
-    target = body.target_path.rstrip("/") + "/"
-    copied = 0
-    for obj in files:
-        target_name = obj.object_name.replace(source_prefix, target, 1)
-        minio.copy_object(bucket, target_name, CopySource(bucket, obj.object_name))
-        copied += 1
-
-    return success_response({"exported": copied, "target_path": target}, "模型导出成功")
+    try:
+        copied = model_service.export_to_repository(model, body.target_path)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    return success_response({"exported": copied, "target_path": body.target_path}, "模型导出成功")
 
 
 @router.get("/{model_code}/versions")
@@ -230,23 +203,15 @@ def download_model_version(
     if model is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型版本不存在")
 
-    settings = get_settings()
-    minio = get_minio_client()
-    bucket = settings.MINIO_BUCKET_MODELS
-    prefix = model.storage_path.rstrip("/") + "/"
-
-    objects = list(minio.list_objects(bucket, prefix=prefix, recursive=True))
-    files = [o for o in objects if not o.is_dir]
-    if not files:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型文件不存在")
-
-    obj = files[0]
-    response = minio.get_object(bucket, obj.object_name)
+    try:
+        info = model_service.get_download_info(model)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 
     return StreamingResponse(
-        response.stream(amt=64 * 1024),
+        info["stream"].stream(amt=64 * 1024),
         media_type="application/octet-stream",
-        headers={"Content-Disposition": f'attachment; filename="{obj.object_name.split("/")[-1]}"'},
+        headers={"Content-Disposition": f'attachment; filename="{info["filename"]}"'},
     )
 
 
@@ -272,14 +237,8 @@ def trigger_security_scan(
     if model is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型不存在")
 
-    scan_id = uuid.uuid4().hex[:12]
-    return success_response({
-        "scan_id": scan_id,
-        "model_code": model.model_code,
-        "version": model.version,
-        "status": "pending",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }, "漏洞扫描任务已触发")
+    result = model_service.trigger_security_scan(model)
+    return success_response(result, "漏洞扫描任务已触发")
 
 
 @router.get("/{model_code}/security/reports")
@@ -292,17 +251,7 @@ def get_security_reports(
     if not versions:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型不存在")
 
-    reports = []
-    for v in versions:
-        reports.append({
-            "scan_id": uuid.uuid4().hex[:12],
-            "model_code": v.model_code,
-            "version": v.version,
-            "status": "completed",
-            "summary": {"critical": 0, "high": 1, "medium": 3, "low": 5},
-            "scanned_at": datetime.now(timezone.utc).isoformat(),
-        })
-
+    reports = model_service.get_security_reports(model_code, db)
     return success_response(reports)
 
 
