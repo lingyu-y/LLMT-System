@@ -340,6 +340,7 @@ import {
   listDatasets,
   triggerQualityCheck,
   triggerQualityRepair,
+  updateDataset,
   uploadDatasetFile,
   type BackendDataset,
   type DatasetStats,
@@ -696,17 +697,28 @@ const submitImport = async () => {
   }
 
   importing.value = true
+  let createdDatasetId: number | undefined
+  let successfulFileCount = 0
+  let successfulTotalSize = 0
+  const persistSuccessfulUploadStats = async () => {
+    if (!createdDatasetId) return
+    await updateDataset(createdDatasetId, {
+      file_count: successfulFileCount,
+      total_size: successfulTotalSize,
+    })
+  }
+
   try {
-    const totalSize = uploadFiles.value.reduce((sum, file) => sum + (file.size ?? file.raw?.size ?? 0), 0)
     const dataset = await createDataset({
       name: importForm.name.trim(),
       data_type: importForm.type,
       description: importForm.desc,
       source: '前端数据加载',
       storage_path: importForm.storagePath || '/datasets',
-      file_count: uploadFiles.value.length,
-      total_size: totalSize,
+      file_count: 0,
+      total_size: 0,
     })
+    createdDatasetId = dataset.id
 
     for (const file of uploadFiles.value) {
       const record = uploadRecords.value.find((item) => item.uid === Number(file.uid))
@@ -716,12 +728,15 @@ const submitImport = async () => {
       record.statusType = 'info'
       record.percent = 60
       await uploadDatasetFile(dataset.id, file.raw)
+      successfulFileCount += 1
+      successfulTotalSize += file.raw.size
       record.statusLabel = '上传成功'
       record.statusType = 'success'
       record.percent = 100
       record.progressStatus = 'success'
     }
 
+    await persistSuccessfulUploadStats()
     dialogVisible.value = false
     uploadFiles.value = []
     uploadRecords.value = []
@@ -731,6 +746,11 @@ const submitImport = async () => {
     await selectDataset(dataset.id, 'load')
     ElMessage.success('数据集已创建，文件上传流程已完成')
   } catch (error) {
+    try {
+      await persistSuccessfulUploadStats()
+    } catch {
+      ElMessage.warning('上传统计回写失败，请稍后刷新数据集信息')
+    }
     uploadRecords.value = uploadRecords.value.map((file) =>
       file.statusLabel === '上传中'
         ? { ...file, statusLabel: '上传中断', statusType: 'danger', progressStatus: 'exception' }

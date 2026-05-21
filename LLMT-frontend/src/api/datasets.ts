@@ -1,4 +1,4 @@
-import { get, post, type ApiMessage, type PageResult, unwrap } from '@/api/http'
+import { get, post, put, type ApiMessage, type PageResult, unwrap } from '@/api/http'
 
 export interface DatasetOwner {
   id: number
@@ -85,6 +85,8 @@ export interface DatasetCreatePayload {
   total_size?: number
 }
 
+export type DatasetUpdatePayload = Partial<DatasetCreatePayload>
+
 export const getDatasetStats = async () => unwrap(await get<ApiMessage<DatasetStats>>('/datasets/stats'))
 
 export const listDatasets = (params?: { page?: number; page_size?: number; keyword?: string; data_type?: string; quality_status?: string }) =>
@@ -92,6 +94,9 @@ export const listDatasets = (params?: { page?: number; page_size?: number; keywo
 
 export const createDataset = async (payload: DatasetCreatePayload) =>
   unwrap(await post<ApiMessage<BackendDataset>>('/datasets', payload))
+
+export const updateDataset = async (datasetId: number, payload: DatasetUpdatePayload) =>
+  unwrap(await put<ApiMessage<BackendDataset>>(`/datasets/${datasetId}`, payload))
 
 export const uploadDatasetFile = async (datasetId: number, file: File) => {
   const form = new FormData()
