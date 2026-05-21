@@ -48,6 +48,18 @@ class Settings(BaseSettings):
     ELASTICSEARCH_PASSWORD: str | None = None
     ELASTICSEARCH_INDEX_LOGS: str = "system-logs"
 
+    # Redis / Celery
+    REDIS_HOST: str = "localhost"
+    REDIS_PORT: int = 6379
+    REDIS_PASSWORD: str | None = None
+    REDIS_DB_BROKER: int = 0
+    REDIS_DB_BACKEND: int = 1
+
+    # Training framework
+    LLMT_TRAINING_MODULE_PATH: str = "llmt_training"
+    LLMT_TRAINING_SCRIPTS_DIR: str | None = None  # absolute path to LLMT-training/examples/
+    TRAINING_DEFAULT_TIMEOUT_HOURS: int = 168  # 7 days
+
     @field_validator("DEBUG", mode="before")
     @classmethod
     def parse_debug(cls, value: object) -> object:
@@ -60,6 +72,18 @@ class Settings(BaseSettings):
             if normalized in {"debug", "dev", "development", "true", "1", "yes", "on"}:
                 return True
         return value
+
+    @property
+    def redis_url_broker(self) -> str:
+        """Return Redis URL for Celery broker."""
+        password = f":{self.REDIS_PASSWORD}@" if self.REDIS_PASSWORD else ""
+        return f"redis://{password}{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB_BROKER}"
+
+    @property
+    def redis_url_backend(self) -> str:
+        """Return Redis URL for Celery result backend."""
+        password = f":{self.REDIS_PASSWORD}@" if self.REDIS_PASSWORD else ""
+        return f"redis://{password}{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB_BACKEND}"
 
     @property
     def postgres_database_url(self) -> str:

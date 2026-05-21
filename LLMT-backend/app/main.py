@@ -19,3 +19,11 @@ app.include_router(api_router, prefix=settings.API_PREFIX)
 @app.on_event("startup")
 def bootstrap_development_data() -> None:
     ensure_bootstrap_data()
+
+
+# Register Celery tasks (import to register with the broker)
+try:
+    from app.core.celery_app import celery_app  # noqa: F401
+    import app.tasks.training_tasks  # noqa: F401
+except Exception:
+    pass  # Celery/Redis not available in dev mode

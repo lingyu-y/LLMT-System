@@ -1,0 +1,49 @@
+{
+    "task_code": "bert-finetune-demo",
+    "framework": "pytorch",
+    "parallel_strategy": "ddp",
+    "model": {
+        "model_type": "bert",
+        "vocab_size": 30522,
+        "hidden_size": 768,
+        "num_layers": 12,
+        "num_attention_heads": 12,
+        "seq_length": 512,
+        "intermediate_size": 3072
+    },
+    "data": {
+        "dataset_path": "",
+        "dataset_format": "jsonl",
+        "train_split": 0.9,
+        "seed": 42
+    },
+    "hyperparams": {
+        "batch_size": 16,
+        "learning_rate": 2e-5,
+        "weight_decay": 0.01,
+        "max_epochs": 3,
+        "warmup_steps": 500,
+        "max_grad_norm": 1.0,
+        "gradient_accumulation_steps": 2,
+        "optimizer": "adamw",
+        "scheduler": "linear_warmup_decay",
+        "precision": "fp16"
+    },
+    "strategy": {
+        "num_gpus": 1,
+        "num_nodes": 1
+    },
+    "checkpoint": {
+        "save_interval": 500,
+        "eval_interval": 200,
+        "max_checkpoints": 3,
+        "upload_to_minio": false,
+        "checkpoint_dir": "./checkpoints/bert-finetune-demo"
+    },
+    "reporting": {
+        "influxdb_url": "http://localhost:8086",
+        "influxdb_org": "llmt",
+        "influxdb_bucket": "training_metrics",
+        "report_interval_steps": 10
+    }
+}

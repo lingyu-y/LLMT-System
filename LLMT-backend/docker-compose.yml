@@ -56,9 +56,30 @@ services:
     volumes:
       - llmt_elasticsearch_data:/usr/share/elasticsearch/data
 
+  # 消息队列：Celery broker / backend
+  redis:
+    image: redis:7-alpine
+    container_name: llmt-redis
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - llmt_redis_data:/data
+
+  # Celery 任务监控面板（可选）
+  flower:
+    image: mher/flower:0.9.7
+    container_name: llmt-flower
+    command: celery --broker=redis://redis:6379/0 flower --port=5555
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
+
 volumes:
   llmt_postgres_data:
   llmt_influxdb_data:
   llmt_influxdb_config:
   llmt_minio_data:
   llmt_elasticsearch_data:
+  llmt_redis_data:
