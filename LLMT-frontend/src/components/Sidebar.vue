@@ -47,7 +47,7 @@
 import type { Component } from 'vue'
 import { computed } from 'vue'
 import { useRouter } from 'vue-router'
-import { Cpu, DataAnalysis, Document, Files, Management, Monitor, Setting, SwitchButton } from '@element-plus/icons-vue'
+import { Cpu, DataAnalysis, Document, Files, Management, Monitor, Setting, SwitchButton, Connection } from '@element-plus/icons-vue'
 import { ElMessageBox } from 'element-plus'
 
 import { systemMenuKeys } from '@/mock/auth'
@@ -66,6 +66,7 @@ const menuItems: MenuItem[] = [
   { title: '仪表盘', path: '/dashboard', icon: Monitor, permission: 'dashboard' },
   { title: '数据处理', path: '/data-processing', icon: Files, permission: 'dataset' },
   { title: '模型训练', path: '/model-training', icon: DataAnalysis, permission: 'training' },
+  { title: '联邦学习', path: '/federated-learning', icon: Connection, permission: 'training' },
   { title: '模型管理', path: '/model-management', icon: Management, permission: 'model' },
   { title: '文档生成', path: '/doc-generation', icon: Document, permission: 'document' },
   {
