@@ -1,11 +1,19 @@
 """Dataset service — data processing business logic (Part 3 of jiekou.md)."""
 
 import csv as _stdlib_csv
+import bz2
+import codecs
+import gzip
 import hashlib
 import io as _stdlib_io
+import json
+import lzma
 import logging
+import os
 import re
+import tempfile
 import uuid
+import zlib
 from datetime import datetime, timezone
 
 from fastapi import UploadFile
@@ -22,7 +30,7 @@ _logger = logging.getLogger(__name__)
 
 # Supported formats (requirement: TXT, CSV, JSON, DOC, DOCX, EXCEL)
 # DOC/DOCX → converted to .txt; EXCEL → converted to .csv
-_TEXT_EXTS = {".txt", ".csv", ".json"}
+_TEXT_EXTS = {".txt", ".csv", ".json", ".jsonl"}
 _DOC_EXTS = {".doc", ".docx"}  # → .txt after conversion
 _XLS_EXTS = {".xlsx", ".xls"}  # → .csv after conversion
 _SUPPORTED_EXTENSIONS = {
@@ -33,6 +41,7 @@ _SUPPORTED_EXTENSIONS = {
 
 _ILLEGAL_CHARS = re.compile(r'[<>:"/\\|?*]')
 _MAX_FILENAME_LEN = 255
+_TEXT_STORED_SUFFIXES = (".txt", ".csv", ".json", ".jsonl")
 
 
 def _detect_data_type(filename: str) -> str:
@@ -160,6 +169,58 @@ def _compute_checksum(data: bytes) -> str:
     return hashlib.md5(data).hexdigest()
 
 
+def _compressed_payload_type(data: bytes) -> str | None:
+    if data.startswith(b"\x1f\x8b"):
+        return "gzip"
+    if data.startswith(b"BZh"):
+        return "bzip2"
+    if data.startswith(b"\xfd7zXZ\x00"):
+        return "xz"
+    if data.startswith(b"\x28\xb5\x2f\xfd"):
+        return "zstd"
+    if data.startswith(b"PK\x03\x04"):
+        return "zip"
+    if data.startswith((b"\x78\x01", b"\x78\x9c", b"\x78\xda")):
+        return "zlib"
+    return None
+
+
+def _try_decompress_text_payload(data: bytes) -> tuple[bytes, str | None]:
+    kind = _compressed_payload_type(data)
+    if kind is None:
+        return data, None
+    try:
+        if kind == "gzip":
+            return gzip.decompress(data), kind
+        if kind == "bzip2":
+            return bz2.decompress(data), kind
+        if kind == "xz":
+            return lzma.decompress(data), kind
+        if kind == "zlib":
+            return zlib.decompress(data), kind
+    except Exception as exc:
+        raise ValueError(f"检测到 {kind} 压缩内容，但解压失败: {exc}") from exc
+    raise ValueError(f"检测到 {kind} 压缩/归档内容，当前数据加载不支持直接解析该格式，请先解压成 TXT/CSV/JSON/JSONL 后上传")
+
+
+def _validate_text_payload(data: bytes, filename: str, allow_truncated: bool = False) -> str | None:
+    try:
+        decoded = data.decode("utf-8")
+    except UnicodeDecodeError:
+        if not allow_truncated:
+            return f"{filename} 不是有效 UTF-8 文本，可能是压缩包、二进制文件或编码不匹配"
+        decoded = data.decode("utf-8", errors="replace").rstrip("\ufffd")
+    if "\x00" in decoded:
+        return f"{filename} 包含二进制空字节，可能不是文本数据"
+    if decoded:
+        replacement_rate = decoded.count("\ufffd") / max(len(decoded), 1)
+        control_count = sum(1 for char in decoded if ord(char) < 32 and char not in "\r\n\t")
+        control_rate = control_count / max(len(decoded), 1)
+        if replacement_rate > 0.01 or control_rate > 0.01:
+            return f"{filename} 文本中存在大量乱码或控制字符，请确认不是压缩/二进制内容"
+    return None
+
+
 def _read_and_hash(file: UploadFile) -> tuple[bytes, str]:
     """Read *file* in 64 KiB chunks, compute MD5 incrementally.  Returns (data, hexdigest)."""
     h = hashlib.md5()
@@ -173,13 +234,90 @@ def _read_and_hash(file: UploadFile) -> tuple[bytes, str]:
     return buf.getvalue(), h.hexdigest()
 
 
+def _spool_text_upload(file: UploadFile, filename: str) -> tuple[str | None, int, str, str | None]:
+    """Stream a text upload to a temp file while validating UTF-8 and hashing."""
+    h = hashlib.md5()
+    size = 0
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    temp = tempfile.NamedTemporaryFile(delete=False)
+    temp_path = temp.name
+    replacement_count = 0
+    control_count = 0
+    char_count = 0
+    first_chunk_checked = False
+    keep_temp = False
+    try:
+        while True:
+            chunk = file.file.read(_CHUNK)
+            if not chunk:
+                break
+            if not first_chunk_checked:
+                first_chunk_checked = True
+                compression = _compressed_payload_type(chunk)
+                if compression:
+                    return None, 0, "", (
+                        f"检测到 {compression} 压缩/归档内容，当前数据加载不支持直接解析该格式，"
+                        "请先解压成 TXT/CSV/JSON/JSONL 后上传"
+                    )
+            try:
+                decoded = decoder.decode(chunk)
+            except UnicodeDecodeError:
+                return None, 0, "", f"{filename} 不是有效 UTF-8 文本，可能是压缩包、二进制文件或编码不匹配"
+            if "\x00" in decoded:
+                return None, 0, "", f"{filename} 包含二进制空字节，可能不是文本数据"
+            replacement_count += decoded.count("\ufffd")
+            control_count += sum(1 for char in decoded if ord(char) < 32 and char not in "\r\n\t")
+            char_count += len(decoded)
+            h.update(chunk)
+            size += len(chunk)
+            temp.write(chunk)
+        try:
+            tail = decoder.decode(b"", final=True)
+        except UnicodeDecodeError:
+            return None, 0, "", f"{filename} 不是完整的 UTF-8 文本"
+        if tail:
+            if "\x00" in tail:
+                return None, 0, "", f"{filename} 包含二进制空字节，可能不是文本数据"
+            replacement_count += tail.count("\ufffd")
+            control_count += sum(1 for char in tail if ord(char) < 32 and char not in "\r\n\t")
+            char_count += len(tail)
+        if size == 0:
+            return None, 0, "", "文件内容为空"
+        if char_count:
+            if replacement_count / char_count > 0.01 or control_count / char_count > 0.01:
+                return None, 0, "", f"{filename} 文本中存在大量乱码或控制字符，请确认不是压缩/二进制内容"
+        temp.flush()
+        keep_temp = True
+        return temp_path, size, h.hexdigest(), None
+    finally:
+        temp.close()
+        if not keep_temp:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
+
+def _minio_retry_fput(minio, bucket: str, object_name: str, file_path: str, content_type: str) -> None:
+    last_exc = None
+    for attempt in range(1, _RETRY_COUNT + 1):
+        try:
+            minio.fput_object(bucket, object_name, file_path, content_type=content_type)
+            return
+        except Exception as exc:
+            last_exc = exc
+            if attempt < _RETRY_COUNT:
+                _logger.warning("MinIO fput_object attempt %d/3 failed: %s", attempt, exc)
+    raise last_exc  # type: ignore[misc]
+
+
 # ============================================================================
 # File Upload — 多模态数据加载 (OFFLINE_AI_DATA_LoadData, Table 2)
 # ============================================================================
 
 
 _UNSUPPORTED_FORMAT_MSG = (
-    "文件格式不支持。当前仅支持: TXT, CSV, JSON, DOC, DOCX, EXCEL (xlsx/xls)。"
+    "文件格式不支持。当前仅支持: TXT, CSV, JSON, JSONL, DOC, DOCX, EXCEL (xlsx/xls)。"
     " DOC/DOCX 将自动转换为 TXT，EXCEL 将自动转换为 CSV。"
 )
 _MAX_BATCH_FILES = 10
@@ -227,6 +365,23 @@ def _check_dedup(minio, bucket: str, object_name: str) -> bool:
         return False
 
 
+def _storage_prefix(dataset: Dataset) -> str:
+    return (dataset.storage_path or "datasets").strip("/")
+
+
+def _storage_prefix_candidates(dataset: Dataset) -> list[str]:
+    canonical = _storage_prefix(dataset)
+    legacy = (dataset.storage_path or "").rstrip("/")
+    candidates = [canonical]
+    if legacy and legacy not in candidates:
+        candidates.append(legacy)
+    return candidates
+
+
+def _object_name(dataset: Dataset, filename: str) -> str:
+    return f"{_storage_prefix(dataset)}/{filename}"
+
+
 def _upload_single(
     minio, bucket: str,
     file: UploadFile,
@@ -236,27 +391,86 @@ def _upload_single(
     """Upload one file with full pipeline: validate → detect → convert → dedup →
     upload → checksum verify → metadata update.  Returns result dict."""
     filename = file.filename or "unknown"
+    detected = _detect_data_type(filename)
+    stored_filename = filename
+    object_name = _object_name(dataset, stored_filename)
+    if _check_dedup(minio, bucket, object_name):
+        return {"filename": filename, "success": False, "error": f"文件 {stored_filename} 已存在，请改名或跳过"}
+
+    if detected == "text" and _needs_conversion(filename) is None:
+        temp_path, size, local_md5, stream_error = _spool_text_upload(file, filename)
+        if stream_error:
+            return {"filename": filename, "success": False, "error": stream_error}
+        if not temp_path:
+            return {"filename": filename, "success": False, "error": "文件内容为空"}
+        try:
+            _minio_retry_fput(minio, bucket, object_name, temp_path, "text/plain; charset=utf-8")
+            uploaded_to = f"s3://{bucket}/{object_name}"
+        except Exception as exc:
+            return {"filename": filename, "success": False, "error": f"MinIO 上传失败（重试 {_RETRY_COUNT} 次后）: {exc}"}
+        finally:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
+        try:
+            stat = minio.stat_object(bucket, object_name)
+            remote_etag = stat.etag.strip('"') if stat.etag else ""
+            verified = remote_etag == local_md5
+        except Exception:
+            verified = True
+
+        dataset_repository.update_dataset(
+            db, dataset,
+            file_count=(dataset.file_count or 0) + 1,
+            total_size=(dataset.total_size or 0) + size,
+            data_type=detected if not dataset.data_type or dataset.data_type == "other" else dataset.data_type,
+            lineage_status="tracked",
+            source=dataset.source or f"upload:{filename}",
+        )
+        return {
+            "success": True,
+            "filename": filename,
+            "stored_filename": stored_filename,
+            "size_original": size,
+            "size_stored": size,
+            "checksum_local": local_md5,
+            "checksum_verified": verified,
+            "converted": False,
+            "data_type": detected,
+            "storage_path": uploaded_to,
+        }
+
     original_content, original_md5 = _read_and_hash(file)
     size_original = len(original_content)
-
-    # detect
-    detected = _detect_data_type(filename)
+    if size_original == 0:
+        return {"filename": filename, "success": False, "error": "文件内容为空"}
 
     # convert
     converted_data, stored_filename, conv_error = _convert_if_needed(original_content, filename)
     if conv_error:
         return {"filename": filename, "success": False, "error": conv_error}
+    if stored_filename.lower().endswith(_TEXT_STORED_SUFFIXES):
+        try:
+            converted_data, compression = _try_decompress_text_payload(converted_data)
+        except ValueError as exc:
+            return {"filename": filename, "success": False, "error": str(exc)}
+        if compression:
+            stored_filename = re.sub(rf"\.({compression})$", "", stored_filename, flags=re.IGNORECASE) or stored_filename
+        text_err = _validate_text_payload(converted_data, stored_filename)
+        if text_err:
+            return {"filename": filename, "success": False, "error": text_err}
     size = len(converted_data)
     local_md5 = _compute_checksum(converted_data) if converted_data != original_content else original_md5
 
-    # dedup
-    object_name = f"{dataset.storage_path.rstrip('/')}/{stored_filename}"
+    object_name = _object_name(dataset, stored_filename)
     if _check_dedup(minio, bucket, object_name):
         return {"filename": filename, "success": False, "error": f"文件 {stored_filename} 已存在，请改名或跳过"}
 
     # upload with retry
     try:
-        ct = "text/plain; charset=utf-8" if stored_filename.endswith((".txt", ".csv", ".json")) else "application/octet-stream"
+        ct = "text/plain; charset=utf-8" if stored_filename.endswith((".txt", ".csv", ".json", ".jsonl")) else "application/octet-stream"
         _minio_retry_put(minio, bucket, object_name, converted_data, ct)
         uploaded_to = f"s3://{bucket}/{object_name}"
     except Exception as exc:
@@ -276,6 +490,7 @@ def _upload_single(
         file_count=(dataset.file_count or 0) + 1,
         total_size=(dataset.total_size or 0) + size,
         data_type=detected if not dataset.data_type or dataset.data_type == "other" else dataset.data_type,
+        lineage_status="tracked",
         source=dataset.source or f"upload:{filename}",
     )
 
@@ -383,11 +598,211 @@ def clear_resume_state(upload_id: str) -> None:
 # Preprocessing — 预处理任务 (Table 2 主事件流)
 # ============================================================================
 
+_TEXT_JSON_KEYS = (
+    "text",
+    "content",
+    "body",
+    "sentence",
+    "prompt",
+    "question",
+    "answer",
+    "input",
+    "output",
+    "title",
+    "正文",
+    "内容",
+    "问题",
+    "答案",
+)
+
+
+def _iter_response_lines(response, chunk_size: int = 64 * 1024):
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    pending = ""
+    first_chunk = True
+    for chunk in response.stream(chunk_size):
+        if first_chunk:
+            first_chunk = False
+            compression = _compressed_payload_type(chunk)
+            if compression:
+                raise ValueError(f"对象内容是 {compression} 压缩/归档数据，不是可直接预处理的文本")
+        pending += decoder.decode(chunk)
+        lines = pending.splitlines(keepends=True)
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            pending = lines.pop()
+        else:
+            pending = ""
+        for line in lines:
+            yield line.rstrip("\r\n")
+    tail = pending + decoder.decode(b"", final=True)
+    if tail:
+        yield tail.rstrip("\r\n")
+
+
+def _normalize_text(value: object) -> str:
+    text = str(value or "")
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _extract_json_texts(value: object) -> list[str]:
+    if isinstance(value, str):
+        text = _normalize_text(value)
+        return [text] if text else []
+    if isinstance(value, list):
+        texts: list[str] = []
+        for item in value:
+            texts.extend(_extract_json_texts(item))
+        return texts
+    if isinstance(value, dict):
+        chunks: list[str] = []
+        for key in _TEXT_JSON_KEYS:
+            item = value.get(key)
+            if isinstance(item, (str, int, float)):
+                text = _normalize_text(item)
+                if text:
+                    chunks.append(text)
+        if not chunks:
+            for item in value.values():
+                if isinstance(item, (str, int, float)):
+                    text = _normalize_text(item)
+                    if text:
+                        chunks.append(text)
+        text = _normalize_text(" ".join(chunks))
+        return [text] if text else []
+    return []
+
+
+def _write_jsonl_record(output, text: str) -> int:
+    normalized = _normalize_text(text)
+    if not normalized:
+        return 0
+    line = json.dumps({"text": normalized}, ensure_ascii=False) + "\n"
+    data = line.encode("utf-8")
+    output.write(data)
+    return len(data)
+
+
+def _iter_dataset_objects(minio, bucket: str, dataset: Dataset):
+    objects_by_name = {}
+    for prefix in _storage_prefix_candidates(dataset):
+        for obj in minio.list_objects(bucket, prefix=prefix.rstrip("/") + "/", recursive=True):
+            objects_by_name[obj.object_name] = obj
+    return [
+        obj
+        for obj in objects_by_name.values()
+        if not obj.is_dir
+        and "/processed/" not in obj.object_name
+        and not obj.object_name.endswith("/")
+    ]
+
+
+def _preprocess_object_to_jsonl(minio, bucket: str, object_name: str, output) -> tuple[int, int]:
+    suffix = object_name.rsplit(".", 1)[-1].lower() if "." in object_name else "txt"
+    response = minio.get_object(bucket, object_name)
+    record_count = 0
+    bytes_written = 0
+    try:
+        lines = _iter_response_lines(response)
+        if suffix in {"json", "jsonl"}:
+            for line in lines:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    parsed = json.loads(stripped)
+                except json.JSONDecodeError:
+                    bytes_written += _write_jsonl_record(output, stripped)
+                    record_count += 1
+                    continue
+                texts = _extract_json_texts(parsed)
+                for text in texts:
+                    written = _write_jsonl_record(output, text)
+                    if written:
+                        bytes_written += written
+                        record_count += 1
+        elif suffix == "csv":
+            reader = _stdlib_csv.reader(lines)
+            for row in reader:
+                text = _normalize_text(" ".join(cell for cell in row if cell is not None))
+                written = _write_jsonl_record(output, text)
+                if written:
+                    bytes_written += written
+                    record_count += 1
+        else:
+            for line in lines:
+                written = _write_jsonl_record(output, line)
+                if written:
+                    bytes_written += written
+                    record_count += 1
+    finally:
+        response.close()
+        response.release_conn()
+    return record_count, bytes_written
+
+
+def _preprocess_dataset_to_jsonl(dataset: Dataset) -> dict:
+    settings = get_settings()
+    minio = get_minio_client()
+    bucket = settings.MINIO_BUCKET_DATASETS
+    raw_objects = _iter_dataset_objects(minio, bucket, dataset)
+    if not raw_objects:
+        raise ValueError("没有可预处理的原始数据文件")
+
+    output_object = _object_name(dataset, "processed/data.jsonl")
+    total_records = 0
+    total_bytes = 0
+    with tempfile.TemporaryFile() as output:
+        for obj in raw_objects:
+            records, written = _preprocess_object_to_jsonl(minio, bucket, obj.object_name, output)
+            total_records += records
+            total_bytes += written
+        if total_records == 0:
+            raise ValueError("预处理未抽取到有效文本")
+        output.seek(0)
+        minio.put_object(
+            bucket,
+            output_object,
+            data=output,
+            length=total_bytes,
+            content_type="application/x-ndjson; charset=utf-8",
+        )
+
+    return {
+        "output_path": f"s3://{bucket}/{output_object}",
+        "output_object": output_object,
+        "record_count": total_records,
+        "size": total_bytes,
+        "source_file_count": len(raw_objects),
+    }
+
 
 def start_preprocess(db: Session, dataset: Dataset) -> dict:
     dataset_repository.update_dataset(db, dataset, quality_status="checking")
     job = dataset_repository.create_processing_job(db, dataset, "preprocess")
-    return job
+    try:
+        preprocess_result = _preprocess_dataset_to_jsonl(dataset)
+        report = check_quality(db, dataset)
+        return dataset_repository.update_processing_job(
+            job["job_id"],
+            status="completed" if report["passed"] else "failed",
+            progress=100,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            output_path=preprocess_result["output_path"],
+            record_count=preprocess_result["record_count"],
+            processed_size=preprocess_result["size"],
+            source_file_count=preprocess_result["source_file_count"],
+        ) or job
+    except Exception as exc:
+        dataset_repository.update_dataset(db, dataset, quality_status="failed")
+        return dataset_repository.update_processing_job(
+            job["job_id"],
+            status="failed",
+            progress=100,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            error=str(exc),
+        ) or job
 
 
 # ============================================================================
@@ -403,9 +818,14 @@ def _sample_data_from_minio(dataset: Dataset, max_bytes: int = 1024 * 1024) -> t
         settings = get_settings()
         minio = get_minio_client()
         bucket = settings.MINIO_BUCKET_DATASETS
-        prefix = dataset.storage_path.rstrip("/") + "/"
-        objects = list(minio.list_objects(bucket, prefix=prefix, recursive=True))
-        files = [o for o in objects if not o.is_dir]
+        files = _iter_dataset_objects(minio, bucket, dataset)
+        processed = []
+        for prefix in _storage_prefix_candidates(dataset):
+            processed.extend(
+                o for o in minio.list_objects(bucket, prefix=prefix.rstrip("/") + "/processed/", recursive=True)
+                if not o.is_dir and o.object_name.endswith("processed/data.jsonl")
+            )
+        files = processed or files
         if not files:
             return None, "no objects in storage"
         obj = files[0]
@@ -413,6 +833,12 @@ def _sample_data_from_minio(dataset: Dataset, max_bytes: int = 1024 * 1024) -> t
         data = resp.read(max_bytes)
         resp.close()
         resp.release_conn()
+        compression = _compressed_payload_type(data)
+        if compression:
+            return None, f"对象 {obj.object_name} 是 {compression} 压缩/归档数据，不是可直接校验的文本"
+        text_err = _validate_text_payload(data, obj.object_name, allow_truncated=True)
+        if text_err:
+            return None, text_err
         return data, ""
     except Exception as exc:
         return None, str(exc)
@@ -426,6 +852,40 @@ def _parse_csv_to_rows(data: bytes) -> list[list[str]]:
         return [row for row in reader]
     except Exception:
         return []
+
+
+def _parse_jsonl_text_rows(data: bytes) -> tuple[list[str], int]:
+    text = data.decode("utf-8", errors="replace")
+    rows: list[str] = []
+    invalid = 0
+    lines = text.splitlines()
+    if data and not data.endswith((b"\n", b"\r")) and lines:
+        lines = lines[:-1]
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if not stripped.startswith("{"):
+            invalid += 1
+            continue
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            invalid += 1
+            continue
+        extracted = _extract_json_texts(parsed)
+        if extracted:
+            rows.extend(extracted)
+        else:
+            invalid += 1
+    return rows, invalid
+
+
+def _looks_like_jsonl_text(rows: list[str], invalid_rows: int) -> bool:
+    total = len(rows) + invalid_rows
+    if total == 0:
+        return False
+    return bool(rows) and (invalid_rows / total) <= 0.02
 
 
 _TIME_COLUMN_PATTERNS = ["time", "date", "timestamp", "created", "updated", "采集时间", "时间", "日期", "create_time", "update_time", "dt"]
@@ -449,10 +909,29 @@ def _ge_validate(sample_data: bytes, dataset: Dataset, rules: dict) -> dict | No
     if not text.strip():
         return None
 
-    if "," in text[:200] or "\t" in text[:200]:
-        df = pd.read_csv(_stdlib_io.StringIO(text), nrows=500)
+    lines = [line for line in text.splitlines() if line.strip()]
+    jsonl_rows: list[str] = []
+    for line in lines[:500]:
+        stripped = line.strip()
+        if not stripped.startswith(("{", "[")):
+            jsonl_rows = []
+            break
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            jsonl_rows = []
+            break
+        jsonl_rows.extend(_extract_json_texts(parsed))
+
+    if jsonl_rows:
+        df = pd.DataFrame({"text": jsonl_rows[:500]})
+    elif "," in text[:200] or "\t" in text[:200]:
+        try:
+            df = pd.read_csv(_stdlib_io.StringIO(text), nrows=500)
+        except Exception as exc:
+            _logger.warning("GE-compatible CSV parsing failed for dataset %s: %s", dataset.id, exc)
+            df = pd.DataFrame({"line": lines[:500]})
     else:
-        lines = [l for l in text.split("\n") if l.strip()]
         df = pd.DataFrame({"line": lines[:500]})
 
     if df.empty:
@@ -574,13 +1053,16 @@ def check_quality(
 
     # ---- Sample data ----
     sample, sample_err = _sample_data_from_minio(dataset)
-    rows: list[list[str]] = _parse_csv_to_rows(sample) if sample else []
+    jsonl_text_rows, jsonl_invalid_rows = _parse_jsonl_text_rows(sample) if sample else ([], 0)
+    is_jsonl_text = _looks_like_jsonl_text(jsonl_text_rows, jsonl_invalid_rows)
+    rows: list[list[str]] = [[text] for text in jsonl_text_rows] if is_jsonl_text else (_parse_csv_to_rows(sample) if sample else [])
     total_cells = sum(len(r) for r in rows) if rows else 0
     has_sample = total_cells > 0
-    # If MinIO is unreachable but files are recorded, flag as incomplete validation
-    if sample_err and (dataset.file_count or 0) > 0:
-        anomalies.append({"field": "storage", "issue": f"无法读取数据文件: {sample_err}"})
-        suggestions.append("检查 MinIO 连接或存储权限后重新校验")
+    storage_available = has_sample and not sample_err
+    if sample_err:
+        issue = "未上传数据文件" if (dataset.file_count or 0) <= 0 else f"无法读取数据文件: {sample_err}"
+        anomalies.append({"field": "storage", "issue": issue})
+        suggestions.append("请先完成文件上传，或检查 MinIO 存储路径、连接与权限后重新校验")
 
     # ====================================================================
     # 1. Completeness — 缺失率 ≤5% + 重复值检测
@@ -588,6 +1070,8 @@ def check_quality(
     completeness = True
     missing_rate = 0.0
     dup_count = 0
+    if not storage_available:
+        completeness = False
     if has_sample:
         missing = sum(1 for r in rows for c in r if c.strip() == "" or c.upper() == "NULL")
         missing_rate = (missing / total_cells * 100) if total_cells else 0
@@ -598,15 +1082,14 @@ def check_quality(
         if dup_count > 0:
             anomalies.append({"field": "duplicates", "issue": f"发现 {dup_count} 行重复数据"})
             suggestions.append(f"移除 {dup_count} 行重复数据或标记为去重处理")
-    else:
-        completeness = bool(dataset.name and dataset.data_type and (dataset.file_count or dataset.total_size))
-        if not completeness:
-            anomalies.append({"field": "metadata", "issue": "名称、类型或数据文件缺失"})
+    elif not sample_err:
+        completeness = False
+        anomalies.append({"field": "metadata", "issue": "名称、类型或数据文件缺失"})
     if not completeness:
         scores["completeness"] = 0.0 if not has_sample else max(0, 100 - missing_rate * 20 - dup_count * 0.1)
     else:
         scores["completeness"] = 100.0
-    if not completeness:
+    if not completeness and storage_available:
         anomalies.append({"field": "completeness", "issue": f"缺失率 {missing_rate:.1f}% > 5%"})
         suggestions.append("补充缺失字段或删除空值行")
 
@@ -616,11 +1099,18 @@ def check_quality(
     consistency = True
     fmt_rate = 100.0
     range_violations = 0
+    if not storage_available:
+        consistency = False
+        fmt_rate = 0.0
     if has_sample and len(rows) > 1:
-        header = rows[0]
-        header_len = len(header)
-        consistent_rows = sum(1 for r in rows[1:] if len(r) == header_len)
-        fmt_rate = (consistent_rows / (len(rows) - 1) * 100) if len(rows) > 1 else 100
+        header = ["text"] if is_jsonl_text else rows[0]
+        if is_jsonl_text:
+            total_jsonl_rows = len(jsonl_text_rows) + jsonl_invalid_rows
+            fmt_rate = (len(jsonl_text_rows) / total_jsonl_rows * 100) if total_jsonl_rows else 0
+        else:
+            header_len = len(header)
+            consistent_rows = sum(1 for r in rows[1:] if len(r) == header_len)
+            fmt_rate = (consistent_rows / (len(rows) - 1) * 100) if len(rows) > 1 else 100
         consistency = fmt_rate >= 98
         # range validation via rules dict
         for ci, col_name in enumerate(header):
@@ -647,8 +1137,9 @@ def check_quality(
         if range_violations > 0:
             anomalies.append({"field": "range_validation", "issue": f"{range_violations} 个值超出取值范围"})
     if not consistency:
-        anomalies.append({"field": "consistency", "issue": f"格式一致率 {fmt_rate:.1f}% < 98%"})
-        suggestions.append("统一列数或修复格式异常行")
+        issue = f"JSONL 文本格式合法率 {fmt_rate:.1f}% < 98%" if is_jsonl_text else f"格式一致率 {fmt_rate:.1f}% < 98%"
+        anomalies.append({"field": "consistency", "issue": issue})
+        suggestions.append("修复无法解析或缺少 text 字段的 JSONL 行" if is_jsonl_text else "统一列数或修复格式异常行")
     scores["consistency"] = max(0, fmt_rate - range_violations * 0.1)
 
     # ====================================================================
@@ -696,6 +1187,8 @@ def check_quality(
     accuracy = True
     outlier_rate = 0.0
     rule_violations = 0
+    if not storage_available:
+        accuracy = False
     if has_sample and len(rows) > 1:
         numeric_cols: list[list[float]] = []
         for ci in range(len(rows[0])):
@@ -753,7 +1246,7 @@ def check_quality(
     # Composite score
     # ====================================================================
     weights = {"completeness": 0.30, "consistency": 0.25, "timeliness": 0.20, "accuracy": 0.25}
-    overall_score = round(sum(scores.get(k, 100) * weights.get(k, 0) for k in weights), 1)
+    overall_score = round(sum(scores.get(k, 0) * weights.get(k, 0) for k in weights), 1)
     passed = overall_score >= 80
     alerted = overall_score < 60
     blocked_for_training = not passed and any(
@@ -812,12 +1305,7 @@ def repair_quality(db: Session, dataset: Dataset) -> dict:
         try:
             settings = get_settings()
             minio = get_minio_client()
-            objects = list(minio.list_objects(
-                settings.MINIO_BUCKET_DATASETS,
-                prefix=dataset.storage_path.rstrip("/") + "/",
-                recursive=True,
-            ))
-            files = [o for o in objects if not o.is_dir]
+            files = _iter_dataset_objects(minio, settings.MINIO_BUCKET_DATASETS, dataset)
             if files:
                 total_sz = sum(o.size or 0 for o in files)
                 dataset_repository.update_dataset(
@@ -831,6 +1319,24 @@ def repair_quality(db: Session, dataset: Dataset) -> dict:
         dataset_repository.update_dataset(db, dataset, quality_status="passed")
 
     return {"status": "repaired" if fixed else "no_action", "fixed_anomalies": fixed}
+
+
+def delete_dataset(db: Session, dataset: Dataset) -> None:
+    prefixes = _storage_prefix_candidates(dataset)
+    dataset_repository.delete_dataset(db, dataset)
+
+    try:
+        settings = get_settings()
+        minio = get_minio_client()
+        bucket = settings.MINIO_BUCKET_DATASETS
+        deleted: set[str] = set()
+        for prefix in prefixes:
+            for obj in minio.list_objects(bucket, prefix=prefix.rstrip("/") + "/", recursive=True):
+                if not obj.is_dir and obj.object_name not in deleted:
+                    minio.remove_object(bucket, obj.object_name)
+                    deleted.add(obj.object_name)
+    except Exception as exc:
+        _logger.warning("Dataset metadata deleted, but MinIO cleanup failed: %s", exc)
 
 
 # ============================================================================
@@ -879,6 +1385,11 @@ def get_lineage(db: Session, dataset: Dataset) -> dict:
             "version_before": dataset.version,
             "version_after": dataset.version,
         })
+
+    lineage_status = dataset.lineage_status
+    if transformations and lineage_status in (None, "", "none", "pending"):
+        dataset = dataset_repository.update_dataset(db, dataset, lineage_status="tracked")
+        lineage_status = dataset.lineage_status
 
     # ---- R3: 下游消费 ----
     downstream: list[dict] = []
@@ -999,7 +1510,7 @@ def get_lineage(db: Session, dataset: Dataset) -> dict:
         "dataset_id": dataset.id,
         "dataset_name": dataset.name,
         "current_version": dataset.version,
-        "lineage_status": dataset.lineage_status or "tracked",
+        "lineage_status": lineage_status or "tracked",
         "data_used": data_used,
         "origin": origin,
         "transformations": transformations,

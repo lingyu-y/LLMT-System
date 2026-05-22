@@ -44,7 +44,11 @@
           <h2>{{ selectedModel.name }}</h2>
           <span>{{ selectedModel.type }}</span>
         </div>
-        <el-button type="primary" :icon="Plus" @click="ElMessage.success('已创建新版本草稿')">创建新版本</el-button>
+        <div class="detail-actions">
+          <el-button :icon="Upload" @click="importDialogVisible = true">导入</el-button>
+          <el-button :icon="Download" @click="openExportDialog">导出</el-button>
+          <el-button type="primary" :icon="Plus" @click="openVersionDialog">创建新版本</el-button>
+        </div>
       </div>
 
       <div class="grid-2">
@@ -65,6 +69,51 @@
               <span>{{ label }}</span>
               <strong>{{ value }}</strong>
             </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-header">
+            <h3 class="card-title">在线推理试跑</h3>
+            <el-button size="small" :icon="Promotion" :loading="predicting" @click="runPredict">运行</el-button>
+          </div>
+          <div class="card-body inference-panel">
+            <el-input v-model="inferenceInput" type="textarea" :rows="4" placeholder="输入一段文本，调用当前模型同步推理" />
+            <div v-if="prediction" class="result-box">
+              <strong>{{ prediction.latency_ms }} ms</strong>
+              <p>{{ prediction.output }}</p>
+            </div>
+            <div class="usage-row">
+              <span>分钟限额：{{ usage?.limit_per_minute ?? '-' }}</span>
+              <span>剩余额度：{{ usage?.remaining_calls ?? '-' }}</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h3 class="card-title">安全与限流</h3>
+            <el-button size="small" :icon="DataLine" :loading="scanning" @click="runSecurityScan">扫描</el-button>
+          </div>
+          <div class="card-body security-panel">
+            <div class="security-summary">
+              <span>安全评分</span>
+              <strong>{{ securityReports[0]?.score ?? '未扫描' }}</strong>
+            </div>
+            <el-form label-position="top" class="rate-form">
+              <el-form-item label="启用限流">
+                <el-switch v-model="rateLimitForm.enabled" />
+              </el-form-item>
+              <el-form-item label="每分钟请求数">
+                <el-input-number v-model="rateLimitForm.requests_per_minute" :min="1" />
+              </el-form-item>
+              <el-form-item label="并发数">
+                <el-input-number v-model="rateLimitForm.concurrent" :min="1" />
+              </el-form-item>
+              <el-button type="primary" plain @click="saveRateLimit">保存限流</el-button>
+            </el-form>
           </div>
         </div>
       </div>
@@ -197,21 +246,67 @@
         </div>
       </div>
     </el-drawer>
+
+    <el-dialog v-model="versionDialogVisible" title="创建模型版本" width="560px">
+      <el-form label-position="top">
+        <el-form-item label="版本号"><el-input v-model="versionForm.version" placeholder="例如 v1.2.0" /></el-form-item>
+        <el-form-item label="标签"><el-input v-model="versionForm.tag" placeholder="stable / candidate" /></el-form-item>
+        <el-form-item label="说明"><el-input v-model="versionForm.description" type="textarea" :rows="3" /></el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="versionDialogVisible = false">取消</el-button>
+        <el-button type="primary" @click="submitVersion">创建</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="importDialogVisible" title="从模型仓库导入" width="560px">
+      <el-form label-position="top">
+        <el-form-item label="源路径"><el-input v-model="importForm.source_path" placeholder="models/source/path" /></el-form-item>
+        <el-form-item label="模型名称"><el-input v-model="importForm.model_name" /></el-form-item>
+        <el-form-item label="模型编码"><el-input v-model="importForm.model_code" /></el-form-item>
+        <el-form-item label="版本"><el-input v-model="importForm.version" /></el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="importDialogVisible = false">取消</el-button>
+        <el-button type="primary" @click="submitImport">导入</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="exportDialogVisible" title="导出到模型仓库" width="520px">
+      <el-form label-position="top">
+        <el-form-item label="目标路径"><el-input v-model="exportForm.target_path" placeholder="exports/models/current" /></el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="exportDialogVisible = false">取消</el-button>
+        <el-button type="primary" @click="submitExport">导出</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { ArrowLeft, Check, DataLine, Download, Management, Plus, RefreshLeft } from '@element-plus/icons-vue'
+import { ArrowLeft, Check, DataLine, Download, Management, Plus, Promotion, RefreshLeft, Upload } from '@element-plus/icons-vue'
 
+import { getInferenceUsage, predict, type InferenceUsage, type PredictResult } from '@/api/inference'
 import StatusBadge from '@/components/StatusBadge.vue'
 import {
+  compareModelVersions,
+  createModelVersion,
+  exportModel,
   getModelDownloadUrl,
+  getModelRateLimit,
+  getSecurityReports,
+  importModel,
   getModelVersions,
   listModels,
   rollbackModelVersion,
+  triggerSecurityScan,
+  updateModelRateLimit,
   type BackendModel,
+  type ModelRateLimit,
+  type SecurityReport,
 } from '@/api/models'
 
 type ModelItem = {
@@ -239,9 +334,27 @@ const keyword = ref('')
 const typeFilter = ref('全部类型')
 const selectedModel = ref<ModelItem | null>(null)
 const compareDrawerVisible = ref(false)
+const versionDialogVisible = ref(false)
+const importDialogVisible = ref(false)
+const exportDialogVisible = ref(false)
 const compareVersion = ref<VersionItem>()
 const models = ref<ModelItem[]>([])
 const versionHistory = ref<VersionItem[]>([])
+const predicting = ref(false)
+const scanning = ref(false)
+const inferenceInput = ref('请对当前模型做一次测试推理')
+const prediction = ref<PredictResult>()
+const usage = ref<InferenceUsage>()
+const securityReports = ref<SecurityReport[]>([])
+const rateLimit = ref<ModelRateLimit>()
+const rateLimitForm = ref({
+  enabled: true,
+  requests_per_minute: 100,
+  concurrent: 10,
+})
+const versionForm = ref({ version: '', tag: '', description: '' })
+const importForm = ref({ source_path: '', model_name: '', model_code: '', version: 'v1.0.0' })
+const exportForm = ref({ target_path: '' })
 
 const colors = [
   'linear-gradient(135deg, #3b82f6, #2563eb)',
@@ -287,6 +400,24 @@ const loadModels = async () => {
 
 const loadVersions = async (modelCode: string) => {
   versionHistory.value = (await getModelVersions(modelCode)).map(mapVersion)
+}
+
+const loadModelOps = async (modelCode: string) => {
+  const [usageResult, reportsResult, rateResult] = await Promise.allSettled([
+    getInferenceUsage(modelCode),
+    getSecurityReports(modelCode),
+    getModelRateLimit(modelCode),
+  ])
+  if (usageResult.status === 'fulfilled') usage.value = usageResult.value[0]
+  if (reportsResult.status === 'fulfilled') securityReports.value = reportsResult.value
+  if (rateResult.status === 'fulfilled') {
+    rateLimit.value = rateResult.value
+    rateLimitForm.value = {
+      enabled: rateResult.value.enabled,
+      requests_per_minute: rateResult.value.limits.requests_per_minute,
+      concurrent: rateResult.value.limits.concurrent,
+    }
+  }
 }
 
 const filteredModels = computed(() =>
@@ -363,9 +494,22 @@ const artifacts = computed(() => [
 const currentVersion = computed(() => versionHistory.value.find((item) => item.current) ?? versionHistory.value[0])
 const historicalCheckpoint = computed(() => `ckpt/${compareVersion.value?.version ?? 'history'}/best`)
 
-const openCompareDrawer = (version: VersionItem) => {
+const openCompareDrawer = async (version: VersionItem) => {
   compareVersion.value = version
+  if (selectedModel.value && currentVersion.value) {
+    await compareModelVersions(selectedModel.value.id, currentVersion.value.version, version.version).catch(() => undefined)
+  }
   compareDrawerVisible.value = true
+}
+
+const openVersionDialog = () => {
+  versionForm.value = { version: '', tag: '', description: '' }
+  versionDialogVisible.value = true
+}
+
+const openExportDialog = () => {
+  exportForm.value = { target_path: selectedModel.value ? `exports/${selectedModel.value.id}/${selectedModel.value.version}` : '' }
+  exportDialogVisible.value = true
 }
 
 const rollback = async (version: string) => {
@@ -384,7 +528,79 @@ const downloadVersion = (version: string) => {
 
 const selectModel = async (model: ModelItem) => {
   selectedModel.value = model
-  await loadVersions(model.id)
+  await Promise.all([loadVersions(model.id), loadModelOps(model.id)])
+}
+
+const runPredict = async () => {
+  if (!selectedModel.value || !inferenceInput.value.trim()) return
+  predicting.value = true
+  try {
+    prediction.value = await predict(selectedModel.value.id, { input: inferenceInput.value.trim() })
+    const usageResult = await getInferenceUsage(selectedModel.value.id)
+    usage.value = usageResult[0]
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '推理失败')
+  } finally {
+    predicting.value = false
+  }
+}
+
+const runSecurityScan = async () => {
+  if (!selectedModel.value) return
+  scanning.value = true
+  try {
+    await triggerSecurityScan(selectedModel.value.id)
+    securityReports.value = await getSecurityReports(selectedModel.value.id)
+    ElMessage.success('安全扫描完成')
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '安全扫描失败')
+  } finally {
+    scanning.value = false
+  }
+}
+
+const saveRateLimit = async () => {
+  if (!selectedModel.value) return
+  rateLimit.value = await updateModelRateLimit(selectedModel.value.id, rateLimitForm.value)
+  ElMessage.success('限流策略已保存')
+}
+
+const submitVersion = async () => {
+  if (!selectedModel.value || !versionForm.value.version.trim()) {
+    ElMessage.warning('请填写版本号')
+    return
+  }
+  await createModelVersion(selectedModel.value.id, {
+    version: versionForm.value.version,
+    tag: versionForm.value.tag,
+    description: versionForm.value.description,
+    framework: selectedModel.value.raw.framework,
+  })
+  versionDialogVisible.value = false
+  await loadVersions(selectedModel.value.id)
+  ElMessage.success('模型版本已创建')
+}
+
+const submitImport = async () => {
+  if (!importForm.value.source_path || !importForm.value.model_name || !importForm.value.model_code) {
+    ElMessage.warning('请填写导入信息')
+    return
+  }
+  await importModel({ ...importForm.value })
+  importDialogVisible.value = false
+  await loadModels()
+  ElMessage.success('模型导入成功')
+}
+
+const submitExport = async () => {
+  if (!selectedModel.value || !exportForm.value.target_path) return
+  await exportModel({
+    model_code: selectedModel.value.id,
+    version: selectedModel.value.version,
+    target_path: exportForm.value.target_path,
+  })
+  exportDialogVisible.value = false
+  ElMessage.success('模型导出成功')
 }
 
 onMounted(() => {
@@ -397,11 +613,56 @@ onMounted(() => {
 <style scoped>
 .filters,
 .detail-header,
+.detail-actions,
 .timeline-head,
 .timeline-actions {
   display: flex;
   align-items: center;
   gap: 12px;
+}
+
+.inference-panel,
+.security-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.result-box,
+.security-summary,
+.usage-row {
+  padding: 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-color);
+}
+
+.result-box p {
+  margin: 8px 0 0;
+  color: var(--text-secondary);
+}
+
+.usage-row {
+  display: flex;
+  justify-content: space-between;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.security-summary span,
+.security-summary strong {
+  display: block;
+}
+
+.security-summary strong {
+  margin-top: 6px;
+  font-size: 24px;
+}
+
+.rate-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 12px;
 }
 
 .filters {

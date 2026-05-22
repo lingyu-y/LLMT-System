@@ -83,6 +83,11 @@ class ProcessingJobOut(BaseModel):
     job_type: str
     status: str
     progress: int
+    output_path: Optional[str] = None
+    record_count: Optional[int] = None
+    processed_size: Optional[int] = None
+    source_file_count: Optional[int] = None
+    error: Optional[str] = None
     started_at: Optional[str]
     finished_at: Optional[str]
 
