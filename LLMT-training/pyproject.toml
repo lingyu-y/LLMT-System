@@ -23,5 +23,8 @@ all = ["deepspeed>=0.12.0", "influxdb-client>=1.30.0", "minio>=7.0.0"]
 [project.scripts]
 llmt-train = "llmt_training.cli.main:cli"
 
+[tool.setuptools.package-dir]
+llmt_training = "."
+
 [tool.setuptools.packages.find]
-include = ["llmt_training*"]
+include = ["config*", "core*", "data*", "models*", "trainers*", "launcher*", "reporting*", "cli*", "federated*"]

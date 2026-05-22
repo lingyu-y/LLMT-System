@@ -140,9 +140,25 @@ def remove_participant(
 
 @router.get("/options")
 def get_federated_options(
+    db: Session = Depends(get_db),
     _user=Depends(get_current_user),
 ):
     """Get available options for federated learning configuration."""
+    from app.models.dataset import Dataset as DatasetModel
+
+    # Fetch available datasets for participant binding
+    datasets = (
+        db.query(DatasetModel.id, DatasetModel.name, DatasetModel.data_type, DatasetModel.file_count)
+        .filter(DatasetModel.quality_status.in_(["passed", "pending"]))
+        .order_by(DatasetModel.id.desc())
+        .limit(200)
+        .all()
+    )
+    dataset_options = [
+        {"id": d.id, "name": d.name, "data_type": d.data_type, "file_count": d.file_count}
+        for d in datasets
+    ]
+
     return success_response({
         "aggregation_strategies": [
             {"value": "fedavg", "label": "FedAvg (均匀平均)"},
@@ -156,4 +172,5 @@ def get_federated_options(
         "dp_algorithms": [
             {"value": "dp-sgd", "label": "DP-SGD (差分隐私SGD)"},
         ],
+        "datasets": dataset_options,
     })

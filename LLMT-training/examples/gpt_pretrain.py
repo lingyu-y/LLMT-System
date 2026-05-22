@@ -10,9 +10,8 @@ Usage:
     # DeepSpeed
     deepspeed --num_gpus=4 gpt_pretrain.py --deepspeed --deepspeed_config ds_zero2.json
 
-    # Megatron (via launcher)
-    torchrun --nproc_per_node=4 gpt_pretrain.py \
-        --num-layers 24 --hidden-size 1024 --num-attention-heads 16 ...
+    # Via launcher (config passed via LLMT_TRAINING_CONFIG env var)
+    torchrun --nproc_per_node=4 gpt_pretrain.py
 """
 
 from __future__ import annotations

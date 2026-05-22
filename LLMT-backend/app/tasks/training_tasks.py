@@ -14,6 +14,81 @@ from app.core.config import get_settings
 settings = get_settings()
 
 
+def _ensure_llmt_training_on_path() -> None:
+    """Register the llmt_training package even if pip install -e . wasn't run.
+
+    The repo directory is ``LLMT-training/`` (hyphen) but the Python package
+    is ``llmt_training`` (underscore).  Simply adding the repo root to
+    ``sys.path`` won't work because Python can't import a directory whose
+    name contains a hyphen.  Instead we use ``importlib.util`` to load the
+    ``__init__.py`` and register the module explicitly.
+
+    **Critical**: We also create a symlink ``llmt_training -> LLMT-training``
+    in the same parent directory and add that parent to both ``sys.path`` and
+    ``PYTHONPATH`` so that DataLoader worker sub-processes (spawned via
+    ``multiprocessing``) can also find the package.
+    """
+    try:
+        import llmt_training  # noqa: F401
+        return
+    except ImportError:
+        pass
+
+    # Resolve the physical path to the LLMT-training source directory
+    module_path = settings.LLMT_TRAINING_MODULE_PATH
+    if os.path.isdir(module_path):
+        source_dir = module_path
+    else:
+        # Derive from repo layout: LLMT-training is a sibling of LLMT-backend
+        repo_root = os.path.dirname(
+            os.path.dirname(
+                os.path.dirname(
+                    os.path.dirname(os.path.abspath(__file__))
+                )
+            )
+        )
+        source_dir = os.path.join(repo_root, "LLMT-training")
+
+    if not os.path.isdir(source_dir):
+        return
+
+    init_file = os.path.join(source_dir, "__init__.py")
+    if not os.path.isfile(init_file):
+        return
+
+    # Register llmt_training as a package pointing to source_dir (for main process)
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "llmt_training",
+        init_file,
+        submodule_search_locations=[source_dir],
+    )
+    if spec is not None and spec.loader is not None:
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["llmt_training"] = module
+        spec.loader.exec_module(module)
+
+    # Create a symlink so multiprocessing workers can also find the package.
+    # LLMT-training/ (hyphen) -> llmt_training/ (underscore) symlink
+    parent_dir = os.path.dirname(source_dir)
+    symlink_path = os.path.join(parent_dir, "llmt_training")
+    if not os.path.exists(symlink_path):
+        try:
+            os.symlink(source_dir, symlink_path)
+        except OSError:
+            pass  # Permission or FS issue; num_workers=0 will be the fallback
+
+    # Add parent directory to sys.path and PYTHONPATH for child processes
+    if parent_dir not in sys.path:
+        sys.path.insert(0, parent_dir)
+    existing_pp = os.environ.get("PYTHONPATH", "")
+    if parent_dir not in existing_pp:
+        os.environ["PYTHONPATH"] = f"{parent_dir}:{existing_pp}" if existing_pp else parent_dir
+
+
+_ensure_llmt_training_on_path()
+
+
 @celery_app.task(
     name="run_training_task",
     bind=True,
@@ -52,6 +127,54 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
         config_json = task.config_json
         framework = task.framework or "deepspeed"
         parallel_strategy = task.parallel_strategy or "zero2"
+
+        # Defensive fix: if user selected PyTorch but left a ZeRO parallel
+        # strategy (zero1/zero2/zero3), switch to 'ddp' automatically and
+        # append a warning to the task so the user sees the correction.
+        if framework == "pytorch" and (parallel_strategy or "").startswith("zero"):
+            from datetime import datetime
+            old = parallel_strategy
+            parallel_strategy = "ddp"
+            try:
+                db.execute(
+                    "UPDATE training_tasks SET status = :status, error_message = :msg, updated_at = :now WHERE task_code = :code",
+                    {
+                        "status": task.status,
+                        "msg": f"警告：并行策略 {old} 与 PyTorch 不兼容，已自动切换为 'ddp'。",
+                        "now": datetime.utcnow(),
+                        "code": task_code,
+                    },
+                )
+                db.commit()
+            except Exception:
+                pass
+
+        # Resolve dataset_path from dataset_id if not already set
+        if not config_json.get("dataset_path") and task.dataset_id:
+            from app.models.dataset import Dataset
+            dataset = db.query(Dataset).filter(Dataset.id == task.dataset_id).first()
+            if dataset:
+                local_path = _resolve_dataset_path(dataset)
+                if local_path:
+                    config_json["dataset_path"] = local_path
+                else:
+                    _update_task_status(
+                        task_code, "failed",
+                        error_message=(
+                            f"数据集文件无法访问：storage_path='{dataset.storage_path}'。"
+                            "文件在本地不存在且无法从 MinIO 下载，请确认数据已正确上传。"
+                        ),
+                    )
+                    return {"task_code": task_code, "status": "failed",
+                            "error_message": f"数据集文件无法访问：{dataset.storage_path}"}
+                # Map data_type (text/doc/excel) → training format (jsonl/npy/bin)
+                if config_json.get("dataset_format"):
+                    fmt = config_json["dataset_format"]
+                else:
+                    fmt = _map_data_type_to_format(
+                        dataset.data_type, local_path,
+                    )
+                config_json["dataset_format"] = fmt
 
     # --- 2. Build full training config ---
     from llmt_training.config.schema import TrainingConfig
@@ -226,6 +349,127 @@ class _CancellationCheckCallback:
         pass
 
 
+def _map_data_type_to_format(data_type: str, file_path: str) -> str:
+    """Map dataset.data_type (text/doc/excel/other) to training framework format.
+
+    The training framework expects: jsonl, parquet, npy, bin, megatron_bin_idx.
+    The backend stores data_type as: text, doc, excel, other.
+
+    We also check the file extension for a more accurate mapping.
+    """
+    # First, try to infer from file extension
+    ext_map = {
+        ".jsonl": "jsonl",
+        ".json": "jsonl",
+        ".parquet": "parquet",
+        ".npy": "npy",
+        ".bin": "bin",
+        ".csv": "jsonl",  # CSV can be read line-by-line with adaptation
+        ".txt": "jsonl",  # TXT can be read line-by-line
+    }
+    if file_path:
+        for ext, fmt in ext_map.items():
+            if file_path.endswith(ext):
+                return fmt
+
+    # Fallback: map data_type → training format
+    type_map = {
+        "text": "jsonl",
+        "doc": "jsonl",
+        "excel": "jsonl",
+        "other": "jsonl",
+    }
+    return type_map.get(data_type, "jsonl")
+
+
+def _resolve_dataset_path(ds) -> str | None:
+    """Return a local file path for the dataset, downloading from MinIO if needed.
+
+    Tries:
+      1. Local filesystem (storage_path exists as-is)
+      2. MinIO download to temp dir, then find the data file
+
+    Returns the path to a data file, or None.
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    storage_path = ds.storage_path or ""
+
+    # 1. Try local filesystem directly
+    if os.path.exists(storage_path):
+        if os.path.isfile(storage_path):
+            return storage_path
+        # It's a directory – look for a data file inside
+        for fname in os.listdir(storage_path):
+            if fname.endswith((".jsonl", ".npy", ".bin", ".txt", ".json", ".csv")):
+                return os.path.join(storage_path, fname)
+        # If directory has subdirectories, search deeper
+        for root, _, files in os.walk(storage_path):
+            for fname in files:
+                if fname.endswith((".jsonl", ".npy", ".bin", ".txt", ".json", ".csv")):
+                    return os.path.join(root, fname)
+
+    # 2. Try MinIO download
+    local_dir = _download_dataset_from_minio(storage_path)
+    if local_dir is not None:
+        for fname in os.listdir(local_dir):
+            if fname.endswith((".jsonl", ".npy", ".bin", ".txt", ".json", ".csv")):
+                return os.path.join(local_dir, fname)
+        for root, _, files in os.walk(local_dir):
+            for fname in files:
+                if fname.endswith((".jsonl", ".npy", ".bin", ".txt", ".json", ".csv")):
+                    return os.path.join(root, fname)
+
+    return None
+
+
+def _download_dataset_from_minio(
+    storage_path: str,
+    bucket: str | None = None,
+) -> str | None:
+    """Download all files under *storage_path* from MinIO to a local temp dir.
+
+    Returns the local directory path, or None if MinIO is unavailable.
+    """
+    import logging
+    import tempfile
+    logger = logging.getLogger(__name__)
+
+    try:
+        from app.core.database import get_minio_client
+
+        minio = get_minio_client()
+        bucket_name = bucket or settings.MINIO_BUCKET_DATASETS
+
+        # Ensure the prefix has no leading slash for MinIO listing
+        prefix = storage_path.lstrip("/")
+
+        objects = list(minio.list_objects(bucket_name, prefix=prefix, recursive=True))
+        files = [o for o in objects if not o.is_dir]
+        if not files:
+            logger.warning("No files found in MinIO at %s/%s", bucket_name, prefix)
+            return None
+
+        local_dir = tempfile.mkdtemp(prefix="train_dataset_")
+        for obj in files:
+            rel_path = obj.object_name
+            if rel_path.startswith(prefix):
+                rel_path = rel_path[len(prefix):]
+            rel_path = rel_path.lstrip("/")
+
+            local_path = os.path.join(local_dir, rel_path)
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+
+            minio.fget_object(bucket_name, obj.object_name, local_path)
+            logger.debug("Downloaded %s -> %s", obj.object_name, local_path)
+
+        logger.info("Downloaded %d files from MinIO to %s", len(files), local_dir)
+        return local_dir
+    except Exception as exc:
+        logger.warning("Failed to download dataset from MinIO: %s", exc)
+        return None
+
+
 def _build_training_config(
     task_code: str,
     framework: str,
@@ -249,6 +493,8 @@ def _build_training_config(
             "influxdb_token": settings.INFLUXDB_TOKEN,
             "influxdb_org": settings.INFLUXDB_ORG,
             "influxdb_bucket": settings.INFLUXDB_BUCKET,
+            # Ensure training subprocesses/threads can update Postgres progress
+            "postgres_db_url": settings.postgres_database_url,
         },
     }
 
@@ -275,6 +521,8 @@ def _build_training_config(
     }
 
     for key, value in config_json.items():
+        if value is None:
+            continue  # skip None values so Pydantic defaults are used
         if key in model_keys:
             config["model"][key] = value
         elif key in data_keys:
@@ -298,13 +546,21 @@ def _update_task_status(
     status: str,
     error_message: str | None = None,
 ) -> None:
-    """Update TrainingTask status in PostgreSQL."""
+    """Update TrainingTask status in PostgreSQL directly via SQLAlchemy."""
     try:
-        from llmt_training.reporting.postgres_status import PostgresStatusUpdater
-        updater = PostgresStatusUpdater(db_url=settings.postgres_database_url)
-        updater.update_progress(
-            task_code, status=status, error_message=error_message,
-        )
+        from sqlalchemy import create_engine as _ce, update as _upd
+        from sqlalchemy.orm import Session as _S
+        from app.models.training_task import TrainingTask as _TT
+        from datetime import datetime as _dt, timezone as _tz
+        _engine = _ce(settings.postgres_database_url)
+        with _S(_engine) as db:
+            values: dict[str, Any] = {"status": status}
+            if error_message is not None:
+                values["error_message"] = error_message
+            if status in ("completed", "failed", "cancelled"):
+                values["ended_at"] = _dt.now(_tz.utc)
+            db.execute(_upd(_TT).where(_TT.task_code == task_code).values(**values))
+            db.commit()
     except Exception:
         pass  # Best-effort status update
 

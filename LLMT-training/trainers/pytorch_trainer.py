@@ -144,7 +144,16 @@ class PyTorchTrainer(BaseTrainer):
 
         scaler = None
         if precision == "fp16" and self.device.type == "cuda":
-            scaler = torch.amp.GradScaler("cuda")
+            # Create GradScaler in a way that works across torch versions:
+            # prefer torch.cuda.amp.GradScaler, fall back to torch.amp.GradScaler
+            try:
+                from torch.cuda.amp import GradScaler as _GradScaler
+                scaler = _GradScaler()
+            except Exception:
+                try:
+                    scaler = torch.amp.GradScaler()
+                except Exception:
+                    scaler = None
 
         start_time = time.time()
 
@@ -164,6 +173,14 @@ class PyTorchTrainer(BaseTrainer):
                     # Move batch to device
                     batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
                              for k, v in batch.items()}
+
+                    # Ensure model input ids are integer tensors for embedding lookup
+                    if "input_ids" in batch and isinstance(batch["input_ids"], torch.Tensor):
+                        batch["input_ids"] = batch["input_ids"].long()
+                    if "attention_mask" in batch and isinstance(batch["attention_mask"], torch.Tensor):
+                        batch["attention_mask"] = batch["attention_mask"].long()
+                    if "labels" in batch and isinstance(batch["labels"], torch.Tensor):
+                        batch["labels"] = batch["labels"].long()
 
                     # Forward
                     if scaler is not None:
@@ -246,6 +263,12 @@ class PyTorchTrainer(BaseTrainer):
             for batch in self.eval_dataloader:
                 batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
                          for k, v in batch.items()}
+                if "input_ids" in batch and isinstance(batch["input_ids"], torch.Tensor):
+                    batch["input_ids"] = batch["input_ids"].long()
+                if "attention_mask" in batch and isinstance(batch["attention_mask"], torch.Tensor):
+                    batch["attention_mask"] = batch["attention_mask"].long()
+                if "labels" in batch and isinstance(batch["labels"], torch.Tensor):
+                    batch["labels"] = batch["labels"].long()
                 outputs = model(**{k: v for k, v in batch.items()
                                   if k in ("input_ids", "attention_mask")})
                 loss = self.loss_fn(

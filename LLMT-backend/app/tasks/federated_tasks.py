@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
 import time
 from typing import Any
 
@@ -11,8 +12,152 @@ import torch
 from torch.utils.data import DataLoader
 
 from app.core.celery_app import celery_app
+from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
+settings = get_settings()
+
+
+def _ensure_llmt_training_on_path() -> None:
+    """Register the llmt_training package even if pip install -e . wasn't run."""
+    try:
+        import llmt_training  # noqa: F401
+        return
+    except ImportError:
+        pass
+
+    import importlib.util
+    import sys
+
+    module_path = settings.LLMT_TRAINING_MODULE_PATH
+    if os.path.isdir(module_path):
+        source_dir = module_path
+    else:
+        repo_root = os.path.dirname(
+            os.path.dirname(
+                os.path.dirname(
+                    os.path.dirname(os.path.abspath(__file__))
+                )
+            )
+        )
+        source_dir = os.path.join(repo_root, "LLMT-training")
+
+    if not os.path.isdir(source_dir):
+        return
+
+    init_file = os.path.join(source_dir, "__init__.py")
+    if not os.path.isfile(init_file):
+        return
+
+    spec = importlib.util.spec_from_file_location(
+        "llmt_training",
+        init_file,
+        submodule_search_locations=[source_dir],
+    )
+    if spec is not None and spec.loader is not None:
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["llmt_training"] = module
+        spec.loader.exec_module(module)
+
+
+_ensure_llmt_training_on_path()
+
+
+# ---------------------------------------------------------------------------
+# Helper – download dataset files from MinIO to a local temp directory
+# ---------------------------------------------------------------------------
+
+def _download_dataset_from_minio(
+    storage_path: str,
+    bucket: str | None = None,
+) -> str | None:
+    """Download all files under *storage_path* from MinIO to a local temp dir.
+
+    Returns the local directory path, or None if MinIO is unavailable.
+    """
+    from app.core.config import get_settings
+    from app.core.database import get_minio_client
+
+    try:
+        settings = get_settings()
+        minio = get_minio_client()
+        bucket_name = bucket or settings.MINIO_BUCKET_DATASETS
+
+        # Ensure the prefix has no leading slash for MinIO listing
+        prefix = storage_path.lstrip("/")
+
+        objects = list(minio.list_objects(bucket_name, prefix=prefix, recursive=True))
+        files = [o for o in objects if not o.is_dir]
+        if not files:
+            logger.warning("No files found in MinIO at %s/%s", bucket_name, prefix)
+            return None
+
+        local_dir = tempfile.mkdtemp(prefix="fl_dataset_")
+        for obj in files:
+            # Preserve relative path structure under the local dir
+            rel_path = obj.object_name
+            if rel_path.startswith(prefix):
+                rel_path = rel_path[len(prefix):]
+            rel_path = rel_path.lstrip("/")
+
+            local_path = os.path.join(local_dir, rel_path)
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+
+            minio.fget_object(bucket_name, obj.object_name, local_path)
+            logger.debug("Downloaded %s -> %s", obj.object_name, local_path)
+
+        logger.info("Downloaded %d files from MinIO to %s", len(files), local_dir)
+        return local_dir
+    except Exception as exc:
+        logger.warning("Failed to download dataset from MinIO: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Helper – resolve a dataset to a local JSONL path for training
+# ---------------------------------------------------------------------------
+
+def _resolve_dataset_path(ds, config) -> str | None:
+    """Return a local file path for the dataset, downloading from MinIO if needed.
+
+    Tries:
+      1. Local filesystem (storage_path exists as-is)
+      2. MinIO download to temp dir, then find the JSONL file
+
+    Returns the path to a JSONL file, or None.
+    """
+    storage_path = ds.storage_path or ""
+
+    # 1. Try local filesystem directly
+    if os.path.exists(storage_path):
+        if os.path.isfile(storage_path):
+            return storage_path
+        # It's a directory – look for a JSONL file inside
+        for fname in os.listdir(storage_path):
+            if fname.endswith(".jsonl"):
+                return os.path.join(storage_path, fname)
+        # If no JSONL, try any text file
+        for fname in os.listdir(storage_path):
+            if fname.endswith((".txt", ".json", ".csv")):
+                return os.path.join(storage_path, fname)
+
+    # 2. Try MinIO download
+    local_dir = _download_dataset_from_minio(storage_path)
+    if local_dir is not None:
+        for fname in os.listdir(local_dir):
+            if fname.endswith(".jsonl"):
+                return os.path.join(local_dir, fname)
+        # Try any text file
+        for fname in os.listdir(local_dir):
+            if fname.endswith((".txt", ".json", ".csv")):
+                return os.path.join(local_dir, fname)
+        # If directory has subdirectories, search deeper
+        for root, _, files in os.walk(local_dir):
+            for fname in files:
+                if fname.endswith(".jsonl"):
+                    return os.path.join(root, fname)
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -49,34 +194,42 @@ def _build_participant_from_db(
         local_batch_size=p.local_batch_size,
         local_learning_rate=p.local_learning_rate,
         status=p.status,
+        dataset_id=p.dataset_id,
     )
 
     # --- data loader ---
     train_dataloader: DataLoader | None = None
     if p.dataset_id is not None:
         ds = db.query(DatasetModel).filter(DatasetModel.id == p.dataset_id).first()
-        if ds is not None and os.path.exists(ds.storage_path):
-            finetune_ds = FinetuneDataset.from_config({
-                "data": {"dataset_path": ds.storage_path},
-                "model": {"seq_length": config.seq_length},
-            })
-            if tokenizer is not None:
-                finetune_ds.tokenizer = tokenizer
-            train_dataloader = DataLoader(
-                finetune_ds,
-                batch_size=p.local_batch_size,
-                shuffle=True,
-                num_workers=0,
-                drop_last=False,
-            )
-            logger.info(
-                "Participant %s: loaded dataset '%s' (%d samples)",
-                p.participant_id, ds.name, len(finetune_ds),
-            )
+        if ds is not None:
+            local_path = _resolve_dataset_path(ds, config)
+            if local_path is not None:
+                finetune_ds = FinetuneDataset.from_config({
+                    "data": {"dataset_path": local_path},
+                    "model": {"seq_length": config.seq_length},
+                })
+                if tokenizer is not None:
+                    finetune_ds.tokenizer = tokenizer
+                train_dataloader = DataLoader(
+                    finetune_ds,
+                    batch_size=p.local_batch_size,
+                    shuffle=True,
+                    num_workers=0,
+                    drop_last=False,
+                )
+                logger.info(
+                    "Participant %s: loaded dataset '%s' (%d samples) from %s",
+                    p.participant_id, ds.name, len(finetune_ds), local_path,
+                )
+            else:
+                logger.warning(
+                    "Participant %s: dataset '%s' (id=%d) could not be resolved to a local file",
+                    p.participant_id, ds.name, ds.id,
+                )
         else:
             logger.warning(
-                "Participant %s: dataset path '%s' does not exist",
-                p.participant_id, ds.storage_path if ds else "(dataset not found)",
+                "Participant %s: dataset_id=%d not found in DB",
+                p.participant_id, p.dataset_id,
             )
 
     if train_dataloader is None:
@@ -84,7 +237,6 @@ def _build_participant_from_db(
             "Participant %s: no dataset available, using synthetic data",
             p.participant_id,
         )
-        from llmt_training.data.finetune_dataset import FinetuneDataset
         n_samples = max(p.data_size, 100)
         synthetic_samples = [
             {"text": f"federated training sample {i} for participant {p.participant_id}"}
@@ -229,6 +381,10 @@ def run_federated_task(self, task_code: str) -> dict:
 
             # ---- detect anomalies ----
             anomaly_report = coordinator.detect_and_handle_anomalies(updates)
+
+            # Persist anomaly info to DB participants
+            _persist_anomaly_info(db, task, anomaly_report)
+
             for pid in anomaly_report.get("anomalies", {}):
                 if pid in updates:
                     del updates[pid]
@@ -381,14 +537,62 @@ def _sync_participants(
         logger.info("Participant %s removed (no longer active in DB)", pid)
 
 
+def _persist_anomaly_info(
+    db, task, anomaly_report: dict[str, Any],
+) -> None:
+    """Write anomaly detection results back to DB participant rows."""
+    if not anomaly_report or "anomalies" not in anomaly_report:
+        return
+    from app.models.federated import FederatedParticipant as DBParticipant
+
+    anomalies: dict[str, dict] = anomaly_report["anomalies"]
+    if not anomalies:
+        return
+
+    for pid, info in anomalies.items():
+        db_p = (
+            db.query(DBParticipant)
+            .filter(DBParticipant.task_id == task.id, DBParticipant.participant_id == pid)
+            .first()
+        )
+        if db_p is not None:
+            db_p.anomaly_score = info.get("z_score")
+            db_p.anomaly_details_json = info
+
+    db.commit()
+
+
 def _persist_round_progress(
     db, task, coordinator, round_num: int,
 ) -> None:
-    """Write incremental progress back to DB after each round."""
+    """Write incremental progress back to DB after each round.
+
+    Updates both the task row and each participant's runtime stats.
+    """
+    from app.models.federated import FederatedParticipant as DBParticipant
+
     task.current_round = round_num
     task.best_loss = (
         round(coordinator._best_loss, 6)
         if coordinator._best_loss != float("inf")
         else None
     )
+
+    # Update participant runtime stats from coordinator state
+    db_participants: dict[str, DBParticipant] = {
+        p.participant_id: p
+        for p in db.query(DBParticipant)
+        .filter(DBParticipant.task_id == task.id)
+        .all()
+    }
+    for pid, p_coord in coordinator.participants.items():
+        db_p = db_participants.get(pid)
+        if db_p is None:
+            continue
+        db_p.last_round_completed = round_num
+        if p_coord._local_loss_history:
+            db_p.last_loss = round(p_coord._local_loss_history[-1], 6)
+        if p_coord.participant_config.status in ("malicious", "inactive"):
+            db_p.status = p_coord.participant_config.status
+
     db.commit()

@@ -11,6 +11,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.models.federated import FederatedParticipant, FederatedTask
+from app.models.dataset import Dataset as DatasetModel
 from app.schemas.federated import (
     AddParticipantRequest,
     FederatedTaskCreate,
@@ -30,9 +31,6 @@ def create_task(db: Session, body: FederatedTaskCreate, creator_id: int) -> Fede
     """Create a federated learning task."""
     task_code = f"FL-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M')}-{uuid.uuid4().hex[:6]}"
 
-    # Build full config
-    config_dict = body.model_dump()
-
     # Build model config
     model_config = {
         "model_type": body.model_type,
@@ -43,6 +41,50 @@ def create_task(db: Session, body: FederatedTaskCreate, creator_id: int) -> Fede
         "seq_length": body.seq_length,
         "dropout": body.dropout,
     }
+
+    # Build full config JSON – only fields that FederatedConfig accepts
+    from llmt_training.federated.config import FederatedConfig, ParticipantConfig
+    participants_for_config = [
+        ParticipantConfig(
+            participant_id=p.participant_id,
+            name=p.name,
+            weight=p.weight,
+            data_size=p.data_size,
+            local_epochs=p.local_epochs,
+            local_batch_size=p.local_batch_size,
+            local_learning_rate=p.local_learning_rate,
+            status="active",
+            dataset_id=p.dataset_id,
+        )
+        for p in body.participants
+    ]
+    config_obj = FederatedConfig(
+        task_code=task_code,
+        model_type=body.model_type,
+        vocab_size=body.vocab_size,
+        hidden_size=body.hidden_size,
+        num_layers=body.num_layers,
+        num_attention_heads=body.num_attention_heads,
+        seq_length=body.seq_length,
+        dropout=body.dropout,
+        num_rounds=body.num_rounds,
+        min_participants=body.min_participants,
+        convergence_threshold=body.convergence_threshold,
+        max_rounds_no_improve=body.max_rounds_no_improve,
+        aggregation_strategy=body.aggregation_strategy,
+        fedprox_mu=body.fedprox_mu,
+        enable_dp=body.enable_dp,
+        dp_epsilon=body.dp_epsilon,
+        dp_delta=body.dp_delta,
+        dp_noise_multiplier=body.dp_noise_multiplier,
+        dp_max_grad_norm=body.dp_max_grad_norm,
+        anomaly_threshold=body.anomaly_threshold,
+        auto_remove_malicious=body.auto_remove_malicious,
+        checkpoint_dir=body.checkpoint_dir,
+        save_every_n_rounds=body.save_every_n_rounds,
+        participants=participants_for_config,
+    )
+    config_dict = json.loads(config_obj.model_dump_json())
 
     task = FederatedTask(
         task_name=body.task_name,
@@ -85,21 +127,21 @@ def create_task(db: Session, body: FederatedTaskCreate, creator_id: int) -> Fede
     db.commit()
     db.refresh(task)
 
-    return _to_task_out(task)
+    return _to_task_out(task, db)
 
 
 def get_task(db: Session, task_id: int) -> FederatedTaskOut | None:
     task = db.query(FederatedTask).filter(FederatedTask.id == task_id).first()
     if task is None:
         return None
-    return _to_task_out(task)
+    return _to_task_out(task, db)
 
 
 def get_task_by_code(db: Session, task_code: str) -> FederatedTaskOut | None:
     task = db.query(FederatedTask).filter(FederatedTask.task_code == task_code).first()
     if task is None:
         return None
-    return _to_task_out(task)
+    return _to_task_out(task, db)
 
 
 def list_tasks(
@@ -151,14 +193,28 @@ def start_task(db: Session, task_id: int) -> FederatedTaskOut | None:
         from app.tasks.federated_tasks import run_federated_task
         async_result = run_federated_task.delay(task.task_code)
         task.celery_task_id = async_result.id  # type: ignore[attr-defined]
+
+        # Check if Celery worker is actually consuming
+        worker_available = False
+        try:
+            from app.core.celery_app import celery_app
+            inspect = celery_app.control.inspect()
+            active_queues = inspect.active_queues() or {}
+            worker_available = bool(active_queues)
+        except Exception:
+            pass
+
+        if not worker_available:
+            logger.info("No Celery worker detected, running federated task %s in background thread", task.task_code)
+            _run_federated_task_in_background(task.task_code, task.id)
     except Exception:
-        # Celery not available – simulate for development
-        logger.info("Celery not available, simulating federated training for task %s", task.task_code)
-        _simulate_training_progress(db, task)
+        # Celery not available – run in background thread
+        logger.info("Celery not available, running federated task %s in background thread", task.task_code)
+        _run_federated_task_in_background(task.task_code, task.id)
 
     db.commit()
     db.refresh(task)
-    return _to_task_out(task)
+    return _to_task_out(task, db)
 
 
 def cancel_task(db: Session, task_id: int) -> FederatedTaskOut | None:
@@ -189,7 +245,7 @@ def cancel_task(db: Session, task_id: int) -> FederatedTaskOut | None:
                 task.celery_task_id, exc,
             )
 
-    return _to_task_out(task)
+    return _to_task_out(task, db)
 
 
 def add_participant(
@@ -224,7 +280,24 @@ def add_participant(
     db.add(participant)
     db.commit()
     db.refresh(participant)
-    return ParticipantOut.model_validate(participant)
+    return ParticipantOut(
+        id=participant.id,
+        task_id=participant.task_id,
+        participant_id=participant.participant_id,
+        name=participant.name,
+        status=participant.status,
+        weight=participant.weight,
+        data_size=participant.data_size,
+        local_epochs=participant.local_epochs,
+        local_batch_size=participant.local_batch_size,
+        local_learning_rate=participant.local_learning_rate,
+        dataset_id=participant.dataset_id,
+        dataset_name=_get_dataset_name(db, participant.dataset_id),
+        last_round_completed=participant.last_round_completed,
+        last_loss=participant.last_loss,
+        anomaly_score=participant.anomaly_score,
+        anomaly_details=participant.anomaly_details_json,
+    )
 
 
 def remove_participant(db: Session, task_id: int, participant_id: str) -> bool:
@@ -277,9 +350,37 @@ def get_task_metrics(db: Session, task_id: int) -> dict[str, Any]:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _to_task_out(task: FederatedTask) -> FederatedTaskOut:
+def _get_dataset_name(db: Session, dataset_id: int | None) -> str | None:
+    """Look up a dataset name by ID. Returns None if not found or dataset_id is None."""
+    if dataset_id is None:
+        return None
+    ds = db.query(DatasetModel).filter(DatasetModel.id == dataset_id).first()
+    return ds.name if ds else None
+
+
+def _to_task_out(task: FederatedTask, db: Session | None = None) -> FederatedTaskOut:
     """Convert a FederatedTask model to FederatedTaskOut schema."""
-    participants = [ParticipantOut.model_validate(p) for p in (task.participants or [])]
+    participants = [
+        ParticipantOut(
+            id=p.id,
+            task_id=p.task_id,
+            participant_id=p.participant_id,
+            name=p.name,
+            status=p.status,
+            weight=p.weight,
+            data_size=p.data_size,
+            local_epochs=p.local_epochs,
+            local_batch_size=p.local_batch_size,
+            local_learning_rate=p.local_learning_rate,
+            dataset_id=p.dataset_id,
+            dataset_name=_get_dataset_name(db, p.dataset_id) if db else None,
+            last_round_completed=p.last_round_completed,
+            last_loss=p.last_loss,
+            anomaly_score=p.anomaly_score,
+            anomaly_details=p.anomaly_details_json,
+        )
+        for p in (task.participants or [])
+    ]
     return FederatedTaskOut(
         id=task.id,
         task_name=task.task_name,
@@ -309,44 +410,44 @@ def _to_task_out(task: FederatedTask) -> FederatedTaskOut:
     )
 
 
-def _simulate_training_progress(db: Session, task: FederatedTask) -> None:
-    """Simulate training progress for development without Celery."""
-    import random
+def _run_federated_task_in_background(task_code: str, task_id: int) -> None:
+    """Run federated task in a daemon thread when no Celery worker is available."""
+    import threading
 
-    round_results = []
-    best_loss = float("inf")
+    def _worker():
+        try:
+            # run_federated_task() handles all DB status updates internally,
+            # so we only need to handle the case where it crashes.
+            from app.tasks.federated_tasks import run_federated_task
+            result = run_federated_task.run(task_code)
 
-    for r in range(1, task.num_rounds + 1):
-        loss = round(2.5 - r * 0.15 + random.uniform(-0.05, 0.05), 4)
-        if loss < best_loss:
-            best_loss = loss
+            status = result.get("status", "unknown") if isinstance(result, dict) else "unknown"
+            if status == "completed":
+                logger.info("Background federated task %s completed", task_code)
+            else:
+                error = result.get("error", result.get("error_message", "")) if isinstance(result, dict) else ""
+                logger.warning("Background federated task %s ended with status=%s error=%s", task_code, status, error)
 
-        round_results.append({
-            "round": r,
-            "num_active_participants": len(task.participants or []),
-            "round_loss": loss,
-            "round_elapsed_seconds": round(random.uniform(8, 25), 2),
-            "converged": r == task.num_rounds,
-        })
+        except Exception as e:
+            logger.exception("Background federated task %s crashed: %s", task_code, e)
+            try:
+                from app.core.database import SessionLocal
+                db = SessionLocal()
+                try:
+                    task = db.query(FederatedTask).filter(FederatedTask.id == task_id).first()
+                    if task and task.status not in ("completed", "cancelled", "failed"):
+                        task.status = "failed"
+                        task.error_message = str(e)
+                        task.ended_at = datetime.now(timezone.utc)
+                        db.commit()
+                finally:
+                    db.close()
+            except Exception:
+                pass
 
-        # Update participants
-        for p in (task.participants or []):
-            p.last_round_completed = r
-            p.last_loss = loss + random.uniform(-0.02, 0.02)
-
-    task.current_round = task.num_rounds
-    task.best_loss = round(best_loss, 6)
-    task.status = "completed"
-    task.ended_at = datetime.now(timezone.utc)
-    task.final_model_path = f"checkpoints/federated/{task.task_code}/global_model-final.pt"
-    task.result_json = {
-        "total_rounds": task.num_rounds,
-        "best_loss": round(best_loss, 6),
-        "total_elapsed_seconds": round(sum(r["round_elapsed_seconds"] for r in round_results), 2),
-        "round_results": round_results,
-    }
-    task.training_log_json = _generate_simulated_logs(task)
-    db.commit()
+    t = threading.Thread(target=_worker, daemon=True, name=f"federated-{task_code}")
+    t.start()
+    logger.info("Started background thread for federated task %s", task_code)
 
 
 def _generate_simulated_logs(task: FederatedTask) -> list[dict[str, Any]]:

@@ -114,12 +114,14 @@ class ParticipantOut(BaseModel):
     local_epochs: int
     local_batch_size: int
     local_learning_rate: float
+    dataset_id: Optional[int] = None
+    dataset_name: Optional[str] = None
     last_round_completed: Optional[int] = None
     last_loss: Optional[float] = None
     anomaly_score: Optional[float] = None
     anomaly_details: Optional[dict[str, Any]] = None
 
-    model_config = {"from_attributes": True}
+    model_config = {"from_attributes": True, "protected_namespaces": ()}
 
 
 class FederatedTaskOut(BaseModel):

@@ -13,6 +13,9 @@ from pydantic import BaseModel, Field, model_validator
 
 class ModelConfig(BaseModel):
     """Model architecture configuration."""
+
+    model_config = {"protected_namespaces": ()}
+
     model_type: str = "gpt2"
     vocab_size: int = 50257
     hidden_size: int = 768
@@ -46,7 +49,7 @@ class DataConfig(BaseModel):
     dataset_format: Literal["jsonl", "parquet", "megatron_bin_idx", "npy"] = "jsonl"
     train_split: float = 0.95
     seed: int = 42
-    num_workers: int = 4
+    num_workers: int = 0
     pin_memory: bool = True
 
 

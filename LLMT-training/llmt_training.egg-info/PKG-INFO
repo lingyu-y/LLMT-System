@@ -1,0 +1,20 @@
+Metadata-Version: 2.4
+Name: llmt-training
+Version: 0.1.0
+Summary: Integrated PyTorch + DeepSpeed + Megatron-LM training framework
+License: MIT
+Requires-Python: >=3.10
+Requires-Dist: torch>=2.0.0
+Requires-Dist: pydantic>=2.0
+Requires-Dist: click>=8.0
+Requires-Dist: pyyaml>=6.0
+Provides-Extra: deepspeed
+Requires-Dist: deepspeed>=0.12.0; extra == "deepspeed"
+Provides-Extra: reporting
+Requires-Dist: influxdb-client>=1.30.0; extra == "reporting"
+Requires-Dist: minio>=7.0.0; extra == "reporting"
+Provides-Extra: all
+Requires-Dist: deepspeed>=0.12.0; extra == "all"
+Requires-Dist: influxdb-client>=1.30.0; extra == "all"
+Requires-Dist: minio>=7.0.0; extra == "all"
+Dynamic: requires-python

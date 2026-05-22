@@ -10,6 +10,17 @@ from torch.utils.data import DataLoader, DistributedSampler, Subset, random_spli
 from llmt_training.core.base_dataset import BaseDataset
 
 
+def _get_tokenizer_from_config(config: dict[str, Any]):
+    from llmt_training.models.registry import ModelRegistry
+
+    model_type = config.get("model", {}).get("model_type", "gpt2")
+    provider = ModelRegistry.get(model_type)
+    try:
+        return provider.get_tokenizer(config.get("model", {}))
+    except Exception:
+        return None
+
+
 def build_dataloaders(
     dataset: BaseDataset,
     config: dict[str, Any],
@@ -29,23 +40,35 @@ def build_dataloaders(
     hyperparams = config.get("hyperparams", {})
     train_split = data_cfg.get("train_split", 0.95)
     batch_size = hyperparams.get("batch_size", 32)
-    num_workers = data_cfg.get("num_workers", 4)
+    num_workers = data_cfg.get("num_workers", 0)
     pin_memory = data_cfg.get("pin_memory", True)
     seed = data_cfg.get("seed", 42)
 
     # Split dataset
     total = len(dataset)
+    if total == 0:
+        raise ValueError(
+            "数据集为空（0 个样本），请检查 dataset_path 是否正确指向一个有效的数据文件。"
+            "如果数据存储在 MinIO，系统会自动下载；如果路径不存在，将导致空数据集。"
+        )
+
     train_size = int(total * train_split)
     eval_size = total - train_size
 
-    if eval_size > 0:
+    # Ensure train_size is at least 1 to avoid num_samples=0 error in RandomSampler
+    if train_size == 0:
+        train_size = 1
+        eval_size = total - train_size
+
+    # When dataset is too small, skip eval split entirely
+    if eval_size <= 0 or total <= 2:
+        train_dataset = dataset
+        eval_dataset = None
+    else:
         train_dataset, eval_dataset = random_split(
             dataset, [train_size, eval_size],
             generator=torch.Generator().manual_seed(seed),
         )
-    else:
-        train_dataset = dataset
-        eval_dataset = None
 
     # Samplers
     train_sampler = DistributedSampler(train_dataset) if distributed else None
@@ -100,7 +123,8 @@ def create_dataset_from_config(config: dict[str, Any]) -> BaseDataset:
     if fmt == "megatron_bin_idx":
         return MegatronDataset.from_config(config)
     elif fmt in ("jsonl", "parquet"):
-        return FinetuneDataset.from_config(config)
+        tokenizer = _get_tokenizer_from_config(config)
+        return FinetuneDataset.from_config(config, tokenizer=tokenizer)
     elif fmt in ("npy", "bin"):
         return PretrainDataset.from_config(config)
     else:

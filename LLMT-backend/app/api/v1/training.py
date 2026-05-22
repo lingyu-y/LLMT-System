@@ -101,9 +101,9 @@ def validate_training_config(
 def create_training_task(
     body: TrainingTaskCreate,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user=Depends(get_current_user),
 ):
-    """Create a new training task. This is the canonical POST /training/tasks route."""
+    """Create a new training task and queue it for execution."""
     result = training_service.create_task(db, body, creator_id=user.id)
     return success_response(result.model_dump(), "训练任务已创建")
 
@@ -112,90 +112,73 @@ def create_training_task(
 def list_training_tasks(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
-    keyword: str = Query("", description="搜索任务名称/代码"),
-    status_filter: str = Query("", alias="status"),
+    status: str = Query(""),
     framework: str = Query(""),
     db: Session = Depends(get_db),
-    _user: User = Depends(get_current_user),
+    _user=Depends(get_current_user),
 ):
-    q = db.query(TrainingTask)
-    if keyword:
-        like = f"%{keyword}%"
-        q = q.filter(TrainingTask.task_name.ilike(like) | TrainingTask.task_code.ilike(like))
-    if status_filter:
-        q = q.filter(TrainingTask.status == status_filter)
-    if framework:
-        q = q.filter(TrainingTask.framework == framework)
-
-    total = q.count()
-    tasks = q.order_by(TrainingTask.id.desc()).offset((page - 1) * page_size).limit(page_size).all()
-    return paginated_response([_task_out(task) for task in tasks], total, page, page_size)
-
-
-@router.post("/tasks/submit")
-def submit_training_task(
-    body: SubmitTaskRequest,
-    db: Session = Depends(get_db),
-    _admin: User = Depends(require_admin),
-):
-    """Start an existing created task by task_code. Kept off /tasks to avoid route ambiguity."""
-    task = training_repository.get_by_task_code(db, body.task_code)
-    if task is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="训练任务不存在")
-    if task.status not in ("created", "queued", "paused"):
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"任务状态为 {task.status}，无法提交")
-
-    task.status = "running"
-    task.started_at = task.started_at or datetime.now(timezone.utc)
-    task.current_epoch = task.current_epoch or 1
-    task.current_step = task.current_step or 0
-    task.checkpoint_path = task.checkpoint_path or f"ckpt/{body.task_code}/step-{task.current_step}"
-    task.config_json = {**(task.config_json or {}), "loss": (task.config_json or {}).get("loss", 0.184)}
-    db.commit()
-    db.refresh(task)
-    return success_response(_task_out(task), "训练任务已提交")
+    """List training tasks with pagination and optional filters."""
+    items, total = training_service.list_tasks(
+        db, page=page, page_size=page_size, status=status, framework=framework,
+    )
+    return paginated_response(
+        [item.model_dump() for item in items],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
 
 
 @router.get("/tasks/{task_id}")
 def get_training_task(
     task_id: int,
     db: Session = Depends(get_db),
-    _user: User = Depends(get_current_user),
+    _user=Depends(get_current_user),
 ):
-    return success_response(_task_out(_get_task_or_404(db, task_id)))
+    """Get a single training task by ID."""
+    result = training_service.get_task(db, task_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="训练任务不存在")
+    return success_response(result.model_dump())
+
+
+@router.post("/tasks/{task_id}/cancel")
+def cancel_training_task(
+    task_id: int,
+    db: Session = Depends(get_db),
+    _user=Depends(get_current_user),
+):
+    """Cancel a running or queued training task."""
+    result = training_service.cancel_task(db, task_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="训练任务不存在或无法取消")
+    return success_response(result.model_dump(), "训练任务已取消")
 
 
 @router.post("/tasks/{task_id}/pause")
 def pause_training_task(
     task_id: int,
     db: Session = Depends(get_db),
-    _admin: User = Depends(require_admin),
+    _admin=Depends(require_admin),
 ):
-    task = _get_task_or_404(db, task_id)
-    if task.status != "running":
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"任务状态为 {task.status}，无法暂停")
-
-    task.status = "paused"
-    db.commit()
-    db.refresh(task)
-    return success_response(_task_out(task), "训练任务已暂停")
+    """Pause a running training task."""
+    result = training_service.pause_task(db, task_id)
+    if result is None:
+        raise HTTPException(status_code=409, detail="任务不存在或状态不允许暂停")
+    return success_response(result.model_dump(), "训练任务已暂停")
 
 
 @router.post("/tasks/{task_id}/resume")
 def resume_training_task(
     task_id: int,
     db: Session = Depends(get_db),
-    _admin: User = Depends(require_admin),
+    _admin=Depends(require_admin),
 ):
-    task = _get_task_or_404(db, task_id)
-    if task.status != "paused":
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"任务状态为 {task.status}，无法恢复")
-
-    task.status = "running"
-    task.started_at = task.started_at or datetime.now(timezone.utc)
-    db.commit()
-    db.refresh(task)
-    return success_response(_task_out(task), "训练任务已恢复")
+    """Resume a paused training task."""
+    result = training_service.resume_task(db, task_id)
+    if result is None:
+        raise HTTPException(status_code=409, detail="任务不存在或状态不允许恢复")
+    return success_response(result.model_dump(), "训练任务已恢复")
 
 
 @router.post("/tasks/{task_id}/scale")
@@ -203,39 +186,18 @@ def scale_training_task(
     task_id: int,
     body: ScaleTaskRequest,
     db: Session = Depends(get_db),
-    _admin: User = Depends(require_admin),
+    _admin=Depends(require_admin),
 ):
-    task = _get_task_or_404(db, task_id)
-    if task.status not in ("running", "paused", "queued"):
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"任务状态为 {task.status}，无法扩缩容")
-
-    old_gpu = (task.config_json or {}).get("num_gpus") or (task.config_json or {}).get("gpu_count", 1)
-    old_strategy = task.parallel_strategy
-    task.config_json = {**(task.config_json or {}), "num_gpus": body.gpu_count, "gpu_count": body.gpu_count}
-    task.parallel_strategy = body.parallel_strategy or task.parallel_strategy
-    db.commit()
-    db.refresh(task)
-
-    return success_response({
-        **_task_out(task),
-        "scale_detail": {
-            "gpu_count": {"from": old_gpu, "to": body.gpu_count},
-            "parallel_strategy": {"from": old_strategy, "to": task.parallel_strategy},
-        },
-    }, "扩缩容已完成")
-
-
-@router.post("/tasks/{task_id}/cancel")
-def cancel_training_task(
-    task_id: int,
-    db: Session = Depends(get_db),
-    _user: User = Depends(get_current_user),
-):
-    result = training_service.cancel_task(db, task_id)
+    """Scale GPU count / parallel strategy for a running or paused task."""
+    result = training_service.scale_task(db, task_id, body)
     if result is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="训练任务不存在或无法取消")
-    return success_response(result.model_dump(), "训练任务已取消")
+        raise HTTPException(status_code=409, detail="任务不存在或状态不允许扩缩容")
+    return success_response(result.model_dump(), "扩缩容已完成")
 
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
 
 @router.get("/tasks/{task_id}/metrics")
 def get_training_metrics(
@@ -245,9 +207,13 @@ def get_training_metrics(
     stop_time: str = Query(""),
     window: str = Query("10s"),
     db: Session = Depends(get_db),
-    _user: User = Depends(get_current_user),
+    _user=Depends(get_current_user),
 ):
-    task = _get_task_or_404(db, task_id)
+    """Query training metrics from InfluxDB for a given task."""
+    task = training_service.get_task(db, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="训练任务不存在")
+
     query = TrainingMetricsQuery(
         task_code=task.task_code,
         metric_type=metric_type,
@@ -255,26 +221,32 @@ def get_training_metrics(
         stop_time=stop_time or None,
         window=window,
     )
-    try:
-        metrics = training_service.get_metrics(query)
-    except Exception:
-        metrics = []
+    metrics = training_service.get_metrics(query)
     return success_response(metrics)
 
+
+# ---------------------------------------------------------------------------
+# Checkpoints
+# ---------------------------------------------------------------------------
 
 @router.get("/tasks/{task_id}/checkpoints")
 def get_training_checkpoints(
     task_id: int,
     db: Session = Depends(get_db),
-    _user: User = Depends(get_current_user),
+    _user=Depends(get_current_user),
 ):
-    task = _get_task_or_404(db, task_id)
-    try:
-        checkpoints = training_service.get_checkpoints(task.task_code)
-    except Exception:
-        checkpoints = []
+    """List checkpoint files for a training task from MinIO."""
+    task = training_service.get_task(db, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="训练任务不存在")
+
+    checkpoints = training_service.get_checkpoints(task.task_code)
     return success_response(checkpoints)
 
+
+# ---------------------------------------------------------------------------
+# Logs
+# ---------------------------------------------------------------------------
 
 @router.get("/tasks/{task_id}/logs")
 def get_training_logs(
@@ -283,44 +255,64 @@ def get_training_logs(
     keyword: str = Query("", description="日志关键词"),
     lines: int = Query(50, ge=1, le=500, description="返回行数"),
     db: Session = Depends(get_db),
-    _user: User = Depends(get_current_user),
+    _user=Depends(get_current_user),
 ):
-    task = _get_task_or_404(db, task_id)
-    samples = [
-        ("INFO", "TrainingTask initialized", "训练任务初始化完成"),
-        ("INFO", "Loading dataset from MinIO", "从 MinIO 加载数据集"),
-        ("INFO", f"Model {task.task_code} loaded", "模型加载完成"),
-        ("INFO", "Starting training loop", "开始训练循环"),
-        ("WARN", "GPU memory usage exceeds 80%", "GPU 显存使用超过 80%"),
-        ("INFO", "Saving checkpoint", "保存 checkpoint"),
-        ("INFO", "Training completed", "训练完成"),
-    ]
+    """Get training logs for a task."""
+    result = training_service.get_logs(db, task_id, level=level, keyword=keyword, lines=lines)
+    return success_response(result)
 
-    now = datetime.now(timezone.utc)
-    logs = [
-        {
-            "timestamp": (now - timedelta(minutes=len(samples) - index)).isoformat(),
-            "level": log_level,
-            "message": message,
-            "detail": detail,
-            "step": index * 100,
-        }
-        for index, (log_level, message, detail) in enumerate(samples)
-    ]
-    if level:
-        logs = [log for log in logs if log["level"] == level.upper()]
-    if keyword:
-        logs = [
-            log for log in logs
-            if keyword.lower() in log["message"].lower() or keyword.lower() in log["detail"].lower()
-        ]
 
-    logs = logs[-lines:]
-    return success_response({
-        "task_id": task_id,
-        "task_name": task.task_name,
-        "total": len(logs),
-        "level_filter": level,
-        "keyword": keyword,
-        "logs": logs,
-    })
+# ---------------------------------------------------------------------------
+# Options
+# ---------------------------------------------------------------------------
+
+@router.get("/options")
+def get_training_options(
+    db: Session = Depends(get_db),
+    _user=Depends(get_current_user),
+):
+    """Get available options for training configuration."""
+    options = training_service.get_options(db)
+    return success_response(options)
+
+
+# ---------------------------------------------------------------------------
+# Stats
+# ---------------------------------------------------------------------------
+
+@router.get("/stats")
+def get_training_stats(
+    db: Session = Depends(get_db),
+    _user=Depends(get_current_user),
+):
+    """Get training task statistics (counts by status)."""
+    counts = training_service.get_status_counts(db)
+    return success_response(counts)
+
+
+# ---------------------------------------------------------------------------
+# Config validation
+# ---------------------------------------------------------------------------
+
+@router.post("/validate-config")
+def validate_training_config(
+    body: TrainingTaskCreate,
+    _user=Depends(get_current_user),
+):
+    """Validate a training configuration for compatibility issues."""
+    result = training_service.validate_config(
+        body.config, body.framework, body.parallel_strategy,
+    )
+    return success_response(result)
+
+
+# ---------------------------------------------------------------------------
+# Privacy config (legacy)
+# ---------------------------------------------------------------------------
+
+@router.post("/privacy-config")
+def set_privacy_config(
+    body: PrivacyConfigRequest,
+    _admin=Depends(require_admin),
+):
+    return success_response(body.model_dump(), "差分隐私配置已保存")

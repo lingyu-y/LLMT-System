@@ -9,6 +9,7 @@ from llmt_training.core.state import TrainingState
 from llmt_training.reporting.influxdb_writer import InfluxDBMetricsWriter
 from llmt_training.reporting.postgres_status import PostgresStatusUpdater
 from llmt_training.reporting.minio_checkpointer import MinIOCheckpointer
+import os
 
 
 class ReportingCallbackBridge(TrainingCallback):
@@ -48,7 +49,10 @@ class ReportingCallbackBridge(TrainingCallback):
             bucket=reporting.get("influxdb_bucket", "training_metrics"),
         )
 
-        postgres_updater = PostgresStatusUpdater()
+        # Prefer an explicit DB URL passed in the backend-generated config;
+        # fall back to the POSTGRES_DATABASE_URL environment variable.
+        postgres_db_url = reporting.get("postgres_db_url") or os.environ.get("POSTGRES_DATABASE_URL")
+        postgres_updater = PostgresStatusUpdater(db_url=postgres_db_url)
 
         minio_checkpointer = MinIOCheckpointer()
 
@@ -88,7 +92,8 @@ class ReportingCallbackBridge(TrainingCallback):
         """Report step metrics at configured intervals."""
         self._step_count += 1
 
-        if self._step_count % self.report_interval_steps != 0:
+        interval = max(1, self.report_interval_steps)
+        if self._step_count != 1 and self._step_count % interval != 0:
             return
 
         if self.influxdb_writer:

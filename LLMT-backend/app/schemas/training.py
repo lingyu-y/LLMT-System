@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 
 
 # ---------------------------------------------------------------------------
-# Existing: privacy config
+# Privacy config
 # ---------------------------------------------------------------------------
 
 class PrivacyConfigRequest(BaseModel):
@@ -96,13 +96,11 @@ class TrainingTaskCreate(BaseModel):
 
 class SubmitTaskRequest(BaseModel):
     """Request body for submitting an existing created training task."""
-
     task_code: str = Field(..., min_length=1, max_length=64)
 
 
 class ScaleTaskRequest(BaseModel):
     """Request body for scaling a running or paused training task."""
-
     gpu_count: int = Field(..., ge=1, le=64)
     parallel_strategy: Optional[str] = Field(default=None, max_length=64)
 
@@ -128,15 +126,15 @@ class TrainingTaskOut(BaseModel):
     checkpoint_path: Optional[str]
     error_message: Optional[str]
     celery_task_id: Optional[str] = None
-    started_at: Optional[datetime]
-    ended_at: Optional[datetime]
+    started_at: Optional[datetime] = None
+    ended_at: Optional[datetime] = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
 
 
 class TrainingTaskListOut(BaseModel):
-    """Paginated list item."""
+    """Paginated list item with computed display fields."""
     id: int
     task_name: str
     task_code: str
@@ -146,7 +144,13 @@ class TrainingTaskListOut(BaseModel):
     current_epoch: int
     current_step: int
     max_epoch: Optional[int]
+    dataset_id: int
+    config_json: dict[str, Any] = {}
     created_at: datetime
+    # Computed display fields
+    progress: int = 0
+    gpu_display: str = ""
+    error_message: Optional[str] = None
 
     model_config = {"from_attributes": True}
 
@@ -157,10 +161,30 @@ class TrainingTaskListOut(BaseModel):
 
 class TrainingMetricsQuery(BaseModel):
     """Query parameters for fetching training metrics from InfluxDB."""
-
     task_code: str = ""
     metric_type: str = "training_step"
     start_time: str | None = None
     stop_time: str | None = None
     window: str = "10s"
 
+
+# ---------------------------------------------------------------------------
+# Options response
+# ---------------------------------------------------------------------------
+
+class OptionItem(BaseModel):
+    value: str
+    label: str
+
+
+class DatasetOptionItem(BaseModel):
+    value: int
+    label: str
+
+
+class TrainingOptionsOut(BaseModel):
+    models: list[OptionItem] = []
+    datasets: list[DatasetOptionItem] = []
+    frameworks: list[OptionItem] = []
+    gpu_options: list[OptionItem] = []
+    parallel_strategies: list[OptionItem] = []

@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 
 from llmt_training.core.base_model import BaseModelProvider
+from llmt_training.core.simple_tokenizer import SimpleTokenizer
 
 
 class BertConfig:
@@ -172,11 +173,15 @@ class BERTModelProvider(BaseModelProvider):
         return BertModel(bert_config)
 
     def get_tokenizer(self, config: dict[str, Any]) -> Any:
+        vocab_size = config.get("vocab_size", 30522)
         try:
             from transformers import BertTokenizer
-            return BertTokenizer.from_pretrained("bert-base-uncased")
-        except ImportError:
-            return None
+            try:
+                return BertTokenizer.from_pretrained("bert-base-uncased", local_files_only=True)
+            except Exception:
+                return SimpleTokenizer(vocab_size=vocab_size)
+        except Exception:
+            return SimpleTokenizer(vocab_size=vocab_size)
 
     def get_loss_fn(self, config: dict[str, Any]) -> nn.Module:
         return nn.CrossEntropyLoss()

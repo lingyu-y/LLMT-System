@@ -48,9 +48,9 @@ class FinetuneDataset(BaseDataset):
                 truncation=True,
                 return_tensors="pt",
             )
-            input_ids = encoding["input_ids"].squeeze(0)
-            attention_mask = encoding["attention_mask"].squeeze(0)
-            labels = input_ids.clone()
+            input_ids = encoding["input_ids"].squeeze(0).long()
+            attention_mask = encoding["attention_mask"].squeeze(0).long()
+            labels = input_ids.clone().long()
             # Mask padding tokens in labels
             labels[labels == self.tokenizer.pad_token_id] = -100
         else:
@@ -66,19 +66,93 @@ class FinetuneDataset(BaseDataset):
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "FinetuneDataset":
-        """Construct from training config dict."""
+    def from_config(cls, config: dict[str, Any], tokenizer=None) -> "FinetuneDataset":
+        """Construct from training config dict.
+
+        Supports multiple file formats:
+          - JSONL: one JSON object per line (each with a "text" field)
+          - JSON array: a single JSON array of objects
+          - Plain text: one sample per line (wrapped as {"text": line})
+          - CSV: comma-separated, first column treated as text
+        """
         data_cfg = config.get("data", {})
         model_cfg = config.get("model", {})
         path = data_cfg.get("dataset_path", "")
         seq_length = model_cfg.get("seq_length", 512)
 
         samples: list[dict[str, Any]] = []
-        if path and os.path.exists(path):
+        if not path or not os.path.exists(path):
+            return cls(samples, seq_length=seq_length)
+
+        raw = ""
+        try:
             with open(path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        samples.append(json.loads(line))
+                raw = f.read()
+        except UnicodeDecodeError:
+            # Binary file – not suitable for fine-tuning text data
+            return cls(samples, seq_length=seq_length)
+
+        if not raw.strip():
+            return cls(samples, seq_length=seq_length)
+
+        # Try JSON array first (e.g. [{"text": "..."}, ...])
+        stripped = raw.strip()
+        if stripped.startswith("["):
+            try:
+                arr = json.loads(stripped)
+                if isinstance(arr, list):
+                    for item in arr:
+                        if isinstance(item, dict):
+                            samples.append(item)
+                        elif isinstance(item, str):
+                            samples.append({"text": item})
+                    return cls(samples, seq_length=seq_length)
+            except json.JSONDecodeError:
+                pass  # Fall through to JSONL / plain text
+
+        # Try JSONL (one JSON object per line)
+        jsonl_ok = True
+        for line in stripped.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    samples.append(obj)
+                elif isinstance(obj, str):
+                    samples.append({"text": obj})
+                else:
+                    jsonl_ok = False
+                    break
+            except json.JSONDecodeError:
+                jsonl_ok = False
+                break
+
+        if jsonl_ok and samples:
+            return cls(samples, seq_length=seq_length)
+
+        # Fallback: treat as plain text (one sample per line or entire file)
+        samples = []
+        lines = [l.strip() for l in stripped.splitlines() if l.strip()]
+        if len(lines) == 0:
+            return cls(samples, seq_length=seq_length)
+        elif len(lines) == 1:
+            # Single block of text → one sample
+            samples.append({"text": lines[0]})
+        else:
+            # Multiple lines → one sample per line
+            # If it looks like CSV (first line has commas), try to parse
+            if "," in lines[0] and len(lines) > 1:
+                import csv
+                import io
+                reader = csv.reader(io.StringIO(stripped))
+                for row in reader:
+                    text = row[0] if row else ""
+                    if text:
+                        samples.append({"text": text})
+            else:
+                for line in lines:
+                    samples.append({"text": line})
 
         return cls(samples, seq_length=seq_length)
