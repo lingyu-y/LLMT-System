@@ -225,33 +225,22 @@ import { DocumentChecked, VideoPlay } from '@element-plus/icons-vue'
 
 import {
   createTrainingTask,
-  getTrainingOptions,
-  listTrainingTasks,
-  pauseTrainingTask,
-  resumeTrainingTask,
-  scaleTrainingTask,
-  validateTrainingConfig,
-  type SelectOption,
-  type TrainingTask as BackendTrainingTask,
-  type TrainingTaskCreatePayload,
-} from '@/api/training'
-import StatusBadge from '@/components/StatusBadge.vue'
-import {
-  type TrainingOptions,
-  type TrainingTaskListItem,
-  type TrainingLog,
-  fetchTrainingTasks,
-  fetchTrainingTask,
-  createTrainingTask,
   cancelTrainingTask,
   pauseTrainingTask,
   resumeTrainingTask,
   scaleTrainingTask,
+  validateTrainingConfig,
+  fetchTrainingTasks,
+  fetchTrainingTask,
   fetchTrainingOptions,
   fetchTrainingStats,
   fetchTrainingLogs,
-  validateTrainingConfig,
+  type OptionItem as SelectOption,
+  type TrainingOptions,
+  type TrainingTaskListItem,
+  type TrainingLog,
 } from '@/api/training'
+import StatusBadge from '@/components/StatusBadge.vue'
 
 // State
 const activeTrainingTab = ref('parallel')
