@@ -132,6 +132,14 @@ def create_processing_job(db: Session, dataset: Dataset, job_type: str) -> dict:
     return job
 
 
+def update_processing_job(job_id: str, **kwargs) -> dict | None:
+    for job in _MOCK_JOBS:
+        if job["job_id"] == job_id:
+            job.update({key: value for key, value in kwargs.items() if value is not None})
+            return job
+    return None
+
+
 def get_processing_jobs(
     page: int = 1, page_size: int = 20
 ) -> tuple[list[dict], int]:

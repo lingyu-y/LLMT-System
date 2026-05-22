@@ -2,7 +2,8 @@
 
 from typing import List
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile, status
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.responses import paginated_response, success_response
@@ -35,7 +36,7 @@ def dataset_stats(
 
 @router.post("/upload")
 def upload_dataset_file(
-    file: UploadFile,
+    file: UploadFile = File(...),
     dataset_id: int = Query(...),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -56,7 +57,7 @@ def upload_dataset_file(
 
 @router.post("/upload/batch")
 def upload_files_batch(
-    files: List[UploadFile],
+    files: List[UploadFile] = File(...),
     dataset_id: int = Query(...),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -67,6 +68,8 @@ def upload_files_batch(
     result = dataset_service.upload_files_batch(db, ds, files, current_user.username)
     if not result.get("files"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=result.get("error", "上传失败"))
+    if result.get("uploaded", 0) == 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="批量上传失败，未成功写入任何文件")
     log_service.create_log(
         db, user_id=current_user.id, username=current_user.username,
         action="upload_batch", resource="dataset", resource_id=ds.id,
@@ -238,7 +241,17 @@ def delete_dataset(
     ds = dataset_repository.get_dataset_by_id(db, dataset_id)
     if ds is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="数据集不存在")
-    dataset_repository.delete_dataset(db, ds)
+    try:
+        dataset_service.delete_dataset(db, ds)
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="该数据集已被训练任务或其他资源引用，无法删除",
+        ) from exc
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="数据集删除失败") from exc
     log_service.create_log(
         db, user_id=current_user.id, username=current_user.username,
         action="delete", resource="dataset", resource_id=dataset_id,
