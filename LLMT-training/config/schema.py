@@ -13,6 +13,9 @@ from pydantic import BaseModel, Field, model_validator
 
 class ModelConfig(BaseModel):
     """Model architecture configuration."""
+
+    model_config = {"protected_namespaces": ()}
+
     model_type: str = "gpt2"
     vocab_size: int = 50257
     hidden_size: int = 768

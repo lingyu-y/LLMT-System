@@ -351,13 +351,21 @@ def _update_task_status(
     status: str,
     error_message: str | None = None,
 ) -> None:
-    """Update TrainingTask status in PostgreSQL."""
+    """Update TrainingTask status in PostgreSQL directly via SQLAlchemy."""
     try:
-        from llmt_training.reporting.postgres_status import PostgresStatusUpdater
-        updater = PostgresStatusUpdater(db_url=settings.postgres_database_url)
-        updater.update_progress(
-            task_code, status=status, error_message=error_message,
-        )
+        from sqlalchemy import create_engine as _ce, update as _upd
+        from sqlalchemy.orm import Session as _S
+        from app.models.training_task import TrainingTask as _TT
+        from datetime import datetime as _dt, timezone as _tz
+        _engine = _ce(settings.postgres_database_url)
+        with _S(_engine) as db:
+            values: dict[str, Any] = {"status": status}
+            if error_message is not None:
+                values["error_message"] = error_message
+            if status in ("completed", "failed", "cancelled"):
+                values["ended_at"] = _dt.now(_tz.utc)
+            db.execute(_upd(_TT).where(_TT.task_code == task_code).values(**values))
+            db.commit()
     except Exception:
         pass  # Best-effort status update
 

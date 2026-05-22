@@ -400,56 +400,39 @@ def _run_task_in_background(task_code: str, task_id: int) -> None:
     import threading
 
     def _worker():
-        from app.core.database import SessionLocal
-        db = SessionLocal()
         try:
-            repo.update_status(db, task_id, status="queued")
-            db.close()
-
-            # Execute the actual training task function directly
+            # Execute the actual training task function directly.
+            # run_training_task() handles all DB status updates internally
+            # via _update_task_status(), so we only need to handle the case
+            # where it crashes without returning a proper result.
             from app.tasks.training_tasks import run_training_task
             result = run_training_task.run(task_code)
 
-            # Update DB based on result
-            db = SessionLocal()
-            try:
-                task = repo.get_by_id(db, task_id)
-                if task is None:
-                    return
-
-                status = result.get("status", "failed")
-                if status == "completed":
-                    task.status = "completed"
-                    task.ended_at = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
-                    if result.get("final_model_path"):
-                        task.checkpoint_path = result["final_model_path"]
-                elif status == "failed":
-                    task.status = "failed"
-                    task.error_message = result.get("error_message", "Training failed")
-                    task.ended_at = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
-                else:
-                    task.status = status
-
-                # Store training log
-                cfg = dict(task.config_json or {})
-                if result.get("training_log"):
-                    cfg["_training_log"] = result["training_log"]
-                task.config_json = cfg
-                db.commit()
-            finally:
-                db.close()
+            # Log the result for debugging
+            status = result.get("status", "unknown") if isinstance(result, dict) else "unknown"
+            error = result.get("error_message", "") if isinstance(result, dict) else ""
+            if status == "completed":
+                logger.info("Background training task %s completed", task_code)
+            else:
+                logger.warning("Background training task %s ended with status=%s error=%s", task_code, status, error)
 
         except Exception as e:
-            logger.exception("Background training task %s failed: %s", task_code, e)
+            logger.exception("Background training task %s crashed: %s", task_code, e)
+            # run_training_task crashed without handling the error itself.
+            # Update DB as a fallback.
             try:
+                from app.core.database import SessionLocal
+                from datetime import datetime, timezone as tz
                 db = SessionLocal()
-                task = repo.get_by_id(db, task_id)
-                if task and task.status not in ("completed", "cancelled"):
-                    task.status = "failed"
-                    task.error_message = str(e)
-                    task.ended_at = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
-                    db.commit()
-                db.close()
+                try:
+                    task = repo.get_by_id(db, task_id)
+                    if task and task.status not in ("completed", "cancelled", "failed"):
+                        task.status = "failed"
+                        task.error_message = str(e)
+                        task.ended_at = datetime.now(tz.utc)
+                        db.commit()
+                finally:
+                    db.close()
             except Exception:
                 pass
 

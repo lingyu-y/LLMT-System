@@ -415,50 +415,33 @@ def _run_federated_task_in_background(task_code: str, task_id: int) -> None:
     import threading
 
     def _worker():
-        from app.core.database import SessionLocal
         try:
+            # run_federated_task() handles all DB status updates internally,
+            # so we only need to handle the case where it crashes.
             from app.tasks.federated_tasks import run_federated_task
             result = run_federated_task.run(task_code)
 
-            # Update DB based on result
-            db = SessionLocal()
-            try:
-                task = db.query(FederatedTask).filter(FederatedTask.id == task_id).first()
-                if task is None:
-                    return
-
-                status = result.get("status", "failed")
-                if status == "completed":
-                    task.status = "completed"
-                    task.current_round = result.get("total_rounds", task.current_round)
-                    task.best_loss = result.get("best_loss")
-                    task.final_model_path = result.get("final_model_path")
-                    task.result_json = result
-                    task.training_log_json = result.get("training_log")
-                elif status == "failed":
-                    task.status = "failed"
-                    task.error_message = result.get("error", result.get("error_message"))
-                elif status == "cancelled":
-                    task.status = "cancelled"
-                else:
-                    task.status = status
-
-                task.ended_at = datetime.now(timezone.utc)
-                db.commit()
-            finally:
-                db.close()
+            status = result.get("status", "unknown") if isinstance(result, dict) else "unknown"
+            if status == "completed":
+                logger.info("Background federated task %s completed", task_code)
+            else:
+                error = result.get("error", result.get("error_message", "")) if isinstance(result, dict) else ""
+                logger.warning("Background federated task %s ended with status=%s error=%s", task_code, status, error)
 
         except Exception as e:
-            logger.exception("Background federated task %s failed: %s", task_code, e)
+            logger.exception("Background federated task %s crashed: %s", task_code, e)
             try:
+                from app.core.database import SessionLocal
                 db = SessionLocal()
-                task = db.query(FederatedTask).filter(FederatedTask.id == task_id).first()
-                if task and task.status not in ("completed", "cancelled"):
-                    task.status = "failed"
-                    task.error_message = str(e)
-                    task.ended_at = datetime.now(timezone.utc)
-                    db.commit()
-                db.close()
+                try:
+                    task = db.query(FederatedTask).filter(FederatedTask.id == task_id).first()
+                    if task and task.status not in ("completed", "cancelled", "failed"):
+                        task.status = "failed"
+                        task.error_message = str(e)
+                        task.ended_at = datetime.now(timezone.utc)
+                        db.commit()
+                finally:
+                    db.close()
             except Exception:
                 pass
 
