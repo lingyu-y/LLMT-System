@@ -26,9 +26,13 @@ def dashboard_summary(
 
 @router.get("/metrics")
 def dashboard_metrics(
+    range: str = Query("1h", description="时间范围: 15m / 1h / 6h / 24h"),
     _current_user: User = Depends(get_current_user),
 ):
-    return success_response(dashboard_repository.get_metrics())
+    valid_ranges = {"15m", "1h", "6h", "24h"}
+    if range not in valid_ranges:
+        range = "1h"
+    return success_response(dashboard_repository.get_metrics(range_str=range))
 
 
 @router.get("/training-tasks")
@@ -63,9 +67,25 @@ async def dashboard_stream(websocket: WebSocket):
     await websocket.accept()
     try:
         while True:
+            # 每个连接独立 DB session
+            db = next(get_db())
+            try:
+                summary = dashboard_repository.get_summary(db)
+                training_tasks = dashboard_repository.get_training_tasks(db)
+                alerts = dashboard_repository.get_alerts(db, limit=5)
+                metrics = dashboard_repository.get_metrics(range_str="1h")
+            finally:
+                db.close()
+
             payload = {
-                "summary": {"running_tasks": 0, "gpu_utilization": 72.5, "updated_at": datetime.now().isoformat()},
-                "alerts": [],
+                "summary": summary,
+                "training_tasks": training_tasks,
+                "alerts": alerts,
+                "metrics": {
+                    "loss": metrics["loss"][-10:],
+                    "accuracy": metrics["accuracy"][-10:],
+                },
+                "updated_at": datetime.now().isoformat(),
             }
             await websocket.send_text(json.dumps(payload, ensure_ascii=False))
             await asyncio.sleep(5)
