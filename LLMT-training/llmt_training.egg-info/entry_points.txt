@@ -1,0 +1,2 @@
+[console_scripts]
+llmt-train = llmt_training.cli.main:cli

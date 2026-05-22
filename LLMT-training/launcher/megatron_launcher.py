@@ -1,4 +1,4 @@
-"""Megatron launcher – uses torch.distributed.run with Megatron arguments."""
+"""Megatron launcher – uses torch.distributed.run."""
 
 from __future__ import annotations
 
@@ -8,15 +8,13 @@ import sys
 from typing import Any
 
 from llmt_training.launcher.base_launcher import BaseLauncher
-from llmt_training.config.schema import TrainingConfig
-from llmt_training.config.merger import ConfigMerger
 
 
 class MegatronLauncher(BaseLauncher):
-    """Launch training using torch.distributed.run with Megatron-LM arguments.
+    """Launch training using torch.distributed.run.
 
-    Generates Megatron CLI arguments from TrainingConfig and launches via:
-      torchrun --nproc_per_node=N trainer_script.py --num-layers 12 --hidden-size 768 ...
+    Config is passed via LLMT_TRAINING_CONFIG environment variable.
+    Launches via: torchrun --nproc_per_node=N trainer_script.py
     """
 
     def build_command(self, trainer_script: str, **kwargs: Any) -> list[str]:
@@ -41,11 +39,6 @@ class MegatronLauncher(BaseLauncher):
             ])
 
         cmd.append(trainer_script)
-
-        # Add Megatron arguments
-        megatron_args = self._build_megatron_args()
-        cmd.extend(megatron_args)
-
         return cmd
 
     def launch(self, trainer_script: str, **kwargs: Any) -> int:
@@ -63,19 +56,3 @@ class MegatronLauncher(BaseLauncher):
 
         result = subprocess.run(cmd, env=env)
         return result.returncode
-
-    def _build_megatron_args(self) -> list[str]:
-        """Generate Megatron CLI arguments from config."""
-        try:
-            tc = TrainingConfig(**self.config)
-            return ConfigMerger.to_megatron_args(tc)
-        except Exception:
-            # Fallback: minimal args
-            m = self.config.get("model", {})
-            return [
-                "--num-layers", str(m.get("num_layers", 12)),
-                "--hidden-size", str(m.get("hidden_size", 768)),
-                "--num-attention-heads", str(m.get("num_attention_heads", 12)),
-                "--seq-length", str(m.get("seq_length", 1024)),
-                "--model-type", m.get("model_type", "gpt2"),
-            ]

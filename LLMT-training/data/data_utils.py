@@ -10,6 +10,17 @@ from torch.utils.data import DataLoader, DistributedSampler, Subset, random_spli
 from llmt_training.core.base_dataset import BaseDataset
 
 
+def _get_tokenizer_from_config(config: dict[str, Any]):
+    from llmt_training.models.registry import ModelRegistry
+
+    model_type = config.get("model", {}).get("model_type", "gpt2")
+    provider = ModelRegistry.get(model_type)
+    try:
+        return provider.get_tokenizer(config.get("model", {}))
+    except Exception:
+        return None
+
+
 def build_dataloaders(
     dataset: BaseDataset,
     config: dict[str, Any],
@@ -112,7 +123,8 @@ def create_dataset_from_config(config: dict[str, Any]) -> BaseDataset:
     if fmt == "megatron_bin_idx":
         return MegatronDataset.from_config(config)
     elif fmt in ("jsonl", "parquet"):
-        return FinetuneDataset.from_config(config)
+        tokenizer = _get_tokenizer_from_config(config)
+        return FinetuneDataset.from_config(config, tokenizer=tokenizer)
     elif fmt in ("npy", "bin"):
         return PretrainDataset.from_config(config)
     else:

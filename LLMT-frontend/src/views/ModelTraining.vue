@@ -219,7 +219,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { DocumentChecked, VideoPlay } from '@element-plus/icons-vue'
 
@@ -250,6 +250,7 @@ const trainingLogs = ref<TrainingLog[]>([])
 const scaleDialogVisible = ref(false)
 const scaleTarget = ref<TrainingTaskListItem | null>(null)
 const statsCounts = ref<Record<string, number>>({})
+let refreshTimer: number | null = null
 
 const options = reactive<TrainingOptions>({
   models: [],
@@ -580,6 +581,21 @@ onMounted(() => {
   loadOptions()
   loadTasks()
   loadStats()
+
+  refreshTimer = window.setInterval(async () => {
+    await loadTasks()
+    await loadStats()
+    if (selectedTask.value) {
+      await loadLogs(selectedTask.value.id)
+    }
+  }, 5000)
+})
+
+onBeforeUnmount(() => {
+  if (refreshTimer !== null) {
+    window.clearInterval(refreshTimer)
+    refreshTimer = null
+  }
 })
 </script>
 

@@ -1,0 +1,53 @@
+{
+  "task_code": "TASK-4DB2964D",
+  "framework": "megatron",
+  "parallel_strategy": "zero2",
+  "model": {
+    "model_type": "gpt2",
+    "vocab_size": 50257,
+    "hidden_size": 768,
+    "num_layers": 12,
+    "num_attention_heads": 12,
+    "seq_length": 1024
+  },
+  "data": {
+    "dataset_path": "/home/ambition/LLMT-System/LLMT-backend/local_test_dataset.jsonl",
+    "dataset_format": "jsonl",
+    "train_split": 0.95,
+    "seed": 42
+  },
+  "hyperparams": {
+    "batch_size": 32,
+    "learning_rate": 2e-05,
+    "weight_decay": 0.01,
+    "max_epochs": 10,
+    "warmup_steps": 1000,
+    "max_grad_norm": 1.0,
+    "gradient_accumulation_steps": 1,
+    "optimizer": "adamw",
+    "scheduler": "linear_warmup_decay",
+    "precision": "fp16",
+    "min_lr": 0.0,
+    "beta1": 0.9,
+    "beta2": 0.999
+  },
+  "strategy": {
+    "num_gpus": 1,
+    "num_nodes": 1,
+    "tensor_model_parallel_size": 1,
+    "pipeline_model_parallel_size": 1
+  },
+  "checkpoint": {
+    "save_interval": 500,
+    "eval_interval": 100,
+    "max_checkpoints": 5,
+    "upload_to_minio": true
+  },
+  "reporting": {
+    "influxdb_url": "http://localhost:8086",
+    "influxdb_token": "change-this-influxdb-token",
+    "influxdb_org": "llmt",
+    "influxdb_bucket": "training_metrics",
+    "postgres_db_url": "postgresql://postgres:postgres@localhost:5432/llmt_system"
+  }
+}

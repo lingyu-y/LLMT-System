@@ -48,9 +48,9 @@ class FinetuneDataset(BaseDataset):
                 truncation=True,
                 return_tensors="pt",
             )
-            input_ids = encoding["input_ids"].squeeze(0)
-            attention_mask = encoding["attention_mask"].squeeze(0)
-            labels = input_ids.clone()
+            input_ids = encoding["input_ids"].squeeze(0).long()
+            attention_mask = encoding["attention_mask"].squeeze(0).long()
+            labels = input_ids.clone().long()
             # Mask padding tokens in labels
             labels[labels == self.tokenizer.pad_token_id] = -100
         else:
@@ -66,7 +66,7 @@ class FinetuneDataset(BaseDataset):
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "FinetuneDataset":
+    def from_config(cls, config: dict[str, Any], tokenizer=None) -> "FinetuneDataset":
         """Construct from training config dict.
 
         Supports multiple file formats:

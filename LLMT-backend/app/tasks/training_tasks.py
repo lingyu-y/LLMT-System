@@ -128,6 +128,27 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
         framework = task.framework or "deepspeed"
         parallel_strategy = task.parallel_strategy or "zero2"
 
+        # Defensive fix: if user selected PyTorch but left a ZeRO parallel
+        # strategy (zero1/zero2/zero3), switch to 'ddp' automatically and
+        # append a warning to the task so the user sees the correction.
+        if framework == "pytorch" and (parallel_strategy or "").startswith("zero"):
+            from datetime import datetime
+            old = parallel_strategy
+            parallel_strategy = "ddp"
+            try:
+                db.execute(
+                    "UPDATE training_tasks SET status = :status, error_message = :msg, updated_at = :now WHERE task_code = :code",
+                    {
+                        "status": task.status,
+                        "msg": f"警告：并行策略 {old} 与 PyTorch 不兼容，已自动切换为 'ddp'。",
+                        "now": datetime.utcnow(),
+                        "code": task_code,
+                    },
+                )
+                db.commit()
+            except Exception:
+                pass
+
         # Resolve dataset_path from dataset_id if not already set
         if not config_json.get("dataset_path") and task.dataset_id:
             from app.models.dataset import Dataset
@@ -472,6 +493,8 @@ def _build_training_config(
             "influxdb_token": settings.INFLUXDB_TOKEN,
             "influxdb_org": settings.INFLUXDB_ORG,
             "influxdb_bucket": settings.INFLUXDB_BUCKET,
+            # Ensure training subprocesses/threads can update Postgres progress
+            "postgres_db_url": settings.postgres_database_url,
         },
     }
 

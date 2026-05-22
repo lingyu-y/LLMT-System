@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 
 from llmt_training.core.base_model import BaseModelProvider
+from llmt_training.core.simple_tokenizer import SimpleTokenizer
 
 
 class GPTConfig:
@@ -146,11 +147,15 @@ class GPTModelProvider(BaseModelProvider):
         return GPTModel(gpt_config)
 
     def get_tokenizer(self, config: dict[str, Any]) -> Any:
+        vocab_size = config.get("vocab_size", 50257)
         try:
             from transformers import GPT2Tokenizer
-            return GPT2Tokenizer.from_pretrained("gpt2")
-        except ImportError:
-            return None
+            try:
+                return GPT2Tokenizer.from_pretrained("gpt2", local_files_only=True)
+            except Exception:
+                return SimpleTokenizer(vocab_size=vocab_size)
+        except Exception:
+            return SimpleTokenizer(vocab_size=vocab_size)
 
     def get_loss_fn(self, config: dict[str, Any]) -> nn.Module:
         return nn.CrossEntropyLoss()
