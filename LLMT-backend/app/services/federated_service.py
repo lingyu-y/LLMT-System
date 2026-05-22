@@ -173,6 +173,22 @@ def cancel_task(db: Session, task_id: int) -> FederatedTaskOut | None:
     task.ended_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(task)
+
+    # Revoke the Celery task if it exists and is still pending/running
+    if task.celery_task_id:
+        try:
+            from app.core.celery_app import celery_app
+            celery_app.control.revoke(task.celery_task_id, terminate=True)
+            logger.info(
+                "Revoked Celery task %s for federated task %s",
+                task.celery_task_id, task.task_code,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to revoke Celery task %s: %s",
+                task.celery_task_id, exc,
+            )
+
     return _to_task_out(task)
 
 

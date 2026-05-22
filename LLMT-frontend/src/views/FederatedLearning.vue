@@ -361,6 +361,7 @@ import {
   type FederatedTask,
   type ParticipantConfig,
   fetchFederatedTasks,
+  fetchFederatedTask,
   createFederatedTask,
   startFederatedTask,
   cancelFederatedTask,
@@ -586,10 +587,16 @@ const openDetail = async (task: FederatedTask) => {
   selectedTask.value = task
   activeTab.value = 'monitor'
   try {
-    const [metricsRes, logsRes] = await Promise.all([
+    const [detailRes, metricsRes, logsRes] = await Promise.all([
+      fetchFederatedTask(task.id),
       fetchFederatedMetrics(task.id),
       fetchFederatedLogs(task.id),
     ])
+    // Full task details (includes participants with runtime stats)
+    if (detailRes.data) {
+      selectedTask.value = detailRes.data as FederatedTask
+    }
+    // Overlay metrics & logs onto the selected task
     if (metricsRes.data) {
       selectedTask.value = { ...selectedTask.value, result_json: metricsRes.data as Record<string, unknown> }
     }
@@ -607,7 +614,11 @@ const handleAddParticipant = async () => {
     await addParticipant(selectedTask.value.id, newParticipant)
     ElMessage.success('参与方已加入')
     showAddParticipantDialog.value = false
-    await openDetail(selectedTask.value)
+    // Re-fetch full task details so participant list is up to date
+    const detailRes = await fetchFederatedTask(selectedTask.value.id)
+    if (detailRes.data) {
+      selectedTask.value = detailRes.data as FederatedTask
+    }
   } catch (e: unknown) {
     ElMessage.error((e as Error).message || '加入失败')
   }
@@ -618,7 +629,11 @@ const handleRemoveParticipant = async (participant: { participant_id: string }) 
   try {
     await removeParticipant(selectedTask.value.id, participant.participant_id)
     ElMessage.success('参与方已移除')
-    await openDetail(selectedTask.value)
+    // Re-fetch full task details so participant list is up to date
+    const detailRes = await fetchFederatedTask(selectedTask.value.id)
+    if (detailRes.data) {
+      selectedTask.value = detailRes.data as FederatedTask
+    }
   } catch (e: unknown) {
     ElMessage.error((e as Error).message || '移除失败')
   }
