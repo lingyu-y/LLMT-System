@@ -22,6 +22,11 @@ def _ensure_llmt_training_on_path() -> None:
     ``sys.path`` won't work because Python can't import a directory whose
     name contains a hyphen.  Instead we use ``importlib.util`` to load the
     ``__init__.py`` and register the module explicitly.
+
+    **Critical**: We also create a symlink ``llmt_training -> LLMT-training``
+    in the same parent directory and add that parent to both ``sys.path`` and
+    ``PYTHONPATH`` so that DataLoader worker sub-processes (spawned via
+    ``multiprocessing``) can also find the package.
     """
     try:
         import llmt_training  # noqa: F401
@@ -51,7 +56,7 @@ def _ensure_llmt_training_on_path() -> None:
     if not os.path.isfile(init_file):
         return
 
-    # Register llmt_training as a package pointing to source_dir
+    # Register llmt_training as a package pointing to source_dir (for main process)
     import importlib.util
     spec = importlib.util.spec_from_file_location(
         "llmt_training",
@@ -62,6 +67,23 @@ def _ensure_llmt_training_on_path() -> None:
         module = importlib.util.module_from_spec(spec)
         sys.modules["llmt_training"] = module
         spec.loader.exec_module(module)
+
+    # Create a symlink so multiprocessing workers can also find the package.
+    # LLMT-training/ (hyphen) -> llmt_training/ (underscore) symlink
+    parent_dir = os.path.dirname(source_dir)
+    symlink_path = os.path.join(parent_dir, "llmt_training")
+    if not os.path.exists(symlink_path):
+        try:
+            os.symlink(source_dir, symlink_path)
+        except OSError:
+            pass  # Permission or FS issue; num_workers=0 will be the fallback
+
+    # Add parent directory to sys.path and PYTHONPATH for child processes
+    if parent_dir not in sys.path:
+        sys.path.insert(0, parent_dir)
+    existing_pp = os.environ.get("PYTHONPATH", "")
+    if parent_dir not in existing_pp:
+        os.environ["PYTHONPATH"] = f"{parent_dir}:{existing_pp}" if existing_pp else parent_dir
 
 
 _ensure_llmt_training_on_path()

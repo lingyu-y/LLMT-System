@@ -92,10 +92,47 @@ class DeepSpeedTrainer(BaseTrainer):
 
         # Determine local rank
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+
+        # Check CUDA availability (including driver compatibility)
+        use_cuda = False
+        if torch.cuda.is_available():
+            try:
+                # Try a small CUDA operation to verify driver compatibility
+                _test = torch.zeros(1, device="cuda")
+                del _test
+                use_cuda = True
+            except (RuntimeError, torch.cuda.CudaError) as e:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "CUDA runtime available but driver incompatible (%s). Falling back to CPU.", e,
+                )
+                use_cuda = False
+
+        device = torch.device(f"cuda:{local_rank}" if use_cuda else "cpu")
+
+        # If running on CPU, adjust DeepSpeed config to avoid CUDA-only features
+        if not use_cuda:
+            ds_config["fp16"] = {"enabled": False}
+            ds_config["bf16"] = {"enabled": False}
 
         # Move model to correct device before init
         self.model = self.model.to(device)
+
+        # Ensure distributed init environment variables are set (required by DeepSpeed)
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", "29500")
+        os.environ.setdefault("LOCAL_RANK", str(local_rank))
+        os.environ.setdefault("RANK", "0")
+        os.environ.setdefault("WORLD_SIZE", "1")
+
+        # Initialize torch.distributed before DeepSpeed to avoid MPI detection
+        if not torch.distributed.is_initialized():
+            backend = "nccl" if use_cuda else "gloo"
+            torch.distributed.init_process_group(
+                backend=backend,
+                rank=0,
+                world_size=1,
+            )
 
         # DeepSpeed initialize
         model_engine, optimizer, train_dataloader, scheduler = deepspeed.initialize(
@@ -103,8 +140,6 @@ class DeepSpeedTrainer(BaseTrainer):
             model_parameters=[p for p in self.model.parameters() if p.requires_grad],
             training_data=self.train_dataloader,
             config=ds_config,
-            dist_init_address=os.environ.get("MASTER_ADDR", "127.0.0.1"),
-            dist_init_port=os.environ.get("MASTER_PORT", "29500"),
         )
         self._ds_engine = model_engine
         self.train_dataloader = train_dataloader or self.train_dataloader

@@ -49,7 +49,7 @@ class DataConfig(BaseModel):
     dataset_format: Literal["jsonl", "parquet", "megatron_bin_idx", "npy"] = "jsonl"
     train_split: float = 0.95
     seed: int = 42
-    num_workers: int = 4
+    num_workers: int = 0
     pin_memory: bool = True
 
 
