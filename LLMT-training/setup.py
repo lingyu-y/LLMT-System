@@ -2,11 +2,17 @@
 
 from setuptools import setup, find_packages
 
+# The source tree is flat: LLMT-training/{config,core,models,...}
+# We need to map the Python package name "llmt_training" to the repo root "."
+_sub_pkgs = find_packages(exclude=["tests", "tests.*"])
+_packages = ["llmt_training"] + [f"llmt_training.{p}" for p in _sub_pkgs]
+
 setup(
     name="llmt-training",
     version="0.1.0",
     description="Integrated PyTorch + DeepSpeed + Megatron-LM training framework",
-    packages=find_packages(),
+    packages=_packages,
+    package_dir={"llmt_training": "."},
     python_requires=">=3.10",
     install_requires=[
         "torch>=2.0.0",

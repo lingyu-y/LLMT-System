@@ -15,30 +15,53 @@ settings = get_settings()
 
 
 def _ensure_llmt_training_on_path() -> None:
-    """Add LLMT-training to sys.path if the package is not installed."""
+    """Register the llmt_training package even if pip install -e . wasn't run.
+
+    The repo directory is ``LLMT-training/`` (hyphen) but the Python package
+    is ``llmt_training`` (underscore).  Simply adding the repo root to
+    ``sys.path`` won't work because Python can't import a directory whose
+    name contains a hyphen.  Instead we use ``importlib.util`` to load the
+    ``__init__.py`` and register the module explicitly.
+    """
     try:
         import llmt_training  # noqa: F401
         return
     except ImportError:
         pass
 
+    # Resolve the physical path to the LLMT-training source directory
     module_path = settings.LLMT_TRAINING_MODULE_PATH
-    # If it's a filesystem path, add its parent so "from llmt_training.xxx" works
     if os.path.isdir(module_path):
-        sys.path.insert(0, os.path.dirname(module_path))
-        return
-
-    # Derive from repo layout: LLMT-training is a sibling of LLMT-backend
-    repo_root = os.path.dirname(
-        os.path.dirname(
+        source_dir = module_path
+    else:
+        # Derive from repo layout: LLMT-training is a sibling of LLMT-backend
+        repo_root = os.path.dirname(
             os.path.dirname(
-                os.path.dirname(os.path.abspath(__file__))
+                os.path.dirname(
+                    os.path.dirname(os.path.abspath(__file__))
+                )
             )
         )
+        source_dir = os.path.join(repo_root, "LLMT-training")
+
+    if not os.path.isdir(source_dir):
+        return
+
+    init_file = os.path.join(source_dir, "__init__.py")
+    if not os.path.isfile(init_file):
+        return
+
+    # Register llmt_training as a package pointing to source_dir
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "llmt_training",
+        init_file,
+        submodule_search_locations=[source_dir],
     )
-    candidate = os.path.join(repo_root, "LLMT-training")
-    if os.path.isdir(candidate):
-        sys.path.insert(0, repo_root)
+    if spec is not None and spec.loader is not None:
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["llmt_training"] = module
+        spec.loader.exec_module(module)
 
 
 _ensure_llmt_training_on_path()
