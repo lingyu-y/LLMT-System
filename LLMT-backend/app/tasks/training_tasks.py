@@ -115,8 +115,23 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
                 if local_path:
                     config_json["dataset_path"] = local_path
                 else:
-                    config_json["dataset_path"] = dataset.storage_path
-                config_json["dataset_format"] = config_json.get("dataset_format") or dataset.data_type
+                    _update_task_status(
+                        task_code, "failed",
+                        error_message=(
+                            f"数据集文件无法访问：storage_path='{dataset.storage_path}'。"
+                            "文件在本地不存在且无法从 MinIO 下载，请确认数据已正确上传。"
+                        ),
+                    )
+                    return {"task_code": task_code, "status": "failed",
+                            "error_message": f"数据集文件无法访问：{dataset.storage_path}"}
+                # Map data_type (text/doc/excel) → training format (jsonl/npy/bin)
+                if config_json.get("dataset_format"):
+                    fmt = config_json["dataset_format"]
+                else:
+                    fmt = _map_data_type_to_format(
+                        dataset.data_type, local_path,
+                    )
+                config_json["dataset_format"] = fmt
 
     # --- 2. Build full training config ---
     from llmt_training.config.schema import TrainingConfig
@@ -289,6 +304,39 @@ class _CancellationCheckCallback:
 
     def on_error(self, state, **kwargs):
         pass
+
+
+def _map_data_type_to_format(data_type: str, file_path: str) -> str:
+    """Map dataset.data_type (text/doc/excel/other) to training framework format.
+
+    The training framework expects: jsonl, parquet, npy, bin, megatron_bin_idx.
+    The backend stores data_type as: text, doc, excel, other.
+
+    We also check the file extension for a more accurate mapping.
+    """
+    # First, try to infer from file extension
+    ext_map = {
+        ".jsonl": "jsonl",
+        ".json": "jsonl",
+        ".parquet": "parquet",
+        ".npy": "npy",
+        ".bin": "bin",
+        ".csv": "jsonl",  # CSV can be read line-by-line with adaptation
+        ".txt": "jsonl",  # TXT can be read line-by-line
+    }
+    if file_path:
+        for ext, fmt in ext_map.items():
+            if file_path.endswith(ext):
+                return fmt
+
+    # Fallback: map data_type → training format
+    type_map = {
+        "text": "jsonl",
+        "doc": "jsonl",
+        "excel": "jsonl",
+        "other": "jsonl",
+    }
+    return type_map.get(data_type, "jsonl")
 
 
 def _resolve_dataset_path(ds) -> str | None:
