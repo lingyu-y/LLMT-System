@@ -52,9 +52,25 @@ def create_task(db: Session, body: TrainingTaskCreate, creator_id: int) -> Train
         async_result = run_training_task.delay(task.task_code)
         task.celery_task_id = async_result.id
         db.commit()
-        repo.update_status(db, task.id, status="queued")
+
+        # Check if Celery worker is actually consuming
+        worker_available = False
+        try:
+            from app.core.celery_app import celery_app
+            inspect = celery_app.control.inspect()
+            active_queues = inspect.active_queues() or {}
+            worker_available = bool(active_queues)
+        except Exception:
+            pass
+
+        if worker_available:
+            repo.update_status(db, task.id, status="queued")
+        else:
+            logger.info("No Celery worker detected, running task %s in background thread", task.task_code)
+            _run_task_in_background(task.task_code, task.id)
     except Exception:
-        logger.info("Celery not available, task %s stays in 'created' state", task.task_code)
+        logger.info("Celery not available, running task %s in background thread", task.task_code)
+        _run_task_in_background(task.task_code, task.id)
 
     db.refresh(task)
     return _to_task_out(task)
@@ -377,6 +393,69 @@ def _to_list_out(task: TrainingTask) -> TrainingTaskListOut:
         progress=progress,
         gpu_display=gpu_display,
     )
+
+
+def _run_task_in_background(task_code: str, task_id: int) -> None:
+    """Run training task in a daemon thread when no Celery worker is available."""
+    import threading
+
+    def _worker():
+        from app.core.database import SessionLocal
+        db = SessionLocal()
+        try:
+            repo.update_status(db, task_id, status="queued")
+            db.close()
+
+            # Execute the actual training task function directly
+            from app.tasks.training_tasks import run_training_task
+            result = run_training_task.run(task_code)
+
+            # Update DB based on result
+            db = SessionLocal()
+            try:
+                task = repo.get_by_id(db, task_id)
+                if task is None:
+                    return
+
+                status = result.get("status", "failed")
+                if status == "completed":
+                    task.status = "completed"
+                    task.ended_at = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+                    if result.get("final_model_path"):
+                        task.checkpoint_path = result["final_model_path"]
+                elif status == "failed":
+                    task.status = "failed"
+                    task.error_message = result.get("error_message", "Training failed")
+                    task.ended_at = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+                else:
+                    task.status = status
+
+                # Store training log
+                cfg = dict(task.config_json or {})
+                if result.get("training_log"):
+                    cfg["_training_log"] = result["training_log"]
+                task.config_json = cfg
+                db.commit()
+            finally:
+                db.close()
+
+        except Exception as e:
+            logger.exception("Background training task %s failed: %s", task_code, e)
+            try:
+                db = SessionLocal()
+                task = repo.get_by_id(db, task_id)
+                if task and task.status not in ("completed", "cancelled"):
+                    task.status = "failed"
+                    task.error_message = str(e)
+                    task.ended_at = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+                    db.commit()
+                db.close()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_worker, daemon=True, name=f"training-{task_code}")
+    t.start()
+    logger.info("Started background thread for training task %s", task_code)
 
 
 def _generate_simulated_logs(task: TrainingTask) -> list[dict[str, Any]]:
