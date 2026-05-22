@@ -26,6 +26,7 @@ from app.schemas.model import (
     TrainingMetadata,
     VersionCreate,
 )
+from app.services import model_service
 
 router = APIRouter(prefix="/models", tags=["模型管理"])
 
@@ -159,26 +160,11 @@ def export_model(
     if model is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型版本不存在")
 
-    settings = get_settings()
-    minio = get_minio_client()
-    bucket = settings.MINIO_BUCKET_MODELS
-    source_prefix = model.storage_path.rstrip("/") + "/"
-
-    objects = list(minio.list_objects(bucket, prefix=source_prefix, recursive=True))
-    files = [o for o in objects if not o.is_dir]
-    if not files:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型文件不存在")
-
-    from minio.commonconfig import CopySource
-
-    target = body.target_path.rstrip("/") + "/"
-    copied = 0
-    for obj in files:
-        target_name = obj.object_name.replace(source_prefix, target, 1)
-        minio.copy_object(bucket, target_name, CopySource(bucket, obj.object_name))
-        copied += 1
-
-    return success_response({"exported": copied, "target_path": target}, "模型导出成功")
+    try:
+        copied = model_service.export_to_repository(model, body.target_path)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    return success_response({"exported": copied, "target_path": body.target_path}, "模型导出成功")
 
 
 @router.get("/{model_code}/versions")
@@ -312,23 +298,15 @@ def download_model_version(
     if model is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型版本不存在")
 
-    settings = get_settings()
-    minio = get_minio_client()
-    bucket = settings.MINIO_BUCKET_MODELS
-    prefix = model.storage_path.rstrip("/") + "/"
-
-    objects = list(minio.list_objects(bucket, prefix=prefix, recursive=True))
-    files = [o for o in objects if not o.is_dir]
-    if not files:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型文件不存在")
-
-    obj = files[0]
-    response = minio.get_object(bucket, obj.object_name)
+    try:
+        info = model_service.get_download_info(model)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 
     return StreamingResponse(
-        response.stream(amt=64 * 1024),
+        info["stream"].stream(amt=64 * 1024),
         media_type="application/octet-stream",
-        headers={"Content-Disposition": f'attachment; filename="{obj.object_name.split("/")[-1]}"'},
+        headers={"Content-Disposition": f'attachment; filename="{info["filename"]}"'},
     )
 
 

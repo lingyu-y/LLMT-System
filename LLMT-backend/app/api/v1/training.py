@@ -1,11 +1,15 @@
 """Training API endpoints – full CRUD + metrics + validation."""
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
+from app.core.database import get_minio_client
 from app.core.responses import paginated_response, success_response
 from app.dependencies.auth import get_current_user, require_admin
 from app.dependencies.db import get_db
+from app.models.dataset import Dataset
+from app.models.training_task import TrainingTask
 from app.schemas.training import (
     PrivacyConfigRequest,
     ScaleTaskRequest,
@@ -14,6 +18,7 @@ from app.schemas.training import (
     TrainingMetricsQuery,
     TrainingTaskCreate,
 )
+from app.repositories import model_repository
 from app.services import training_service
 
 router = APIRouter(prefix="/training", tags=["训练管理"])

@@ -1,5 +1,7 @@
 """Application entrypoint."""
 
+from importlib import import_module
+
 from fastapi import FastAPI
 
 from app.api.router import api_router
@@ -24,6 +26,6 @@ def bootstrap_development_data() -> None:
 # Register Celery tasks (import to register with the broker)
 try:
     from app.core.celery_app import celery_app  # noqa: F401
-    import app.tasks.training_tasks  # noqa: F401
+    import_module("app.tasks.training_tasks")
 except Exception:
     pass  # Celery/Redis not available in dev mode
