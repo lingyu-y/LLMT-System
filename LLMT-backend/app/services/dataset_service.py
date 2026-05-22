@@ -577,6 +577,10 @@ def check_quality(
     rows: list[list[str]] = _parse_csv_to_rows(sample) if sample else []
     total_cells = sum(len(r) for r in rows) if rows else 0
     has_sample = total_cells > 0
+    # If MinIO is unreachable but files are recorded, flag as incomplete validation
+    if sample_err and (dataset.file_count or 0) > 0:
+        anomalies.append({"field": "storage", "issue": f"无法读取数据文件: {sample_err}"})
+        suggestions.append("检查 MinIO 连接或存储权限后重新校验")
 
     # ====================================================================
     # 1. Completeness — 缺失率 ≤5% + 重复值检测
@@ -721,11 +725,17 @@ def check_quality(
             eq_val = col_rules.get("eq")        # exact match
             if pattern:
                 import re as _regex
-                rx = _regex.compile(pattern)
-                for r in rows[1:]:
-                    cell = r[ci] if ci < len(r) else ""
-                    if cell and not rx.match(cell):
-                        rule_violations += 1
+                try:
+                    rx = _regex.compile(pattern)
+                except _regex.error:
+                    anomalies.append({"field": f"rules.{col_name}.pattern", "issue": f"无效正则表达式: {pattern}"})
+                    suggestions.append(f"修正 {col_name} 的 pattern 规则语法")
+                    rule_violations += 1
+                else:
+                    for r in rows[1:]:
+                        cell = r[ci] if ci < len(r) else ""
+                        if cell and not rx.match(cell):
+                            rule_violations += 1
             if eq_val is not None:
                 for r in rows[1:]:
                     cell = r[ci] if ci < len(r) else ""
