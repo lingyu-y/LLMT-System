@@ -91,6 +91,7 @@ export interface TrainingTaskListItem {
   created_at: string
   progress: number
   gpu_display: string
+  error_message?: string
 }
 
 export interface OptionItem {

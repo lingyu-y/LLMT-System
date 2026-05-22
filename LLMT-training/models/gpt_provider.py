@@ -92,12 +92,12 @@ class GPTModel(nn.Module):
             if isinstance(module, nn.Linear):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
                 if module.bias is not None:
-                    nn.init.zeros_(module.bias)
+                    torch.nn.init.zeros_(module.bias)
             elif isinstance(module, nn.Embedding):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
             elif isinstance(module, nn.LayerNorm):
                 nn.init.ones_(module.weight)
-                nn.init_zeros_(module.bias)
+                torch.nn.init.zeros_(module.bias)
 
     def forward(self, input_ids, attention_mask=None, **kwargs):
         bsz, seq_len = input_ids.shape

@@ -42,6 +42,11 @@
                 </div>
               </div>
 
+              <!-- 错误信息 -->
+              <div v-if="monitorError" class="error-banner">
+                <strong>错误信息：</strong>{{ monitorError }}
+              </div>
+
               <!-- 训练日志 -->
               <div class="card" style="margin-top: 18px">
                 <div class="card-header"><h3 class="card-title">训练日志</h3></div>
@@ -153,7 +158,12 @@
           </el-table-column>
           <el-table-column prop="gpu_display" label="GPU" width="110" />
           <el-table-column label="状态" width="110">
-            <template #default="{ row }"><StatusBadge :label="statusLabel(row.status)" :type="statusType(row.status)" /></template>
+            <template #default="{ row }">
+              <StatusBadge :label="statusLabel(row.status)" :type="statusType(row.status)" />
+              <div v-if="row.status === 'failed' && row.error_message" class="error-hint" :title="row.error_message">
+                {{ row.error_message.length > 30 ? row.error_message.slice(0, 30) + '…' : row.error_message }}
+              </div>
+            </template>
           </el-table-column>
           <el-table-column label="进度" width="160">
             <template #default="{ row }">
@@ -171,6 +181,7 @@
               <el-button size="small" :disabled="row.status !== 'paused'" @click="handleResume(row)">恢复</el-button>
               <el-button size="small" @click="openScaleDialog(row)">扩缩容</el-button>
               <el-button size="small" type="danger" :disabled="!['created', 'queued', 'running'].includes(row.status)" @click="handleCancel(row)">取消</el-button>
+              <el-button size="small" @click="selectTask(row)">监控</el-button>
             </template>
           </el-table-column>
         </el-table>
@@ -312,6 +323,12 @@ const monitorItems = computed(() => {
     { label: '任务状态', value: statusLabel(t.status) },
     { label: 'GPU', value: t.gpu_display || '-' },
   ]
+})
+
+const monitorError = computed(() => {
+  if (!selectedTask.value) return ''
+  const t = selectedTask.value as any
+  return t.status === 'failed' ? (t.error_message || '训练失败') : ''
 })
 
 const recommendedStrategy = computed(() => {
@@ -483,6 +500,19 @@ const submitScale = async () => {
 
 const handleSaveConfig = () => {
   ElMessage.success('并行配置已保存到任务草稿')
+}
+
+const selectTask = async (row: TrainingTaskListItem) => {
+  selectedTask.value = row
+  activeTrainingTab.value = 'monitor'
+  // Load full task detail to get error_message
+  try {
+    const res = await fetchTrainingTask(row.id)
+    if (res.data) {
+      Object.assign(row, res.data)
+    }
+  } catch { /* ignore */ }
+  await loadLogs(row.id)
 }
 
 const handleValidateConfig = async () => {
@@ -685,6 +715,25 @@ onMounted(() => {
   text-align: center;
   color: var(--text-muted);
   font-size: 13px;
+}
+
+.error-hint {
+  margin-top: 4px;
+  color: #f56c6c;
+  font-size: 11px;
+  line-height: 1.3;
+  cursor: help;
+}
+
+.error-banner {
+  margin-top: 14px;
+  padding: 12px 16px;
+  border: 1px solid #fde2e2;
+  border-radius: 8px;
+  background: #fef0f0;
+  color: #f56c6c;
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 .log-container {

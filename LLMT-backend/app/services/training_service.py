@@ -392,6 +392,7 @@ def _to_list_out(task: TrainingTask) -> TrainingTaskListOut:
         created_at=task.created_at,
         progress=progress,
         gpu_display=gpu_display,
+        error_message=task.error_message,
     )
 
 

@@ -150,6 +150,7 @@ class TrainingTaskListOut(BaseModel):
     # Computed display fields
     progress: int = 0
     gpu_display: str = ""
+    error_message: Optional[str] = None
 
     model_config = {"from_attributes": True}
 
