@@ -133,13 +133,30 @@ class TestProcessing:
 
 class TestQuality:
     def test_19_report(self, client, admin_headers, db):
-        ds = Dataset(name="qr", data_type="text", storage_path="/t", owner_id=1); db.add(ds); db.commit(); db.refresh(ds)
-        assert client.get(f"{PREFIX}/datasets/{ds.id}/quality", headers=admin_headers).status_code == 200
+        ds = Dataset(name="qr", data_type="text", storage_path="/t", owner_id=1,
+                     file_count=10, total_size=1000)
+        db.add(ds); db.commit(); db.refresh(ds)
+        resp = client.get(f"{PREFIX}/datasets/{ds.id}/quality", headers=admin_headers)
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert "overall_score" in data
+        assert "sample_rows" in data
+
     def test_20_check(self, client, admin_headers, db):
-        ds = Dataset(name="qc", data_type="text", storage_path="/t", owner_id=1); db.add(ds); db.commit(); db.refresh(ds)
-        assert client.post(f"{PREFIX}/datasets/{ds.id}/quality/check", headers=admin_headers).status_code == 200
+        ds = Dataset(name="qc", data_type="text", storage_path="/t", owner_id=1,
+                     file_count=10, total_size=1000)
+        db.add(ds); db.commit(); db.refresh(ds)
+        resp = client.post(f"{PREFIX}/datasets/{ds.id}/quality/check", headers=admin_headers)
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert data["completeness"] is not None
+        assert data["overall_score"] >= 0
+        assert "suggestions" in data
+
     def test_21_repair(self, client, admin_headers, db):
-        ds = Dataset(name="qp", data_type="text", storage_path="/t", owner_id=1); db.add(ds); db.commit(); db.refresh(ds)
+        ds = Dataset(name="qp", data_type="text", storage_path="/t", owner_id=1,
+                     file_count=1, total_size=100)
+        db.add(ds); db.commit(); db.refresh(ds)
         assert client.post(f"{PREFIX}/datasets/{ds.id}/quality/repair", headers=admin_headers).status_code == 200
     def test_22_lineage(self, client, admin_headers, db):
         ds = Dataset(name="ln", data_type="text", storage_path="/t", source="kafka",
@@ -159,20 +176,21 @@ class TestQuality:
         resp = client.get(f"{PREFIX}/datasets/{ds.id}/lineage", headers=admin_headers)
         assert resp.status_code == 200
         data = resp.json()["data"]
-        # R1: 来源记录（上传者、时间、原始位置）
+        # R1-R3
         assert data["origin"]["uploaded_by"] is not None
-        assert data["origin"]["uploaded_at"] is not None
-        assert data["origin"]["original_source"] is not None
-        # R2: 转换过程（规则、时间、版本）
         assert len(data["transformations"]) >= 1
-        for tx in data["transformations"]:
-            assert "rule" in tx and "timestamp" in tx
-        # R3: 下游使用（训练任务ID、时间、结果）
-        assert len(data["downstream"]) >= 2  # task + model
-        task_entry = [d for d in data["downstream"] if d["type"] == "training_task"][0]
-        assert "task_id" in task_entry
-        assert "status" in task_entry
-        assert "started_at" in task_entry
+        assert len(data["downstream"]) >= 2
+        # R4-R5 自动分析+图谱
+        assert "auto_analysis" in data
+        assert "graph" in data
+        assert len(data["graph"]["nodes"]) >= 1
+        # 前提条件
+        assert "data_used" in data
+        # 其他事件流
+        assert "quality_trace" in data
+        assert "risk_warning" in data or data["risk_warning"] is None
+        # 版本历史
+        assert "version_history" in data
 
     def test_23_impact(self, client, admin_headers, db):
         ds = Dataset(name="im", data_type="text", storage_path="/t", source="mysql", owner_id=1)

@@ -2,7 +2,7 @@
 
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.core.responses import paginated_response, success_response
@@ -287,15 +287,17 @@ def trigger_quality_check(
     dataset_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    rules: dict | None = Body(None, description="自定义校验规则"),
+    skip_reason: str | None = Body(None, description="跳过原因"),
 ):
     ds = dataset_repository.get_dataset_by_id(db, dataset_id)
     if ds is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="数据集不存在")
-    report = dataset_service.check_quality(db, ds)
+    report = dataset_service.check_quality(db, ds, rules=rules, skip_reason=skip_reason)
     log_service.create_log(
         db, user_id=current_user.id, username=current_user.username,
         action="quality_check", resource="dataset", resource_id=ds.id,
-        detail=f"质量校验数据集 {ds.name}",
+        detail=f"质量校验数据集 {ds.name} (score={report['overall_score']})",
     )
     return success_response(report, "质量校验完成")
 
