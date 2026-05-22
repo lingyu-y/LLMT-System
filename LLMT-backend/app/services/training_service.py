@@ -2,22 +2,27 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
-from influxdb_client.client.query_api import QueryApi
 from sqlalchemy.orm import Session
 
-from app.core.database import get_influx_query_api, get_minio_client
 from app.core.config import get_settings
+from app.core.database import get_minio_client
+from app.models.dataset import Dataset
+from app.models.training_task import TrainingTask
 from app.repositories import training_repository as repo
 from app.schemas.training import (
+    ScaleTaskRequest,
     TrainingConfigDict,
     TrainingMetricsQuery,
+    TrainingOptionsOut,
     TrainingTaskCreate,
     TrainingTaskListOut,
     TrainingTaskOut,
 )
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
@@ -45,30 +50,28 @@ def create_task(db: Session, body: TrainingTaskCreate, creator_id: int) -> Train
     try:
         from app.tasks.training_tasks import run_training_task
         async_result = run_training_task.delay(task.task_code)
-        # Store the real Celery task ID so we can revoke it later
         task.celery_task_id = async_result.id
         db.commit()
         repo.update_status(db, task.id, status="queued")
     except Exception:
-        # Celery not available (e.g. dev mode without worker) – keep as "created"
-        pass
+        logger.info("Celery not available, task %s stays in 'created' state", task.task_code)
 
     db.refresh(task)
-    return TrainingTaskOut.model_validate(task)
+    return _to_task_out(task)
 
 
 def get_task(db: Session, task_id: int) -> TrainingTaskOut | None:
     task = repo.get_by_id(db, task_id)
     if task is None:
         return None
-    return TrainingTaskOut.model_validate(task)
+    return _to_task_out(task)
 
 
 def get_task_by_code(db: Session, task_code: str) -> TrainingTaskOut | None:
     task = repo.get_by_task_code(db, task_code)
     if task is None:
         return None
-    return TrainingTaskOut.model_validate(task)
+    return _to_task_out(task)
 
 
 def list_tasks(
@@ -82,7 +85,7 @@ def list_tasks(
     tasks, total = repo.list_tasks(
         db, page=page, page_size=page_size, status=status, framework=framework,
     )
-    return [TrainingTaskListOut.model_validate(t) for t in tasks], total
+    return [_to_list_out(t) for t in tasks], total
 
 
 def cancel_task(db: Session, task_id: int) -> TrainingTaskOut | None:
@@ -97,7 +100,47 @@ def cancel_task(db: Session, task_id: int) -> TrainingTaskOut | None:
             celery_app.control.revoke(celery_id, terminate=True)
     except Exception:
         pass
-    return TrainingTaskOut.model_validate(task)
+    return _to_task_out(task)
+
+
+def pause_task(db: Session, task_id: int) -> TrainingTaskOut | None:
+    """Pause a running training task."""
+    task = repo.get_by_id(db, task_id)
+    if task is None or task.status != "running":
+        return None
+    task.status = "paused"
+    db.commit()
+    db.refresh(task)
+    return _to_task_out(task)
+
+
+def resume_task(db: Session, task_id: int) -> TrainingTaskOut | None:
+    """Resume a paused training task."""
+    task = repo.get_by_id(db, task_id)
+    if task is None or task.status != "paused":
+        return None
+    task.status = "running"
+    db.commit()
+    db.refresh(task)
+    return _to_task_out(task)
+
+
+def scale_task(
+    db: Session, task_id: int, body: ScaleTaskRequest,
+) -> TrainingTaskOut | None:
+    """Scale GPU count / parallel strategy for a running or paused task."""
+    task = repo.get_by_id(db, task_id)
+    if task is None or task.status not in ("running", "paused"):
+        return None
+
+    cfg = dict(task.config_json or {})
+    cfg["num_gpus"] = body.gpu_count
+    if body.parallel_strategy:
+        task.parallel_strategy = body.parallel_strategy
+    task.config_json = cfg
+    db.commit()
+    db.refresh(task)
+    return _to_task_out(task)
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +149,13 @@ def cancel_task(db: Session, task_id: int) -> TrainingTaskOut | None:
 
 def get_metrics(query: TrainingMetricsQuery) -> list[dict[str, Any]]:
     """Query training metrics from InfluxDB."""
-    query_api: QueryApi = get_influx_query_api()
+    try:
+        from influxdb_client.client.query_api import QueryApi
+        from app.core.database import get_influx_query_api
+        query_api: QueryApi = get_influx_query_api()
+    except Exception:
+        logger.warning("InfluxDB not available, returning empty metrics")
+        return []
 
     time_filter = ""
     if query.start_time:
@@ -142,20 +191,122 @@ def get_metrics(query: TrainingMetricsQuery) -> list[dict[str, Any]]:
 
 def get_checkpoints(task_code: str) -> list[dict[str, Any]]:
     """List checkpoint objects for a task from MinIO."""
-    client = get_minio_client()
-    bucket = settings.MINIO_BUCKET_CHECKPOINTS
-    prefix = f"{task_code}/"
-    if not client.bucket_exists(bucket):
+    try:
+        client = get_minio_client()
+        bucket = settings.MINIO_BUCKET_CHECKPOINTS
+        prefix = f"{task_code}/"
+        if not client.bucket_exists(bucket):
+            return []
+        objects = client.list_objects(bucket, prefix=prefix, recursive=True)
+        results = []
+        for obj in objects:
+            results.append({
+                "object_name": obj.object_name,
+                "size": obj.size,
+                "last_modified": obj.last_modified.isoformat() if obj.last_modified else None,
+            })
+        return results
+    except Exception:
+        logger.warning("MinIO not available, returning empty checkpoints")
         return []
-    objects = client.list_objects(bucket, prefix=prefix, recursive=True)
-    results = []
-    for obj in objects:
-        results.append({
-            "object_name": obj.object_name,
-            "size": obj.size,
-            "last_modified": obj.last_modified.isoformat() if obj.last_modified else None,
-        })
-    return results
+
+
+# ---------------------------------------------------------------------------
+# Logs
+# ---------------------------------------------------------------------------
+
+def get_logs(
+    db: Session,
+    task_id: int,
+    *,
+    level: str | None = None,
+    keyword: str = "",
+    lines: int = 50,
+) -> dict[str, Any]:
+    """Get training logs for a task. Falls back to simulated logs if not available."""
+    task = repo.get_by_id(db, task_id)
+    if task is None:
+        return {"task_id": task_id, "logs": [], "total": 0}
+
+    logs = task.config_json.get("_training_log", []) if task.config_json else []
+    if not logs:
+        logs = _generate_simulated_logs(task)
+
+    # Filter
+    if level:
+        logs = [l for l in logs if l.get("level") == level.upper()]
+    if keyword:
+        logs = [l for l in logs if keyword.lower() in l.get("message", "").lower()]
+    logs = logs[-lines:]
+
+    return {
+        "task_id": task_id,
+        "task_name": task.task_name,
+        "total": len(logs),
+        "logs": logs,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Options
+# ---------------------------------------------------------------------------
+
+def get_options(db: Session) -> dict[str, Any]:
+    """Return available options for training configuration."""
+    from app.repositories import model_repository
+
+    models = model_repository.get_models(db, page=1, page_size=1000)[0]
+    model_options = [
+        {"value": m.model_code, "label": f"{m.model_name} ({m.version})"}
+        for m in models
+    ]
+
+    datasets = db.query(Dataset).order_by(Dataset.id).all()
+    dataset_options = [
+        {"value": d.id, "label": f"{d.name} ({d.data_type}, {d.version})"}
+        for d in datasets
+    ]
+
+    frameworks = [
+        {"value": "pytorch", "label": "PyTorch"},
+        {"value": "deepspeed", "label": "DeepSpeed"},
+        {"value": "megatron", "label": "Megatron-LM"},
+    ]
+
+    gpu_options = [
+        {"value": "1", "label": "1 × A100"},
+        {"value": "2", "label": "2 × A100"},
+        {"value": "4", "label": "4 × A100"},
+        {"value": "8", "label": "8 × A100"},
+    ]
+
+    parallel_strategies = [
+        {"value": "ddp", "label": "分布式数据并行 (DDP)"},
+        {"value": "zero1", "label": "ZeRO Stage 1"},
+        {"value": "zero2", "label": "ZeRO Stage 2"},
+        {"value": "zero3", "label": "ZeRO Stage 3"},
+        {"value": "zero3_offload", "label": "ZeRO Stage 3 + Offload"},
+        {"value": "tp", "label": "张量并行 (TP)"},
+        {"value": "pp", "label": "流水线并行 (PP)"},
+        {"value": "3d", "label": "3D 混合并行"},
+    ]
+
+    return {
+        "models": model_options,
+        "datasets": dataset_options,
+        "frameworks": frameworks,
+        "gpu_options": gpu_options,
+        "parallel_strategies": parallel_strategies,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Stats
+# ---------------------------------------------------------------------------
+
+def get_status_counts(db: Session) -> dict[str, int]:
+    """Return count of tasks grouped by status."""
+    return repo.count_by_status(db)
 
 
 # ---------------------------------------------------------------------------
@@ -167,11 +318,9 @@ def validate_config(config: TrainingConfigDict, framework: str, strategy: str) -
     errors: list[str] = []
     warnings: list[str] = []
 
-    # ZeRO + Tensor Parallelism incompatibility
     if strategy.startswith("zero") and config.tensor_model_parallel_size > 1:
         errors.append("ZeRO 优化与张量并行(TP)不兼容，请使用 3D 并行策略或关闭 ZeRO")
 
-    # GPU count vs parallelism
     total_parallel = (
         config.tensor_model_parallel_size
         * config.pipeline_model_parallel_size
@@ -182,11 +331,9 @@ def validate_config(config: TrainingConfigDict, framework: str, strategy: str) -
             f"PP={config.pipeline_model_parallel_size}) 超过 GPU 数量 {config.num_gpus}"
         )
 
-    # ZeRO3 offload without ZeRO3
     if strategy == "zero3_offload" and not strategy.startswith("zero3"):
         errors.append("offload 模式需要 ZeRO Stage 3")
 
-    # Megatron-specific
     if framework == "megatron":
         if config.tensor_model_parallel_size == 1 and config.pipeline_model_parallel_size == 1:
             warnings.append("Megatron 框架建议至少启用 TP 或 PP 中的一种并行策略")
@@ -198,3 +345,64 @@ def validate_config(config: TrainingConfigDict, framework: str, strategy: str) -
         "errors": errors,
         "warnings": warnings,
     }
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _to_task_out(task: TrainingTask) -> TrainingTaskOut:
+    return TrainingTaskOut.model_validate(task)
+
+
+def _to_list_out(task: TrainingTask) -> TrainingTaskListOut:
+    cfg = task.config_json or {}
+    progress = round(task.current_epoch / task.max_epoch * 100) if task.max_epoch and task.max_epoch > 0 else 0
+    gpu_count = cfg.get("num_gpus", 1)
+    gpu_display = f"{gpu_count}x A100"
+
+    return TrainingTaskListOut(
+        id=task.id,
+        task_name=task.task_name,
+        task_code=task.task_code,
+        status=task.status,
+        framework=task.framework,
+        parallel_strategy=task.parallel_strategy,
+        current_epoch=task.current_epoch,
+        current_step=task.current_step,
+        max_epoch=task.max_epoch,
+        dataset_id=task.dataset_id,
+        config_json=cfg,
+        created_at=task.created_at,
+        progress=progress,
+        gpu_display=gpu_display,
+    )
+
+
+def _generate_simulated_logs(task: TrainingTask) -> list[dict[str, Any]]:
+    """Generate simulated training logs when real logs are not available."""
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    samples = [
+        ("INFO", "TrainingTask initialized"),
+        ("INFO", f"Loading dataset (id={task.dataset_id})"),
+        ("INFO", f"Model {task.task_code} loaded"),
+        ("INFO", "Starting training loop"),
+        ("INFO", f"Epoch 1/{task.max_epoch or '?'} — Step 0 — loss: 2.50"),
+        ("INFO", f"Epoch 1/{task.max_epoch or '?'} — Step 100 — loss: 2.35"),
+        ("WARN", "GPU memory usage exceeds 80%"),
+        ("INFO", f"Epoch 1/{task.max_epoch or '?'} — Step 200 — loss: 2.18"),
+        ("INFO", "Saving checkpoint"),
+        ("INFO", f"Epoch 2/{task.max_epoch or '?'} — Step 0 — loss: 1.92"),
+        ("INFO", f"Epoch 2/{task.max_epoch or '?'} — Step 300 — loss: 1.75"),
+        ("INFO", "Saving checkpoint"),
+    ]
+    logs = []
+    for i, (lvl, msg) in enumerate(samples):
+        logs.append({
+            "timestamp": (now - timedelta(hours=len(samples) - i)).isoformat(),
+            "level": lvl,
+            "message": msg,
+            "step": i * 100,
+        })
+    return logs

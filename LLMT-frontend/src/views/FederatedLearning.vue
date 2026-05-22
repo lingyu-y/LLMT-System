@@ -29,7 +29,7 @@
                 <template #default="{ row }">{{ row.current_round }} / {{ row.num_rounds }}</template>
               </el-table-column>
               <el-table-column label="参与方" width="90">
-                <template #default="{ row }">{{ row.participants?.length ?? 0 }}</template>
+                <template #default="{ row }">{{ row.num_participants ?? row.participants?.length ?? 0 }}</template>
               </el-table-column>
               <el-table-column label="聚合策略" width="130">
                 <template #default="{ row }">{{ strategyLabel(row.aggregation_strategy) }}</template>
@@ -166,14 +166,19 @@
                     <el-form-item label="名称">
                       <el-input v-model="p.name" placeholder="参与方名称" />
                     </el-form-item>
+                    <el-form-item label="数据集">
+                      <el-select v-model="p.dataset_id" placeholder="选择数据集" clearable class="full" @change="(val: number | undefined) => onDatasetSelect(p, val)">
+                        <el-option v-for="ds in datasetOptions" :key="ds.id" :label="ds.name" :value="ds.id" />
+                      </el-select>
+                    </el-form-item>
                     <el-form-item label="数据量">
                       <el-input-number v-model="p.data_size" :min="0" :step="100" />
                     </el-form-item>
+                  </div>
+                  <div class="grid-4">
                     <el-form-item label="权重">
                       <el-input-number v-model="p.weight" :min="0" :step="0.1" :precision="1" />
                     </el-form-item>
-                  </div>
-                  <div class="grid-4">
                     <el-form-item label="本地轮数">
                       <el-input-number v-model="p.local_epochs" :min="1" :max="20" />
                     </el-form-item>
@@ -217,6 +222,9 @@
                   <el-table :data="selectedTask.participants || []" stripe>
                     <el-table-column prop="participant_id" label="ID" width="120" />
                     <el-table-column prop="name" label="名称" width="140" />
+                    <el-table-column label="数据集" width="140">
+                      <template #default="{ row }">{{ row.dataset_name ?? (row.dataset_id ? `#${row.dataset_id}` : '-') }}</template>
+                    </el-table-column>
                     <el-table-column label="数据量" width="100">
                       <template #default="{ row }">{{ row.data_size?.toLocaleString() }}</template>
                     </el-table-column>
@@ -339,6 +347,11 @@
         <el-form-item label="名称">
           <el-input v-model="newParticipant.name" placeholder="例如：D医院" />
         </el-form-item>
+        <el-form-item label="数据集">
+          <el-select v-model="newParticipant.dataset_id" placeholder="选择数据集" clearable class="full" @change="(val: number | undefined) => onDatasetSelect(newParticipant, val)">
+            <el-option v-for="ds in datasetOptions" :key="ds.id" :label="ds.name" :value="ds.id" />
+          </el-select>
+        </el-form-item>
         <el-form-item label="数据量">
           <el-input-number v-model="newParticipant.data_size" :min="0" :step="100" />
         </el-form-item>
@@ -358,7 +371,9 @@ import { ElMessage } from 'element-plus'
 import StatusBadge from '@/components/StatusBadge.vue'
 import {
   type CreateFederatedTask,
+  type DatasetOption,
   type FederatedTask,
+  type FederatedTaskListItem,
   type ParticipantConfig,
   fetchFederatedTasks,
   fetchFederatedTask,
@@ -369,16 +384,18 @@ import {
   fetchFederatedLogs,
   addParticipant,
   removeParticipant,
+  fetchFederatedOptions,
 } from '@/api/federated'
 
 // State
 const activeTab = ref('list')
 const loading = ref(false)
-const tasks = ref<FederatedTask[]>([])
+const tasks = ref<FederatedTaskListItem[]>([])
 const selectedTask = ref<FederatedTask | null>(null)
 const showCreateDialog = ref(false)
 const showAddParticipantDialog = ref(false)
 const trainingLogs = ref<{ timestamp: string; level: string; message: string }[]>([])
+const datasetOptions = ref<DatasetOption[]>([])
 
 // Form
 const form = reactive<CreateFederatedTask & { min_participants: number; max_rounds_no_improve: number; fedprox_mu: number; anomaly_threshold: number; auto_remove_malicious: boolean; checkpoint_dir: string; save_every_n_rounds: number }>({
@@ -407,9 +424,9 @@ const form = reactive<CreateFederatedTask & { min_participants: number; max_roun
   checkpoint_dir: './checkpoints/federated',
   save_every_n_rounds: 1,
   participants: [
-    { participant_id: 'hospital-A', name: 'A医院', weight: 1.0, data_size: 5000, local_epochs: 2, local_batch_size: 32, local_learning_rate: 2e-5 },
-    { participant_id: 'hospital-B', name: 'B医院', weight: 1.0, data_size: 3000, local_epochs: 2, local_batch_size: 32, local_learning_rate: 2e-5 },
-    { participant_id: 'hospital-C', name: 'C医院', weight: 1.0, data_size: 4000, local_epochs: 2, local_batch_size: 32, local_learning_rate: 2e-5 },
+    { participant_id: 'hospital-A', name: 'A医院', weight: 1.0, data_size: 5000, local_epochs: 2, local_batch_size: 32, local_learning_rate: 2e-5, dataset_id: undefined },
+    { participant_id: 'hospital-B', name: 'B医院', weight: 1.0, data_size: 3000, local_epochs: 2, local_batch_size: 32, local_learning_rate: 2e-5, dataset_id: undefined },
+    { participant_id: 'hospital-C', name: 'C医院', weight: 1.0, data_size: 4000, local_epochs: 2, local_batch_size: 32, local_learning_rate: 2e-5, dataset_id: undefined },
   ],
 })
 
@@ -429,13 +446,14 @@ const newParticipant = reactive<ParticipantConfig>({
   local_epochs: 2,
   local_batch_size: 32,
   local_learning_rate: 2e-5,
+  dataset_id: undefined,
 })
 
 // Computed
 const statsData = computed(() => [
   { label: '运行任务', value: String(tasks.value.filter(t => t.status === 'running').length) },
   { label: '总任务数', value: String(tasks.value.length) },
-  { label: '活跃参与方', value: String(tasks.value.filter(t => t.status === 'running').reduce((sum, t) => sum + (t.participants?.filter(p => p.status === 'active').length ?? 0), 0)) },
+  { label: '活跃参与方', value: String(tasks.value.filter(t => t.status === 'running').reduce((sum, t) => sum + (t.num_participants ?? 0), 0)) },
   { label: '差分隐私', value: tasks.value.some(t => t.enable_dp) ? '已启用' : '未启用' },
 ])
 
@@ -524,6 +542,7 @@ const handleQuickCreate = async () => {
       local_epochs: 2,
       local_batch_size: 32,
       local_learning_rate: 2e-5,
+      dataset_id: undefined,
     })
   }
   const body: CreateFederatedTask = {
@@ -563,7 +582,7 @@ const handleQuickCreate = async () => {
   }
 }
 
-const handleStart = async (task: FederatedTask) => {
+const handleStart = async (task: FederatedTaskListItem) => {
   try {
     await startFederatedTask(task.id)
     ElMessage.success(`任务 ${task.task_code} 已启动`)
@@ -573,7 +592,7 @@ const handleStart = async (task: FederatedTask) => {
   }
 }
 
-const handleCancel = async (task: FederatedTask) => {
+const handleCancel = async (task: FederatedTaskListItem) => {
   try {
     await cancelFederatedTask(task.id)
     ElMessage.success(`任务 ${task.task_code} 已取消`)
@@ -583,7 +602,7 @@ const handleCancel = async (task: FederatedTask) => {
   }
 }
 
-const openDetail = async (task: FederatedTask) => {
+const openDetail = async (task: FederatedTaskListItem) => {
   selectedTask.value = task
   activeTab.value = 'monitor'
   try {
@@ -639,6 +658,14 @@ const handleRemoveParticipant = async (participant: { participant_id: string }) 
   }
 }
 
+const onDatasetSelect = (p: ParticipantConfig, datasetId: number | undefined) => {
+  if (!datasetId) return
+  const ds = datasetOptions.value.find(d => d.id === datasetId)
+  if (ds && ds.file_count > 0 && p.data_size === 0) {
+    p.data_size = ds.file_count * 100  // rough estimate: file_count * 100 samples
+  }
+}
+
 const addParticipantRow = () => {
   const idx = form.participants.length + 1
   form.participants.push({
@@ -649,6 +676,7 @@ const addParticipantRow = () => {
     local_epochs: 2,
     local_batch_size: 32,
     local_learning_rate: 2e-5,
+    dataset_id: undefined,
   })
 }
 
@@ -679,7 +707,19 @@ const formatTime = (ts: string) => {
   return new Date(ts).toLocaleTimeString()
 }
 
-onMounted(loadTasks)
+const loadDatasetOptions = async () => {
+  try {
+    const res = await fetchFederatedOptions()
+    datasetOptions.value = res.data?.datasets ?? []
+  } catch {
+    datasetOptions.value = []
+  }
+}
+
+onMounted(() => {
+  loadTasks()
+  loadDatasetOptions()
+})
 </script>
 
 <style scoped>

@@ -11,6 +11,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.models.federated import FederatedParticipant, FederatedTask
+from app.models.dataset import Dataset as DatasetModel
 from app.schemas.federated import (
     AddParticipantRequest,
     FederatedTaskCreate,
@@ -30,9 +31,6 @@ def create_task(db: Session, body: FederatedTaskCreate, creator_id: int) -> Fede
     """Create a federated learning task."""
     task_code = f"FL-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M')}-{uuid.uuid4().hex[:6]}"
 
-    # Build full config
-    config_dict = body.model_dump()
-
     # Build model config
     model_config = {
         "model_type": body.model_type,
@@ -43,6 +41,50 @@ def create_task(db: Session, body: FederatedTaskCreate, creator_id: int) -> Fede
         "seq_length": body.seq_length,
         "dropout": body.dropout,
     }
+
+    # Build full config JSON – only fields that FederatedConfig accepts
+    from llmt_training.federated.config import FederatedConfig, ParticipantConfig
+    participants_for_config = [
+        ParticipantConfig(
+            participant_id=p.participant_id,
+            name=p.name,
+            weight=p.weight,
+            data_size=p.data_size,
+            local_epochs=p.local_epochs,
+            local_batch_size=p.local_batch_size,
+            local_learning_rate=p.local_learning_rate,
+            status="active",
+            dataset_id=p.dataset_id,
+        )
+        for p in body.participants
+    ]
+    config_obj = FederatedConfig(
+        task_code=task_code,
+        model_type=body.model_type,
+        vocab_size=body.vocab_size,
+        hidden_size=body.hidden_size,
+        num_layers=body.num_layers,
+        num_attention_heads=body.num_attention_heads,
+        seq_length=body.seq_length,
+        dropout=body.dropout,
+        num_rounds=body.num_rounds,
+        min_participants=body.min_participants,
+        convergence_threshold=body.convergence_threshold,
+        max_rounds_no_improve=body.max_rounds_no_improve,
+        aggregation_strategy=body.aggregation_strategy,
+        fedprox_mu=body.fedprox_mu,
+        enable_dp=body.enable_dp,
+        dp_epsilon=body.dp_epsilon,
+        dp_delta=body.dp_delta,
+        dp_noise_multiplier=body.dp_noise_multiplier,
+        dp_max_grad_norm=body.dp_max_grad_norm,
+        anomaly_threshold=body.anomaly_threshold,
+        auto_remove_malicious=body.auto_remove_malicious,
+        checkpoint_dir=body.checkpoint_dir,
+        save_every_n_rounds=body.save_every_n_rounds,
+        participants=participants_for_config,
+    )
+    config_dict = json.loads(config_obj.model_dump_json())
 
     task = FederatedTask(
         task_name=body.task_name,
@@ -85,21 +127,21 @@ def create_task(db: Session, body: FederatedTaskCreate, creator_id: int) -> Fede
     db.commit()
     db.refresh(task)
 
-    return _to_task_out(task)
+    return _to_task_out(task, db)
 
 
 def get_task(db: Session, task_id: int) -> FederatedTaskOut | None:
     task = db.query(FederatedTask).filter(FederatedTask.id == task_id).first()
     if task is None:
         return None
-    return _to_task_out(task)
+    return _to_task_out(task, db)
 
 
 def get_task_by_code(db: Session, task_code: str) -> FederatedTaskOut | None:
     task = db.query(FederatedTask).filter(FederatedTask.task_code == task_code).first()
     if task is None:
         return None
-    return _to_task_out(task)
+    return _to_task_out(task, db)
 
 
 def list_tasks(
@@ -158,7 +200,7 @@ def start_task(db: Session, task_id: int) -> FederatedTaskOut | None:
 
     db.commit()
     db.refresh(task)
-    return _to_task_out(task)
+    return _to_task_out(task, db)
 
 
 def cancel_task(db: Session, task_id: int) -> FederatedTaskOut | None:
@@ -189,7 +231,7 @@ def cancel_task(db: Session, task_id: int) -> FederatedTaskOut | None:
                 task.celery_task_id, exc,
             )
 
-    return _to_task_out(task)
+    return _to_task_out(task, db)
 
 
 def add_participant(
@@ -224,7 +266,24 @@ def add_participant(
     db.add(participant)
     db.commit()
     db.refresh(participant)
-    return ParticipantOut.model_validate(participant)
+    return ParticipantOut(
+        id=participant.id,
+        task_id=participant.task_id,
+        participant_id=participant.participant_id,
+        name=participant.name,
+        status=participant.status,
+        weight=participant.weight,
+        data_size=participant.data_size,
+        local_epochs=participant.local_epochs,
+        local_batch_size=participant.local_batch_size,
+        local_learning_rate=participant.local_learning_rate,
+        dataset_id=participant.dataset_id,
+        dataset_name=_get_dataset_name(db, participant.dataset_id),
+        last_round_completed=participant.last_round_completed,
+        last_loss=participant.last_loss,
+        anomaly_score=participant.anomaly_score,
+        anomaly_details=participant.anomaly_details_json,
+    )
 
 
 def remove_participant(db: Session, task_id: int, participant_id: str) -> bool:
@@ -277,9 +336,37 @@ def get_task_metrics(db: Session, task_id: int) -> dict[str, Any]:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _to_task_out(task: FederatedTask) -> FederatedTaskOut:
+def _get_dataset_name(db: Session, dataset_id: int | None) -> str | None:
+    """Look up a dataset name by ID. Returns None if not found or dataset_id is None."""
+    if dataset_id is None:
+        return None
+    ds = db.query(DatasetModel).filter(DatasetModel.id == dataset_id).first()
+    return ds.name if ds else None
+
+
+def _to_task_out(task: FederatedTask, db: Session | None = None) -> FederatedTaskOut:
     """Convert a FederatedTask model to FederatedTaskOut schema."""
-    participants = [ParticipantOut.model_validate(p) for p in (task.participants or [])]
+    participants = [
+        ParticipantOut(
+            id=p.id,
+            task_id=p.task_id,
+            participant_id=p.participant_id,
+            name=p.name,
+            status=p.status,
+            weight=p.weight,
+            data_size=p.data_size,
+            local_epochs=p.local_epochs,
+            local_batch_size=p.local_batch_size,
+            local_learning_rate=p.local_learning_rate,
+            dataset_id=p.dataset_id,
+            dataset_name=_get_dataset_name(db, p.dataset_id) if db else None,
+            last_round_completed=p.last_round_completed,
+            last_loss=p.last_loss,
+            anomaly_score=p.anomaly_score,
+            anomaly_details=p.anomaly_details_json,
+        )
+        for p in (task.participants or [])
+    ]
     return FederatedTaskOut(
         id=task.id,
         task_name=task.task_name,

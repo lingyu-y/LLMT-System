@@ -20,6 +20,7 @@ class ParticipantConfig(BaseModel):
     status: Literal["active", "inactive", "malicious"] = Field(
         default="active", description="参与方状态"
     )
+    dataset_id: int | None = Field(default=None, description="关联数据集ID")
 
 
 class FederatedConfig(BaseModel):
