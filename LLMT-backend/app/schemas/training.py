@@ -158,6 +158,12 @@ class TrainingTaskListOut(BaseModel):
 class TrainingMetricsQuery(BaseModel):
     """Query parameters for fetching training metrics from InfluxDB."""
 
+    task_code: str = ""
+    metric_type: str = "training_step"
+    start_time: str | None = None
+    stop_time: str | None = None
+    window: str = "10s"
+
 
 # ---------------------------------------------------------------------------
 # Backward-compatible schemas for existing routes

@@ -6,6 +6,7 @@ from app.api.v1.auth import router as auth_router
 from app.api.v1.dashboard import router as dashboard_router
 from app.api.v1.datasets import router as datasets_router
 from app.api.v1.documents import router as documents_router
+from app.api.v1.federated import router as federated_router
 from app.api.v1.health import router as health_router
 from app.api.v1.inference import router as inference_router
 from app.api.v1.models import router as models_router
@@ -24,3 +25,4 @@ api_router.include_router(models_router)
 api_router.include_router(resources_router)
 api_router.include_router(system_router)
 api_router.include_router(training_router)
+api_router.include_router(federated_router)

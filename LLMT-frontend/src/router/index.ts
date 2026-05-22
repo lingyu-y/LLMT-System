@@ -9,6 +9,7 @@ import DocGeneration from '@/views/DocGeneration.vue'
 import Forbidden from '@/views/Forbidden.vue'
 import Login from '@/views/Login.vue'
 import ModelManagement from '@/views/ModelManagement.vue'
+import FederatedLearning from '@/views/FederatedLearning.vue'
 import ModelTraining from '@/views/ModelTraining.vue'
 import MyLogs from '@/views/MyLogs.vue'
 import Register from '@/views/Register.vue'
@@ -51,6 +52,12 @@ const router = createRouter({
           name: 'model-training',
           component: ModelTraining,
           meta: { title: '模型训练', menuKeys: ['training'] },
+        },
+        {
+          path: 'federated-learning',
+          name: 'federated-learning',
+          component: FederatedLearning,
+          meta: { title: '联邦学习', menuKeys: ['training'] },
         },
         {
           path: 'model-management',
