@@ -114,6 +114,29 @@ def delete_user(
     user = user_repository.get_user_by_id(db, user_id)
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
+
+    # 检查关联数据
+    from app.models.dataset import Dataset
+    from app.models.training_task import TrainingTask
+    from app.models.model_version import ModelVersion
+
+    associations: list[str] = []
+    datasets = db.query(Dataset).filter(Dataset.owner_id == user_id).count()
+    if datasets:
+        associations.append(f"{datasets} 个数据集")
+    tasks = db.query(TrainingTask).filter(TrainingTask.creator_id == user_id).count()
+    if tasks:
+        associations.append(f"{tasks} 个训练任务")
+    models = db.query(ModelVersion).filter(ModelVersion.created_by_id == user_id).count()
+    if models:
+        associations.append(f"{models} 个模型版本")
+
+    if associations:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"无法删除用户 {user.username}，存在关联数据: {', '.join(associations)}。请先迁移或删除关联数据后再删除用户。",
+        )
+
     user_repository.delete_user(db, user)
     log_service.create_log(
         db, user_id=None, username="admin",
@@ -256,6 +279,17 @@ def delete_role(
     role = role_repository.get_role_by_id(db, role_id)
     if role is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="角色不存在")
+
+    # 检查是否有用户正在使用该角色
+    user_count = len(role.users)
+    if user_count > 0:
+        usernames = ", ".join(u.username for u in role.users[:5])
+        suffix = " 等用户" if user_count > 5 else ""
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"无法删除角色 {role.name}，该角色已被 {user_count} 个用户使用（{usernames}{suffix}）。请先取消用户分配后再删除。",
+        )
+
     role_repository.delete_role(db, role)
     log_service.create_log(
         db, user_id=None, username="admin",

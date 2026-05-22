@@ -223,6 +223,18 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { DocumentChecked, VideoPlay } from '@element-plus/icons-vue'
 
+import {
+  createTrainingTask,
+  getTrainingOptions,
+  listTrainingTasks,
+  pauseTrainingTask,
+  resumeTrainingTask,
+  scaleTrainingTask,
+  validateTrainingConfig,
+  type SelectOption,
+  type TrainingTask as BackendTrainingTask,
+  type TrainingTaskCreatePayload,
+} from '@/api/training'
 import StatusBadge from '@/components/StatusBadge.vue'
 import {
   type TrainingOptions,
@@ -331,6 +343,14 @@ const monitorError = computed(() => {
   const t = selectedTask.value as any
   return t.status === 'failed' ? (t.error_message || '训练失败') : ''
 })
+
+const selectedOptionLabel = <T extends string | number | undefined>(options: SelectOption[], value: T) =>
+  options.find((item) => item.value === value)?.label ?? String(value ?? '未选择')
+
+const selectedDatasetLabel = computed(() => selectedOptionLabel(datasetOptions.value, form.dataset))
+const selectedModelLabel = computed(() => selectedOptionLabel(modelOptions.value, form.model))
+const selectedGpuLabel = computed(() => selectedOptionLabel(gpuOptions.value, form.gpu))
+const selectedParallelLabels = computed(() => form.parallelStrategies.map((value) => selectedOptionLabel(parallelOptions.value, value)))
 
 const recommendedStrategy = computed(() => {
   const n = Number(gpuOptionValue.value)

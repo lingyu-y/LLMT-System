@@ -1,15 +1,38 @@
 """Model inference endpoints — 模型推理接口 (Part 6 of jiekou.md)."""
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from app.core.responses import success_response
+from app.core.rate_limit import (
+    check_rate_limit,
+    extract_rate_limit_key,
+    rate_limit_headers,
+)
 from app.dependencies.auth import get_current_user
 from app.dependencies.db import get_db
 from app.models.user import User
 from app.repositories import inference_repository
 
 router = APIRouter(prefix="/inference", tags=["模型推理"])
+
+# 推理接口限流配置
+INFERENCE_RATE_LIMIT = 60  # 次/分钟
+INFERENCE_RATE_WINDOW = 60  # 秒
+
+
+def _check_inference_rate_limit(
+    request: Request,
+    current_user: User,
+) -> dict:
+    """推理接口限流检查。"""
+    key = extract_rate_limit_key(request, current_user.id)
+    allowed, info = check_rate_limit(key, INFERENCE_RATE_LIMIT, INFERENCE_RATE_WINDOW)
+    if not allowed:
+        from app.core.rate_limit import rate_limit_http_exception
+        raise rate_limit_http_exception(info)
+    return info
 
 
 @router.get("/models")
@@ -25,9 +48,13 @@ def list_inference_models(
 def predict_sync(
     model_code: str,
     body: dict,
+    request: Request,
     db: Session = Depends(get_db),
-    _current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
+    # 步骤 1-6: 滑动窗口限流检查
+    rate_info = _check_inference_rate_limit(request, current_user)
+
     result = inference_repository.predict_sync(
         db, model_code=model_code,
         input_text=body.get("input", ""),
@@ -35,7 +62,12 @@ def predict_sync(
     )
     if result is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型不存在或不可用")
-    return success_response(result, "推理完成")
+
+    # 构造响应 + 注入限流响应头
+    return JSONResponse(
+        content={"message": "推理完成", "data": result},
+        headers=rate_limit_headers(rate_info),
+    )
 
 
 @router.post("/jobs", status_code=status.HTTP_201_CREATED)

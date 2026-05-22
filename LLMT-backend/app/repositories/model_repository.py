@@ -50,14 +50,31 @@ def get_versions(db: Session, model_code: str) -> list[ModelVersion]:
     )
 
 
-def rollback_version(db: Session, model: ModelVersion) -> ModelVersion:
+def rollback_version(db: Session, model: ModelVersion) -> dict:
+    """回滚到指定版本，返回 {rolled_back_to, previous_current}。"""
+    previous = (
+        db.query(ModelVersion)
+        .filter(ModelVersion.model_code == model.model_code, ModelVersion.is_current.is_(True))
+        .first()
+    )
+    previous_version = previous.version if previous else None
+
     db.query(ModelVersion).filter(
         ModelVersion.model_code == model.model_code, ModelVersion.is_current.is_(True)
     ).update({"is_current": False})
     model.is_current = True
     db.commit()
     db.refresh(model)
-    return model
+
+    return {
+        "rolled_back_to": {
+            "version": model.version,
+            "model_name": model.model_name,
+            "framework": model.framework,
+            "storage_path": model.storage_path,
+        },
+        "previous_current": {"version": previous_version} if previous_version else None,
+    }
 
 
 def get_model_by_code_and_version(

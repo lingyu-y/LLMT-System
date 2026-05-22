@@ -1,4 +1,6 @@
-"""Training API endpoints – full CRUD + metrics + validation + operations."""
+"""Training API endpoints."""
+
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
@@ -6,20 +8,94 @@ from sqlalchemy.orm import Session
 from app.core.responses import paginated_response, success_response
 from app.dependencies.auth import get_current_user, require_admin
 from app.dependencies.db import get_db
+from app.models.dataset import Dataset
+from app.models.training_task import TrainingTask
+from app.models.user import User
+from app.repositories import model_repository, training_repository
 from app.schemas.training import (
     PrivacyConfigRequest,
     ScaleTaskRequest,
+    SubmitTaskRequest,
     TrainingMetricsQuery,
     TrainingTaskCreate,
+    TrainingTaskOut,
 )
 from app.services import training_service
 
 router = APIRouter(prefix="/training", tags=["训练管理"])
 
+GPU_OPTIONS = [
+    {"value": "1", "label": "1 × A100"},
+    {"value": "2", "label": "2 × A100"},
+    {"value": "4", "label": "4 × A100"},
+    {"value": "8", "label": "8 × A100"},
+]
 
-# ---------------------------------------------------------------------------
-# Task CRUD
-# ---------------------------------------------------------------------------
+FRAMEWORKS = [
+    {"value": "pytorch", "label": "PyTorch"},
+    {"value": "deepspeed", "label": "DeepSpeed"},
+    {"value": "megatron", "label": "Megatron-LM"},
+]
+
+PARALLEL_STRATEGIES = [
+    {"value": "ddp", "label": "分布式数据并行 (DDP)"},
+    {"value": "zero1", "label": "ZeRO Stage 1"},
+    {"value": "zero2", "label": "ZeRO Stage 2"},
+    {"value": "zero3", "label": "ZeRO Stage 3"},
+    {"value": "zero3_offload", "label": "ZeRO Stage 3 Offload"},
+    {"value": "tp", "label": "张量并行 (TP)"},
+    {"value": "pp", "label": "流水线并行 (PP)"},
+    {"value": "3d", "label": "3D 混合并行"},
+]
+
+
+def _task_out(task: TrainingTask) -> dict:
+    return TrainingTaskOut.model_validate(task).model_dump()
+
+
+def _get_task_or_404(db: Session, task_id: int) -> TrainingTask:
+    task = training_repository.get_by_id(db, task_id)
+    if task is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="训练任务不存在")
+    return task
+
+
+@router.get("/options")
+def get_training_options(db: Session = Depends(get_db)):
+    models = model_repository.get_models(db, page=1, page_size=1000)[0]
+    datasets = db.query(Dataset).order_by(Dataset.id).all()
+
+    return success_response({
+        "models": [
+            {"value": model.model_code, "label": f"{model.model_name} ({model.version})"}
+            for model in models
+        ],
+        "datasets": [
+            {"value": dataset.id, "label": f"{dataset.name} ({dataset.data_type}, {dataset.version})"}
+            for dataset in datasets
+        ],
+        "frameworks": FRAMEWORKS,
+        "gpu_options": GPU_OPTIONS,
+        "parallel_strategies": PARALLEL_STRATEGIES,
+    })
+
+
+@router.post("/privacy-config")
+def set_privacy_config(
+    body: PrivacyConfigRequest,
+    _admin: User = Depends(require_admin),
+):
+    return success_response(body.model_dump(), "差分隐私配置已保存")
+
+
+@router.post("/validate-config")
+def validate_training_config(
+    body: TrainingTaskCreate,
+    _user: User = Depends(get_current_user),
+):
+    result = training_service.validate_config(body.config, body.framework, body.parallel_strategy)
+    return success_response(result)
+
 
 @router.post("/tasks")
 def create_training_task(

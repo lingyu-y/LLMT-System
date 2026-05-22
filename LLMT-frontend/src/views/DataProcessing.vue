@@ -62,10 +62,6 @@
                   </div>
                   <div class="upload-summary">
                     <div>
-                      <span class="context-label">存储路径</span>
-                      <strong>{{ selectedDataset.raw.storage_path || '接口未返回' }}</strong>
-                    </div>
-                    <div>
                       <span class="context-label">来源</span>
                       <strong>{{ selectedDataset.raw.source || '未记录' }}</strong>
                     </div>
@@ -74,12 +70,17 @@
                       <strong>{{ selectedDataset.raw.file_count }}</strong>
                     </div>
                   </div>
+                  <div class="button-row">
+                    <el-button type="primary" :icon="Upload" @click="openAppendDialog">追加文件</el-button>
+                    <el-button :icon="VideoPlay" @click="startPreprocessJob">启动预处理</el-button>
+                    <el-button :icon="Clock" @click="refreshProcessingJobs">刷新处理任务</el-button>
+                  </div>
                 </div>
 
                 <div class="feature-panel">
                   <div class="panel-copy">
                     <h4>上传状态</h4>
-                    <p>当前接口返回文件名和内容类型，进度与中断状态由前端操作过程展示。</p>
+                    <p>展示本次选择文件的校验、上传和后端处理结果。</p>
                   </div>
                   <div v-if="uploadRecords.length" class="upload-records">
                     <div v-for="file in uploadRecords" :key="file.uid" class="upload-record">
@@ -96,13 +97,32 @@
                   <el-empty v-else description="尚未选择上传文件" :image-size="70" />
                 </div>
               </div>
+
+              <div class="job-list">
+                <h4>处理任务</h4>
+                <el-table :data="processingJobs" stripe>
+                  <el-table-column prop="job_id" label="任务ID" min-width="160" />
+                  <el-table-column prop="dataset_name" label="数据集" min-width="140" />
+                  <el-table-column prop="job_type" label="类型" width="120" />
+                  <el-table-column prop="status" label="状态" width="100" />
+                  <el-table-column label="输出样本" width="110">
+                    <template #default="{ row }">{{ row.record_count ?? '-' }}</template>
+                  </el-table-column>
+                  <el-table-column label="输出大小" width="110">
+                    <template #default="{ row }">{{ row.processed_size ? formatSize(row.processed_size) : '-' }}</template>
+                  </el-table-column>
+                  <el-table-column prop="progress" label="进度" width="160">
+                    <template #default="{ row }"><el-progress :percentage="row.progress" /></template>
+                  </el-table-column>
+                </el-table>
+              </div>
             </el-tab-pane>
 
             <el-tab-pane label="质量校验" name="quality">
               <div class="quality-toolbar">
                 <div>
                   <h4>数据质量校验</h4>
-                  <p>展示后端返回的完整性、一致性、时效性与异常记录；准确性字段当前接口未返回。</p>
+                  <p>展示后端返回的完整性、一致性、时效性、准确性与异常记录。</p>
                 </div>
                 <div class="button-row">
                   <el-button type="primary" :loading="checking" :icon="VideoPlay" @click="startQualityCheck">开始校验</el-button>
@@ -155,10 +175,10 @@
                   <strong>{{ lineageReport?.source || selectedDataset.raw.source || '未记录' }}</strong>
                   <small>上传者：{{ selectedDataset.ownerLabel }} · {{ selectedDataset.createdAt }}</small>
                 </div>
-                <div v-for="step in lineageSteps" :key="step" class="lineage-node">
+                <div v-for="step in lineageSteps" :key="step.key" class="lineage-node">
                   <span>转换</span>
-                  <strong>{{ step }}</strong>
-                  <small>转换时间与版本映射当前接口未返回</small>
+                  <strong>{{ step.description }}</strong>
+                  <small>{{ step.timeLabel }} · {{ step.versionLabel }}</small>
                 </div>
                 <div class="lineage-node">
                   <span>使用</span>
@@ -175,7 +195,7 @@
     <div class="card">
       <div class="card-header">
         <h3 class="card-title">数据集列表</h3>
-        <el-button type="primary" :icon="Upload" @click="dialogVisible = true">数据加载</el-button>
+        <el-button type="primary" :icon="Upload" @click="openCreateDialog">数据加载</el-button>
       </div>
       <div class="card-body table-wrap">
         <el-table v-loading="loading" :data="datasets" stripe @row-click="handleRowClick">
@@ -200,18 +220,21 @@
           <el-table-column label="血缘状态" width="120">
             <template #default="{ row }"><StatusBadge :label="row.lineageLabel" :type="row.lineageType" /></template>
           </el-table-column>
-          <el-table-column label="操作" fixed="right" width="250">
+          <el-table-column label="操作" fixed="right" width="260">
             <template #default="{ row }">
-              <el-button size="small" @click.stop="selectDataset(row.id, 'quality')">校验</el-button>
-              <el-button size="small" @click.stop="selectDataset(row.id, 'lineage')">血缘</el-button>
-              <el-button size="small" @click.stop="selectDataset(row.id, 'load')">加载</el-button>
+              <div class="table-actions">
+                <el-button size="small" @click.stop="selectDataset(row.id, 'quality')">校验</el-button>
+                <el-button size="small" @click.stop="selectDataset(row.id, 'lineage')">血缘</el-button>
+                <el-button size="small" @click.stop="selectDataset(row.id, 'load')">加载</el-button>
+                <el-button size="small" type="danger" @click.stop="removeDataset(row.id)">删除</el-button>
+              </div>
             </template>
           </el-table-column>
         </el-table>
       </div>
     </div>
 
-    <el-dialog v-model="dialogVisible" title="多模态数据加载" width="680px">
+    <el-dialog v-model="dialogVisible" :title="dialogTitle" width="680px">
       <el-form :model="importForm" label-position="top">
         <el-form-item label="批量上传入口">
           <el-upload
@@ -226,7 +249,7 @@
             <el-icon class="upload-icon"><UploadFilled /></el-icon>
             <div>拖拽文件到此处，或点击选择数据文件</div>
             <template #tip>
-              <div class="muted">支持 TXT、CSV、JSON</div>
+              <div class="muted">支持 TXT、CSV、JSON、JSONL、DOC、DOCX、XLS、XLSX，单文件最大 2GB</div>
             </template>
           </el-upload>
         </el-form-item>
@@ -239,7 +262,7 @@
           </div>
         </div>
 
-        <div class="form-grid">
+        <div v-if="uploadMode === 'create'" class="form-grid">
           <el-form-item label="数据集名称">
             <el-input v-model="importForm.name" placeholder="输入数据集名称" />
           </el-form-item>
@@ -253,22 +276,23 @@
           </el-form-item>
         </div>
 
-        <div class="form-grid">
-          <el-form-item label="存储路径">
-            <el-input v-model="importForm.storagePath" placeholder="/datasets" />
-          </el-form-item>
-          <el-form-item label="命名规则">
-            <el-input v-model="importForm.namingRule" placeholder="原文件名 / 数据集名_序号" />
-          </el-form-item>
-        </div>
-
-        <el-form-item label="描述">
+        <el-form-item v-if="uploadMode === 'create'" label="描述">
           <el-input v-model="importForm.desc" type="textarea" :rows="3" placeholder="输入数据集描述..." />
+        </el-form-item>
+
+        <el-form-item label="断点续传">
+          <div class="resume-option">
+            <el-switch v-model="resumeEnabled" />
+            <div>
+              <strong>{{ resumeEnabled ? '已启用' : '未启用' }}</strong>
+              <p>启用后上传过程保留本地文件状态，失败后可重新提交同一批文件继续处理。</p>
+            </div>
+          </div>
         </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
-        <el-button type="primary" :loading="importing" @click="submitImport">创建并上传</el-button>
+        <el-button type="primary" :loading="importing" @click="submitImport">{{ submitButtonLabel }}</el-button>
       </template>
     </el-dialog>
 
@@ -280,7 +304,7 @@
         <el-descriptions-item label="完整性">{{ qualityReport?.completeness === undefined ? '接口未返回' : passLabel(qualityReport.completeness) }}</el-descriptions-item>
         <el-descriptions-item label="一致性">{{ qualityReport?.consistency === undefined ? '接口未返回' : passLabel(qualityReport.consistency) }}</el-descriptions-item>
         <el-descriptions-item label="时效性">{{ qualityReport?.timeliness === undefined ? '接口未返回' : passLabel(qualityReport.timeliness) }}</el-descriptions-item>
-        <el-descriptions-item label="准确性">当前接口未返回</el-descriptions-item>
+        <el-descriptions-item label="准确性">{{ qualityReport?.accuracy === undefined ? '接口未返回' : passLabel(qualityReport.accuracy) }}</el-descriptions-item>
         <el-descriptions-item label="校验时间">{{ formatDateTime(qualityReport?.checked_at) }}</el-descriptions-item>
       </el-descriptions>
     </el-drawer>
@@ -290,13 +314,13 @@
         <el-descriptions-item label="数据来源">{{ lineageReport?.source || selectedDataset.raw.source || '未记录' }}</el-descriptions-item>
         <el-descriptions-item label="上传者">{{ selectedDataset.ownerLabel }}</el-descriptions-item>
         <el-descriptions-item label="上传时间">{{ selectedDataset.createdAt }}</el-descriptions-item>
-        <el-descriptions-item label="原始位置">{{ selectedDataset.raw.storage_path || '接口未返回' }}</el-descriptions-item>
       </el-descriptions>
       <div class="drawer-section">
         <h4>转换记录</h4>
         <el-timeline>
-          <el-timeline-item v-for="step in lineageSteps" :key="step" :timestamp="selectedDataset?.updatedAt || ''">
-            {{ step }}
+          <el-timeline-item v-for="step in lineageSteps" :key="step.key" :timestamp="step.timeLabel">
+            <strong>{{ step.description }}</strong>
+            <p class="timeline-meta">{{ step.versionLabel }} · {{ step.ruleLabel }}</p>
           </el-timeline-item>
         </el-timeline>
         <el-empty v-if="lineageSteps.length === 0" description="暂无转换记录" :image-size="70" />
@@ -333,19 +357,23 @@ import MetricCard from '@/components/MetricCard.vue'
 import StatusBadge from '@/components/StatusBadge.vue'
 import {
   createDataset,
+  deleteDataset as deleteDatasetApi,
   getDatasetStats,
   getLineage,
   getLineageImpact,
   getQualityReport,
   listDatasets,
+  listProcessingJobs,
+  startPreprocess,
   triggerQualityCheck,
   triggerQualityRepair,
-  updateDataset,
-  uploadDatasetFile,
+  uploadDatasetFileWithProgress,
+  uploadDatasetFilesBatchWithProgress,
   type BackendDataset,
   type DatasetStats,
   type Lineage,
   type LineageImpact,
+  type ProcessingJob,
   type QualityReport,
 } from '@/api/datasets'
 
@@ -379,12 +407,13 @@ interface UploadRecord {
   progressStatus?: 'success' | 'exception' | 'warning'
 }
 
-const supportedFormats = ['TXT', 'CSV', 'JSON']
+const MAX_UPLOAD_FILE_SIZE = 2 * 1024 ** 3
+const supportedFormats = ['TXT', 'CSV', 'JSON', 'JSONL', 'DOC', 'DOCX', 'XLS', 'XLSX']
 const formatByType: Record<string, string> = {
-  text: 'TXT/CSV/JSON',
+  text: 'TXT/CSV/JSON/JSONL/DOC/DOCX',
   image: '暂不支持',
   audio: '暂不支持',
-  tabular: 'CSV/JSON',
+  tabular: 'CSV/JSON/XLS/XLSX',
   video: '暂不支持',
 }
 
@@ -408,6 +437,7 @@ const lineageStatusMap: Record<string, { label: string; type: StatusType }> = {
   tracked: { label: '已追踪', type: 'success' },
   complete: { label: '已追踪', type: 'success' },
   pending: { label: '待生成', type: 'info' },
+  none: { label: '待生成', type: 'info' },
   missing: { label: '缺失', type: 'warning' },
 }
 
@@ -429,13 +459,17 @@ const uploadRecords = ref<UploadRecord[]>([])
 const qualityReport = ref<QualityReport>()
 const lineageReport = ref<Lineage>()
 const lineageImpact = ref<LineageImpact>({ dataset_id: 0, affected_models: [], affected_tasks: [], affected_datasets: [] })
+const processingJobs = ref<ProcessingJob[]>([])
+const resumeEnabled = ref(true)
+const uploadMode = ref<'create' | 'append'>('create')
 const importForm = reactive({
   name: '',
   type: 'text',
   desc: '',
-  storagePath: '/datasets',
-  namingRule: '保留原文件名',
 })
+
+const dialogTitle = computed(() => (uploadMode.value === 'create' ? '多模态数据加载' : `追加文件到 ${selectedDataset.value?.name ?? '当前数据集'}`))
+const submitButtonLabel = computed(() => (uploadMode.value === 'create' ? '创建并上传' : '追加上传'))
 
 const formatSize = (size = 0) => {
   if (size >= 1024 ** 4) return `${(size / 1024 ** 4).toFixed(1)} TB`
@@ -494,6 +528,8 @@ const qualityScore = computed(() => qualityReport.value?.overall_score)
 const qualityScoreLabel = computed(() => (qualityScore.value === undefined ? '接口未返回' : qualityScore.value.toFixed(1)))
 const qualityLevel = computed(() => {
   if (qualityScore.value === undefined) return { label: '暂无报告', className: 'score-empty' }
+  if (qualityReport.value?.blocked_for_training) return { label: '阻断训练', className: 'score-danger' }
+  if (qualityReport.value?.passed === false) return { label: qualityScore.value < 60 ? '告警' : '不合格', className: qualityScore.value < 60 ? 'score-danger' : 'score-warning' }
   if (qualityScore.value < 60) return { label: '告警', className: 'score-danger' }
   if (qualityScore.value < 80) return { label: '不合格', className: 'score-warning' }
   return { label: '合格', className: 'score-success' }
@@ -503,48 +539,79 @@ const qualityItems = computed(() => [
   {
     label: '完整性',
     value: qualityReport.value?.completeness === undefined ? '接口未返回' : passLabel(qualityReport.value.completeness),
-    detail: '缺失率等细分指标当前接口未返回',
+    detail: `缺失率 ${formatPercent(qualityReport.value?.missing_rate_pct)} · 重复行 ${qualityReport.value?.duplicate_rows ?? 0}`,
   },
   {
     label: '一致性',
     value: qualityReport.value?.consistency === undefined ? '接口未返回' : passLabel(qualityReport.value.consistency),
-    detail: '格式一致率当前接口未返回',
+    detail: `格式一致率 ${formatPercent(qualityReport.value?.format_rate_pct)} · 范围异常 ${qualityReport.value?.range_violations ?? 0}`,
   },
   {
     label: '时效性',
     value: qualityReport.value?.timeliness === undefined ? '接口未返回' : passLabel(qualityReport.value.timeliness),
-    detail: `更新时间：${selectedDataset.value?.updatedAt || '-'}`,
+    detail: `更新时间 ${selectedDataset.value?.updatedAt || '-'} · 数据年龄 ${qualityReport.value?.data_age_days ?? 0} 天`,
   },
   {
     label: '准确性',
-    value: '接口未返回',
-    detail: '异常值比例可由 anomalies 扩展',
+    value: qualityReport.value?.accuracy === undefined ? '接口未返回' : passLabel(qualityReport.value.accuracy),
+    detail: `异常值 ${formatPercent(qualityReport.value?.outlier_rate_pct)} · 规则异常 ${qualityReport.value?.rule_violations ?? 0}`,
   },
 ])
 
 const qualityIssues = computed(() =>
   (qualityReport.value?.anomalies ?? []).map((item, index) => ({
     index: index + 1,
-    description: String(item.description ?? item.message ?? JSON.stringify(item)),
-    suggestion: String(item.suggestion ?? '请根据异常字段检查源数据或重新执行修复'),
+    description: String(item.issue ?? item.description ?? item.message ?? JSON.stringify(item)),
+    suggestion: String(item.suggestion ?? qualityReport.value?.suggestions?.[index] ?? '请根据异常字段检查源数据或重新执行校验'),
   })),
 )
 
-const lineageSteps = computed(() => lineageReport.value?.transformations ?? [])
+const lineageSteps = computed(() =>
+  (lineageReport.value?.transformations ?? []).map((step, index) => ({
+    key: `${step.rule ?? 'transform'}-${step.timestamp ?? index}`,
+    description: step.description || step.rule || '未命名转换',
+    ruleLabel: step.rule || '未记录规则',
+    timeLabel: formatDateTime(step.timestamp),
+    versionLabel:
+      step.version_before || step.version_after
+        ? `${step.version_before ?? '初始'} -> ${step.version_after ?? '未记录'}`
+        : '版本未变化',
+  })),
+)
 const downstreamLabel = computed(() => {
   const downstream = lineageReport.value?.downstream ?? []
-  return downstream.length > 0 ? downstream.join('、') : '暂无下游记录'
+  if (downstream.length === 0) return '暂无下游记录'
+  return downstream
+    .map((item) => {
+      if (typeof item === 'string') return item
+      if (item && typeof item === 'object') {
+        const record = item as Record<string, unknown>
+        return String(record.task_name ?? record.model_code ?? record.task_id ?? record.type ?? '下游记录')
+      }
+      return String(item)
+    })
+    .join('、')
 })
 
 const getFileFormat = (filename: string) => filename.split('.').pop()?.toUpperCase() ?? ''
 const isSupportedFile = (filename: string) => supportedFormats.includes(getFileFormat(filename))
+const formatPercent = (value?: number) => (value === undefined || Number.isNaN(value) ? '-' : `${value.toFixed(1)}%`)
+const buildStoragePath = (name: string) => {
+  const safe = name
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9\u4e00-\u9fa5_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48)
+  return `/datasets/${safe || "dataset"}-${Date.now()}`
+}
 
 const syncUploadRecords = () => {
   uploadRecords.value = uploadFiles.value.map((file) => {
     const format = getFileFormat(file.name)
     const supported = isSupportedFile(file.name)
     const size = file.size ?? file.raw?.size ?? 0
-    const tooLarge = size > 1024 ** 3
+    const tooLarge = size > MAX_UPLOAD_FILE_SIZE
 
     return {
       uid: Number(file.uid),
@@ -569,12 +636,41 @@ const handleUploadRemove = (_file: UploadFile, files: UploadUserFile[]) => {
   syncUploadRecords()
 }
 
+const resetImportForm = () => {
+  importForm.name = ''
+  importForm.type = 'text'
+  importForm.desc = ''
+  uploadFiles.value = []
+  uploadRecords.value = []
+}
+
+const openCreateDialog = () => {
+  uploadMode.value = 'create'
+  resetImportForm()
+  dialogVisible.value = true
+}
+
+const openAppendDialog = () => {
+  if (!selectedDataset.value) {
+    ElMessage.warning('请先选择数据集')
+    return
+  }
+  uploadMode.value = 'append'
+  resetImportForm()
+  dialogVisible.value = true
+}
+
 const loadDatasets = async () => {
   loading.value = true
   try {
-    const [statsData, datasetPage] = await Promise.all([getDatasetStats(), listDatasets({ page: 1, page_size: 100 })])
+    const [statsData, datasetPage, jobsPage] = await Promise.all([
+      getDatasetStats(),
+      listDatasets({ page: 1, page_size: 100 }),
+      listProcessingJobs({ page: 1, page_size: 20 }).catch(() => ({ data: [], total: 0, page: 1, page_size: 20 })),
+    ])
     stats.value = statsData
     datasets.value = datasetPage.data.map(mapDataset)
+    processingJobs.value = jobsPage.data
 
     if (!selectedDatasetId.value && datasets.value[0]) {
       await selectDataset(datasets.value[0].id)
@@ -586,13 +682,27 @@ const loadDatasets = async () => {
   }
 }
 
+const refreshProcessingJobs = async () => {
+  const jobsPage = await listProcessingJobs({ page: 1, page_size: 20 })
+  processingJobs.value = jobsPage.data
+}
+
 const loadDatasetDetails = async (datasetId: number) => {
   qualityReport.value = undefined
   lineageReport.value = undefined
   lineageImpact.value = { dataset_id: datasetId, affected_models: [], affected_tasks: [], affected_datasets: [] }
 
   const [quality, lineage] = await Promise.allSettled([getQualityReport(datasetId), getLineage(datasetId)])
-  if (quality.status === 'fulfilled') qualityReport.value = quality.value
+  if (quality.status === 'fulfilled') {
+    qualityReport.value = quality.value
+    const item = datasets.value.find((dataset) => dataset.id === datasetId)
+    if (item && quality.value) {
+      item.raw.quality_status = quality.value.passed ? 'passed' : 'failed'
+      const status = getQualityStatus(item.raw.quality_status)
+      item.qualityLabel = status.label
+      item.qualityType = status.type
+    }
+  }
   if (lineage.status === 'fulfilled') lineageReport.value = lineage.value
 }
 
@@ -684,9 +794,53 @@ const showVersionTip = () => {
   ElMessage.info('历史版本需要后端提供版本列表接口后展示')
 }
 
+const startPreprocessJob = async () => {
+  if (!selectedDataset.value) {
+    ElMessage.warning('请先选择数据集')
+    return
+  }
+  const datasetId = selectedDataset.value.id
+  try {
+    await startPreprocess(datasetId)
+    await refreshProcessingJobs()
+    await loadDatasets()
+    await loadDatasetDetails(datasetId)
+    ElMessage.success('预处理已完成，质量状态已刷新')
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '预处理失败')
+  }
+}
+
+const removeDataset = async (datasetId: number) => {
+  try {
+    await deleteDatasetApi(datasetId)
+    datasets.value = datasets.value.filter((item) => item.id !== datasetId)
+    if (selectedDatasetId.value === datasetId) {
+      selectedDatasetId.value = datasets.value[0]?.id
+      if (selectedDatasetId.value) await loadDatasetDetails(selectedDatasetId.value)
+      else {
+        qualityReport.value = undefined
+        lineageReport.value = undefined
+      }
+    }
+    await loadDatasets()
+    ElMessage.success('数据集已删除')
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '数据集删除失败')
+  }
+}
+
 const submitImport = async () => {
-  if (!importForm.name.trim()) {
+  if (uploadMode.value === 'create' && !importForm.name.trim()) {
     ElMessage.warning('请输入数据集名称')
+    return
+  }
+  if (uploadMode.value === 'append' && !selectedDataset.value) {
+    ElMessage.warning('请先选择要追加的数据集')
+    return
+  }
+  if (uploadFiles.value.length === 0) {
+    ElMessage.warning('请选择要上传的数据文件')
     return
   }
 
@@ -697,62 +851,109 @@ const submitImport = async () => {
   }
 
   importing.value = true
+  let targetDatasetId = selectedDataset.value?.id
   let createdDatasetId: number | undefined
-  let successfulFileCount = 0
-  let successfulTotalSize = 0
-  const persistSuccessfulUploadStats = async () => {
-    if (!createdDatasetId) return
-    await updateDataset(createdDatasetId, {
-      file_count: successfulFileCount,
-      total_size: successfulTotalSize,
-    })
-  }
+  let createdDataset: BackendDataset | undefined
+  let uploadedCount = 0
 
   try {
-    const dataset = await createDataset({
-      name: importForm.name.trim(),
-      data_type: importForm.type,
-      description: importForm.desc,
-      source: '前端数据加载',
-      storage_path: importForm.storagePath || '/datasets',
-      file_count: 0,
-      total_size: 0,
+    const rawFiles: File[] = []
+    uploadFiles.value.forEach((file) => {
+      if (!file.raw) throw new Error('未能读取到浏览器文件对象，请重新选择文件后再上传')
+      rawFiles.push(file.raw as File)
     })
-    createdDatasetId = dataset.id
 
-    for (const file of uploadFiles.value) {
-      const record = uploadRecords.value.find((item) => item.uid === Number(file.uid))
-      if (!file.raw || !record) continue
-
-      record.statusLabel = '上传中'
-      record.statusType = 'info'
-      record.percent = 60
-      await uploadDatasetFile(dataset.id, file.raw)
-      successfulFileCount += 1
-      successfulTotalSize += file.raw.size
-      record.statusLabel = '上传成功'
-      record.statusType = 'success'
-      record.percent = 100
-      record.progressStatus = 'success'
+    if (uploadMode.value === 'create') {
+      const datasetName = importForm.name.trim()
+      const dataset = await createDataset({
+        name: datasetName,
+        data_type: importForm.type,
+        description: importForm.desc,
+        source: '前端数据加载',
+        storage_path: buildStoragePath(datasetName),
+        file_count: 0,
+        total_size: 0,
+      })
+      targetDatasetId = dataset.id
+      createdDatasetId = dataset.id
+      createdDataset = dataset
     }
 
-    await persistSuccessfulUploadStats()
+    if (!targetDatasetId) throw new Error('未找到目标数据集')
+    const ensuredTargetDatasetId = targetDatasetId
+    if (createdDataset) {
+      datasets.value = [mapDataset(createdDataset), ...datasets.value.filter((item) => item.id !== createdDataset?.id)]
+      selectedDatasetId.value = ensuredTargetDatasetId
+      qualityReport.value = undefined
+      lineageReport.value = undefined
+    }
+    activeDataTab.value = 'load'
     dialogVisible.value = false
+
+    if (rawFiles.length > 1) {
+      uploadRecords.value.forEach((record) => {
+        record.statusLabel = '批量上传中'
+        record.statusType = 'info'
+        record.percent = 1
+      })
+      const result = await uploadDatasetFilesBatchWithProgress(ensuredTargetDatasetId, rawFiles, (percent) => {
+        uploadRecords.value.forEach((record) => {
+          if (record.statusLabel === '批量上传中' || record.statusLabel === '写入存储中') {
+            record.percent = percent
+            if (percent >= 95 && percent < 100) record.statusLabel = '写入存储中'
+          }
+        })
+      })
+      uploadedCount = result.uploaded
+      const resultsByName = new Map(result.files.map((item) => [String(item.filename ?? ''), item]))
+      uploadRecords.value.forEach((record) => {
+        const item = resultsByName.get(record.name)
+        const success = item?.success === true
+        record.statusLabel = success ? '上传成功' : String(item?.error ?? '上传失败')
+        record.statusType = success ? 'success' : 'danger'
+        record.percent = 100
+        record.progressStatus = success ? 'success' : 'exception'
+      })
+      if (result.uploaded === 0) throw new Error('批量上传失败，未成功写入任何文件')
+      if (result.failed > 0) ElMessage.warning(`已上传 ${result.uploaded} 个文件，${result.failed} 个文件失败`)
+    } else {
+      for (const file of uploadFiles.value) {
+        const record = uploadRecords.value.find((item) => item.uid === Number(file.uid))
+        if (!file.raw || !record) continue
+
+        record.statusLabel = '上传中'
+        record.statusType = 'info'
+        record.percent = 1
+        await uploadDatasetFileWithProgress(ensuredTargetDatasetId, file.raw, (percent) => {
+          record.percent = percent
+          if (percent >= 95 && percent < 100) record.statusLabel = '写入存储中'
+        })
+        uploadedCount += 1
+        record.statusLabel = '上传成功'
+        record.statusType = 'success'
+        record.percent = 100
+        record.progressStatus = 'success'
+      }
+    }
+
+    await loadDatasets()
+    await selectDataset(ensuredTargetDatasetId, 'load')
     uploadFiles.value = []
-    uploadRecords.value = []
     importForm.name = ''
     importForm.desc = ''
-    await loadDatasets()
-    await selectDataset(dataset.id, 'load')
-    ElMessage.success('数据集已创建，文件上传流程已完成')
+    ElMessage.success(uploadMode.value === 'create' ? '数据集已创建，文件上传完成' : '文件已追加到当前数据集')
   } catch (error) {
-    try {
-      await persistSuccessfulUploadStats()
-    } catch {
-      ElMessage.warning('上传统计回写失败，请稍后刷新数据集信息')
+    if (uploadMode.value === 'create' && createdDatasetId && uploadedCount === 0) {
+      try {
+        await deleteDatasetApi(createdDatasetId)
+        datasets.value = datasets.value.filter((item) => item.id !== createdDatasetId)
+        if (selectedDatasetId.value === createdDatasetId) selectedDatasetId.value = datasets.value[0]?.id
+      } catch {
+        ElMessage.warning('上传未成功，空数据集清理失败，请稍后手动删除')
+      }
     }
     uploadRecords.value = uploadRecords.value.map((file) =>
-      file.statusLabel === '上传中'
+      file.statusLabel === '上传中' || file.statusLabel === '批量上传中'
         ? { ...file, statusLabel: '上传中断', statusType: 'danger', progressStatus: 'exception' }
         : file,
     )
@@ -799,6 +1000,28 @@ onMounted(() => {
   gap: 14px;
 }
 
+.resume-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-color);
+}
+
+.resume-option strong {
+  display: block;
+  margin-bottom: 4px;
+}
+
+.resume-option p {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 .dataset-context {
   grid-template-columns: repeat(4, minmax(0, 1fr));
   margin-bottom: 18px;
@@ -839,6 +1062,18 @@ onMounted(() => {
   background: var(--bg-color);
 }
 
+.feature-panel {
+  display: flex;
+  min-height: 250px;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.panel-copy {
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--border-color);
+}
+
 .panel-copy h4,
 .quality-toolbar h4,
 .issue-list h4,
@@ -869,11 +1104,21 @@ onMounted(() => {
 
 .format-tags,
 .upload-summary {
-  margin-top: 16px;
+  margin-top: 0;
 }
 
 .upload-summary {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.upload-summary > div {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: #fff;
 }
 
 .upload-records {
@@ -921,6 +1166,8 @@ onMounted(() => {
 
 .button-row {
   justify-content: flex-end;
+  margin-top: auto;
+  padding-top: 2px;
 }
 
 .score-band {
@@ -1016,6 +1263,16 @@ onMounted(() => {
   overflow-x: auto;
 }
 
+.table-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.table-actions :deep(.el-button) {
+  margin-left: 0;
+}
+
 .upload-icon {
   color: var(--primary-color);
   font-size: 36px;
@@ -1032,6 +1289,12 @@ onMounted(() => {
   border: 1px solid var(--border-color);
   border-radius: 8px;
   background: var(--bg-color);
+}
+
+.timeline-meta {
+  margin: 4px 0 0;
+  color: var(--text-secondary);
+  font-size: 12px;
 }
 
 .form-grid {

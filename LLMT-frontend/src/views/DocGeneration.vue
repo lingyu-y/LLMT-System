@@ -156,6 +156,7 @@ const buildPreview = (prompt: string, content?: string) => ({
 const saveDraft = async (preview: Message['preview']) => {
   if (!preview) return
   await createDraft({
+    model_code: selectedModel.value.id,
     doc_type: '对话草稿',
     title: preview.title,
     content: preview.sections.map((section) => `## ${section.title}\n\n${section.content}`).join('\n\n'),
@@ -179,13 +180,13 @@ const send = () => {
   if (!content) return
   messages.value.push({ id: Date.now(), role: 'user', content })
   input.value = ''
-  chatGenerate({ prompt: content, model_code: selectedModel.value.id })
+  chatGenerate({ message: content, model_code: selectedModel.value.id })
     .then((result) => {
     messages.value.push({
       id: Date.now() + 1,
       role: 'ai',
-      content: `已使用 ${selectedModel.value.name} 生成一段可继续修改的文档草稿。`,
-      preview: buildPreview(content, result.reply),
+      content: result.content,
+      preview: buildPreview(content, result.content),
     })
     scrollBottom()
     })
@@ -199,12 +200,12 @@ onMounted(async () => {
   try {
     const models = await listDocumentModels()
     docModels.value = models.map((model) => ({
-      id: model.code,
-      name: model.name,
+      id: model.value,
+      name: model.label,
       provider: '后端文档模型',
       context: '项目配置',
-      desc: model.description,
-      tags: ['文档生成'],
+      desc: `支持 ${model.types.join('、')} 类型文档生成`,
+      tags: model.types,
     }))
     selectedModel.value = docModels.value[0] ?? defaultDocModels[0]!
   } catch {

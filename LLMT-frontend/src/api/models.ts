@@ -1,4 +1,4 @@
-import { get, post, type ApiMessage, type PageResult, unwrap } from '@/api/http'
+import { get, post, put, type ApiMessage, type PageResult, unwrap } from '@/api/http'
 
 export interface BackendModel {
   id: number
@@ -14,6 +14,33 @@ export interface BackendModel {
   is_current: boolean
   created_at: string
   updated_at?: string
+  metrics?: Record<string, unknown>
+  training_metadata?: Record<string, unknown>
+  storage_path?: string
+}
+
+export interface ModelRateLimit {
+  model_code: string
+  enabled: boolean
+  limits: {
+    requests_per_minute: number
+    requests_per_hour: number
+    requests_per_day: number
+    concurrent: number
+    max_tokens_per_request: number
+  }
+  updated_at?: string | null
+}
+
+export interface SecurityReport {
+  scan_id: string
+  model_code: string
+  version: string
+  status: string
+  score?: number
+  summary?: string
+  vulnerabilities: unknown[]
+  scanned_at?: string
 }
 
 export const listModels = (params?: { page?: number; page_size?: number; keyword?: string }) =>
@@ -35,3 +62,31 @@ export const compareModelVersions = async (modelCode: string, v1: string, v2: st
 
 export const getModelDownloadUrl = (modelCode: string, version: string) =>
   `/api/v1/models/${modelCode}/versions/${encodeURIComponent(version)}/download`
+
+export const createModel = async (file: File, metadata: Record<string, unknown>) => {
+  const form = new FormData()
+  form.append('file', file)
+  form.append('metadata', JSON.stringify(metadata))
+  return unwrap(await post<ApiMessage<BackendModel>>('/models', form))
+}
+
+export const importModel = async (payload: Record<string, unknown>) =>
+  unwrap(await post<ApiMessage<BackendModel>>('/models/repository/import', payload))
+
+export const exportModel = async (payload: { model_code: string; version: string; target_path: string }) =>
+  unwrap(await post<ApiMessage<{ exported: number; target_path: string }>>('/models/repository/export', payload))
+
+export const createModelVersion = async (modelCode: string, payload: Record<string, unknown>) =>
+  unwrap(await post<ApiMessage<BackendModel>>(`/models/${modelCode}/versions`, payload))
+
+export const triggerSecurityScan = async (modelCode: string) =>
+  unwrap(await post<ApiMessage<Record<string, unknown>>>(`/models/${modelCode}/security/scan`))
+
+export const getSecurityReports = async (modelCode: string) =>
+  unwrap(await get<ApiMessage<SecurityReport[]>>(`/models/${modelCode}/security/reports`))
+
+export const getModelRateLimit = async (modelCode: string) =>
+  unwrap(await get<ApiMessage<ModelRateLimit>>(`/models/${modelCode}/rate-limit`))
+
+export const updateModelRateLimit = async (modelCode: string, payload: Partial<ModelRateLimit['limits']> & { enabled?: boolean }) =>
+  unwrap(await put<ApiMessage<ModelRateLimit>>(`/models/${modelCode}/rate-limit`, payload))

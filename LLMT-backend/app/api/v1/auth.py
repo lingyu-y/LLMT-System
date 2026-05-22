@@ -1,6 +1,6 @@
 """Auth API endpoints."""
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.core.responses import success_response
@@ -17,27 +17,48 @@ router = APIRouter(prefix="/auth", tags=["认证"])
 
 
 @router.post("/login", response_model=LoginResponse)
-def login(request: LoginRequest, db: Session = Depends(get_db)):
-    return authenticate_user(db, request.username, request.password)
+def login(
+    body: LoginRequest,
+    req: Request,
+    db: Session = Depends(get_db),
+):
+    return authenticate_user(db, body.username, body.password, request=req)
 
 
 @router.post("/register", response_model=LoginResponse, status_code=status.HTTP_201_CREATED)
-def register(request: RegisterRequest, db: Session = Depends(get_db)):
-    if user_repository.get_user_by_username(db, request.username):
+def register(
+    body: RegisterRequest,
+    req: Request,
+    db: Session = Depends(get_db),
+):
+    if user_repository.get_user_by_username(db, body.username):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="用户名已存在")
 
     role = db.query(Role).filter(Role.name == "user").first()
     role_ids = [role.id] if role else []
-    user_repository.create_user(
+    new_user = user_repository.create_user(
         db,
-        username=request.username,
-        password=request.password,
-        real_name=request.realName,
-        email=request.email,
-        phone=request.phone,
+        username=body.username,
+        password=body.password,
+        real_name=body.realName,
+        email=body.email,
+        phone=body.phone,
         role_ids=role_ids,
     )
-    return authenticate_user(db, request.username, request.password)
+
+    # 记录注册日志
+    try:
+        from app.services import log_service
+        log_service.create_log(
+            db, user_id=new_user.id, username=body.username,
+            action="register", resource="auth", resource_id=new_user.id,
+            detail=f"新用户注册: {body.username}",
+            ip_address=req.client.host if req.client else "",
+        )
+    except Exception:
+        pass
+
+    return authenticate_user(db, body.username, body.password, request=req)
 
 
 @router.post("/logout")
