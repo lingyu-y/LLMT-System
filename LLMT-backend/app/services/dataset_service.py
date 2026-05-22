@@ -16,7 +16,7 @@ from app.core.database import get_minio_client
 from app.models.dataset import Dataset
 from app.models.model_version import ModelVersion
 from app.models.training_task import TrainingTask
-from app.repositories import dataset_repository
+from app.repositories import dataset_repository, log_repository
 
 _logger = logging.getLogger(__name__)
 
@@ -397,51 +397,231 @@ def start_preprocess(db: Session, dataset: Dataset) -> dict:
 # ============================================================================
 
 
-def check_quality(db: Session, dataset: Dataset) -> dict:
+def _sample_data_from_minio(dataset: Dataset, max_bytes: int = 1024 * 1024) -> tuple[bytes | None, str]:
+    """Try to read up to *max_bytes* from the first stored object.  Returns (data, error)."""
+    try:
+        settings = get_settings()
+        minio = get_minio_client()
+        bucket = settings.MINIO_BUCKET_DATASETS
+        prefix = dataset.storage_path.rstrip("/") + "/"
+        objects = list(minio.list_objects(bucket, prefix=prefix, recursive=True))
+        files = [o for o in objects if not o.is_dir]
+        if not files:
+            return None, "no objects in storage"
+        obj = files[0]
+        resp = minio.get_object(bucket, obj.object_name)
+        data = resp.read(max_bytes)
+        resp.close()
+        resp.release_conn()
+        return data, ""
+    except Exception as exc:
+        return None, str(exc)
+
+
+def _parse_csv_to_rows(data: bytes) -> list[list[str]]:
+    """Parse CSV bytes into list-of-list-of-strings for analysis."""
+    try:
+        text = data.decode("utf-8", errors="replace")
+        reader = _stdlib_csv.reader(_stdlib_io.StringIO(text))
+        return [row for row in reader]
+    except Exception:
+        return []
+
+
+_TIME_COLUMN_PATTERNS = ["time", "date", "timestamp", "created", "updated", "采集时间", "时间", "日期", "create_time", "update_time", "dt"]
+
+
+def check_quality(
+    db: Session,
+    dataset: Dataset,
+    rules: dict | None = None,
+    skip_reason: str | None = None,
+) -> dict:
+    """Per Table 3: completeness ≤5% missing + dedup, consistency ≥98% + range
+    validation, timeliness ≤7 days + capture-time scan, accuracy ≤1% outliers
+    + rule engine, composite score ≥80 = passed.  Blocks training on critical
+    failures."""
+    rules = rules or {}
     report_id = str(uuid.uuid4())[:12]
     anomalies: list[dict] = []
-    checks_passed = 0
-    checks_total = 3
+    suggestions: list[str] = []
+    scores: dict[str, float] = {}
 
-    # Completeness
+    # ---- Sample data ----
+    sample, sample_err = _sample_data_from_minio(dataset)
+    rows: list[list[str]] = _parse_csv_to_rows(sample) if sample else []
+    total_cells = sum(len(r) for r in rows) if rows else 0
+    has_sample = total_cells > 0
+
+    # ====================================================================
+    # 1. Completeness — 缺失率 ≤5% + 重复值检测
+    # ====================================================================
     completeness = True
-    if not dataset.name or not dataset.data_type:
-        completeness = False
-        anomalies.append({"field": "metadata", "issue": "名称或数据类型缺失"})
-    if not dataset.file_count and not dataset.total_size:
-        completeness = False
-        anomalies.append({"field": "files", "issue": "未关联任何数据文件"})
-    if completeness:
-        checks_passed += 1
+    missing_rate = 0.0
+    dup_count = 0
+    if has_sample:
+        missing = sum(1 for r in rows for c in r if c.strip() == "" or c.upper() == "NULL")
+        missing_rate = (missing / total_cells * 100) if total_cells else 0
+        # duplicate detection
+        tuple_rows = [tuple(r) for r in rows]
+        dup_count = len(tuple_rows) - len(set(tuple_rows))
+        completeness = missing_rate <= 5
+        if dup_count > 0:
+            anomalies.append({"field": "duplicates", "issue": f"发现 {dup_count} 行重复数据"})
+            suggestions.append(f"移除 {dup_count} 行重复数据或标记为去重处理")
+    else:
+        completeness = bool(dataset.name and dataset.data_type and (dataset.file_count or dataset.total_size))
+        if not completeness:
+            anomalies.append({"field": "metadata", "issue": "名称、类型或数据文件缺失"})
+    scores["completeness"] = 100.0 if completeness else max(0, 100 - missing_rate * 20 - dup_count * 0.1)
+    if not completeness:
+        anomalies.append({"field": "completeness", "issue": f"缺失率 {missing_rate:.1f}% > 5%"})
+        suggestions.append("补充缺失字段或删除空值行")
 
-    # Consistency
+    # ====================================================================
+    # 2. Consistency — 格式一致率 ≥98% + 取值范围校验
+    # ====================================================================
     consistency = True
-    if dataset.storage_path and dataset.data_type:
-        path_type = _detect_data_type(dataset.storage_path)
-        if path_type != "other" and dataset.data_type != path_type:
-            consistency = False
-            anomalies.append({
-                "field": "data_type",
-                "issue": f"标记类型 {dataset.data_type} 与存储路径类型 {path_type} 不一致",
-            })
-    if consistency:
-        checks_passed += 1
+    fmt_rate = 100.0
+    range_violations = 0
+    if has_sample and len(rows) > 1:
+        header = rows[0]
+        header_len = len(header)
+        consistent_rows = sum(1 for r in rows[1:] if len(r) == header_len)
+        fmt_rate = (consistent_rows / (len(rows) - 1) * 100) if len(rows) > 1 else 100
+        consistency = fmt_rate >= 98
+        # range validation via rules dict
+        for ci, col_name in enumerate(header):
+            col_rules = rules.get(col_name, {})
+            lo = col_rules.get("min")
+            hi = col_rules.get("max")
+            allowed = col_rules.get("allowed")
+            if lo is not None or hi is not None:
+                for r in rows[1:]:
+                    try:
+                        v = float(r[ci]) if ci < len(r) else None
+                        if v is not None:
+                            if lo is not None and v < lo:
+                                range_violations += 1
+                            if hi is not None and v > hi:
+                                range_violations += 1
+                    except (ValueError, IndexError):
+                        pass
+            if allowed:
+                for r in rows[1:]:
+                    cell = r[ci].strip() if ci < len(r) else ""
+                    if cell and cell not in allowed:
+                        range_violations += 1
+        if range_violations > 0:
+            anomalies.append({"field": "range_validation", "issue": f"{range_violations} 个值超出取值范围"})
+    if not consistency:
+        anomalies.append({"field": "consistency", "issue": f"格式一致率 {fmt_rate:.1f}% < 98%"})
+        suggestions.append("统一列数或修复格式异常行")
+    scores["consistency"] = max(0, fmt_rate - range_violations * 0.1)
 
-    # Timeliness
+    # ====================================================================
+    # 3. Timeliness — ≤7 days + 采集时间列扫描
+    # ====================================================================
     timeliness = True
+    age_days = 0
+    capture_age_days = 0
     if dataset.updated_at:
         updated = dataset.updated_at
         if updated.tzinfo is None:
             updated = updated.replace(tzinfo=timezone.utc)
         age_days = (datetime.now(timezone.utc) - updated).days
-        if age_days > 30:
-            timeliness = False
-            anomalies.append({"field": "updated_at", "issue": f"数据已 {age_days} 天未更新"})
-    if timeliness:
-        checks_passed += 1
+        timeliness = age_days <= 7
+    # scan for capture-time columns in the data
+    if has_sample and len(rows) > 1:
+        header = [c.lower() for c in rows[0]]
+        for ptn in _TIME_COLUMN_PATTERNS:
+            if ptn in header:
+                ci = header.index(ptn)
+                try:
+                    # try to parse the first data row's time column
+                    cell = rows[1][ci] if ci < len(rows[1]) else ""
+                    for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"]:
+                        try:
+                            cell_time = datetime.strptime(cell.strip()[:19], fmt)
+                            cell_time = cell_time.replace(tzinfo=timezone.utc)
+                            capture_age_days = (datetime.now(timezone.utc) - cell_time).days
+                            break
+                        except (ValueError, IndexError):
+                            pass
+                except Exception:
+                    pass
+                break
+    if capture_age_days > 7:
+        anomalies.append({"field": "capture_time", "issue": f"采集时间列已 {capture_age_days} 天（>7 天）"})
+    scores["timeliness"] = 100.0 if timeliness and capture_age_days <= 7 else max(0, 100 - max(age_days, capture_age_days) * 5)
+    if not timeliness:
+        anomalies.append({"field": "timeliness", "issue": f"数据已 {age_days} 天未更新（>7 天）"})
+        suggestions.append("重新采集或刷新数据")
 
-    overall_score = round((checks_passed / checks_total) * 100, 1)
-    new_status = "passed" if overall_score >= 66.7 else "failed"
+    # ====================================================================
+    # 4. Accuracy — 异常值比例 ≤1% + 规则引擎
+    # ====================================================================
+    accuracy = True
+    outlier_rate = 0.0
+    rule_violations = 0
+    if has_sample and len(rows) > 1:
+        numeric_cols: list[list[float]] = []
+        for ci in range(len(rows[0])):
+            vals = []
+            for r in rows[1:]:
+                try:
+                    vals.append(float(r[ci]) if ci < len(r) else float("nan"))
+                except ValueError:
+                    pass
+            if len(vals) >= 10:
+                numeric_cols.append(vals)
+        if numeric_cols:
+            total_numeric = sum(len(v) for v in numeric_cols)
+            outlier_count = 0
+            for col in numeric_cols:
+                n = len(col)
+                mean = sum(col) / n
+                std = (sum((x - mean) ** 2 for x in col) / n) ** 0.5
+                if std > 0:
+                    outlier_count += sum(1 for x in col if abs(x - mean) > 3 * std)
+            outlier_rate = (outlier_count / total_numeric * 100) if total_numeric else 0
+            accuracy = outlier_rate <= 1
+        # rule engine: per-column custom checks
+        for ci, col_name in enumerate(rows[0]):
+            col_rules = rules.get(col_name, {})
+            pattern = col_rules.get("pattern")  # regex
+            eq_val = col_rules.get("eq")        # exact match
+            if pattern:
+                import re as _regex
+                rx = _regex.compile(pattern)
+                for r in rows[1:]:
+                    cell = r[ci] if ci < len(r) else ""
+                    if cell and not rx.match(cell):
+                        rule_violations += 1
+            if eq_val is not None:
+                for r in rows[1:]:
+                    cell = r[ci] if ci < len(r) else ""
+                    if cell and cell != str(eq_val):
+                        rule_violations += 1
+        if rule_violations > 0:
+            anomalies.append({"field": "rule_engine", "issue": f"{rule_violations} 个值违反自定义规则"})
+    scores["accuracy"] = 100.0 if accuracy else max(0, 100 - outlier_rate * 10 - rule_violations * 0.5)
+    if not accuracy:
+        anomalies.append({"field": "accuracy", "issue": f"异常值比例 {outlier_rate:.1f}% > 1%"})
+        suggestions.append("检查并修正异常数据点")
+
+    # ====================================================================
+    # Composite score
+    # ====================================================================
+    weights = {"completeness": 0.30, "consistency": 0.25, "timeliness": 0.20, "accuracy": 0.25}
+    overall_score = round(sum(scores.get(k, 100) * weights.get(k, 0) for k in weights), 1)
+    passed = overall_score >= 80
+    alerted = overall_score < 60
+    blocked_for_training = not passed and any(
+        a.get("field") in ("completeness", "accuracy") for a in anomalies
+    )
+    new_status = "passed" if passed else "failed"
+
     dataset_repository.update_dataset(db, dataset, quality_status=new_status)
 
     return {
@@ -449,10 +629,27 @@ def check_quality(db: Session, dataset: Dataset) -> dict:
         "dataset_id": dataset.id,
         "dataset_name": dataset.name,
         "overall_score": overall_score,
+        "passed": passed,
+        "alerted": alerted,
+        "blocked_for_training": blocked_for_training,
         "completeness": completeness,
         "consistency": consistency,
         "timeliness": timeliness,
+        "accuracy": accuracy,
+        "duplicate_rows": dup_count,
+        "range_violations": range_violations,
+        "rule_violations": rule_violations,
+        "missing_rate_pct": round(missing_rate, 2),
+        "format_rate_pct": round(fmt_rate, 2),
+        "data_age_days": age_days,
+        "capture_age_days": capture_age_days,
+        "outlier_rate_pct": round(outlier_rate, 2),
+        "sample_rows": len(rows),
+        "sample_cells": total_cells,
+        "scores_detail": scores,
         "anomalies": anomalies,
+        "suggestions": suggestions,
+        "skip_reason": skip_reason,
         "checked_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -502,27 +699,30 @@ def repair_quality(db: Session, dataset: Dataset) -> dict:
 
 
 def get_lineage(db: Session, dataset: Dataset) -> dict:
-    """Build the complete data lineage per requirement spec Table 4.
+    """Full lineage per Table 4 — origin, transforms, downstream, graph, risk,
+    version history, quality trace, auto-analysis.  Errors are swallowed so
+    lineage queries never block the main flow."""
 
-    Requirement 1 — 数据加载时：记录来源（上传者、时间、原始位置）
-    Requirement 2 — 数据转换时：记录转换规则、转换时间、前后版本
-    Requirement 3 — 数据使用时：记录使用场景（训练任务ID）、使用时间、使用结果
-    Requirements 6 & 7 — 完整血缘链路 + 影响分析
-    """
+    # ---- 前提条件 1: 数据已使用校验 ----
+    task_count = (
+        db.query(TrainingTask).filter(TrainingTask.dataset_id == dataset.id).count()
+    )
+    data_used = task_count > 0 or dataset.lineage_status == "tracked"
 
-    # ---- Requirement 1: 数据加载来源 ----
-    origin = {
-        "uploaded_by": dataset.owner.username if dataset.owner else None,
-        "uploaded_at": dataset.created_at.isoformat() if dataset.created_at else None,
-        "original_source": dataset.source,
-        "data_type": dataset.data_type,
-        "initial_version": dataset.version,
-    }
+    # ---- R1: 来源 ----
+    try:
+        origin = {
+            "uploaded_by": dataset.owner.username if dataset.owner else None,
+            "uploaded_at": dataset.created_at.isoformat() if dataset.created_at else None,
+            "original_source": dataset.source,
+            "data_type": dataset.data_type,
+            "initial_version": dataset.version,
+        }
+    except Exception:
+        origin = {"original_source": dataset.source}
 
-    # ---- Requirement 2: 数据转换过程 ----
+    # ---- R2: 转换过程 ----
     transformations: list[dict] = []
-
-    # 文件加载
     if dataset.file_count and dataset.file_count > 0:
         transformations.append({
             "rule": "data_loaded",
@@ -531,8 +731,6 @@ def get_lineage(db: Session, dataset: Dataset) -> dict:
             "version_before": None,
             "version_after": dataset.version,
         })
-
-    # 质量校验
     if dataset.quality_status in ("checking", "passed", "failed"):
         transformations.append({
             "rule": "quality_validated",
@@ -542,15 +740,10 @@ def get_lineage(db: Session, dataset: Dataset) -> dict:
             "version_after": dataset.version,
         })
 
-    # ---- Requirement 3: 数据使用（下游消费）----
+    # ---- R3: 下游消费 ----
     downstream: list[dict] = []
-    tasks = (
-        db.query(TrainingTask)
-        .filter(TrainingTask.dataset_id == dataset.id)
-        .all()
-    )
+    tasks = db.query(TrainingTask).filter(TrainingTask.dataset_id == dataset.id).all()
     for t in tasks:
-        # 训练任务使用记录
         usage = {
             "type": "training_task",
             "task_id": t.task_code,
@@ -561,13 +754,7 @@ def get_lineage(db: Session, dataset: Dataset) -> dict:
             "progress": f"epoch {t.current_epoch}/{t.max_epoch}",
         }
         downstream.append(usage)
-
-        # 模型产出
-        models = (
-            db.query(ModelVersion)
-            .filter(ModelVersion.task_id == t.id)
-            .all()
-        )
+        models = db.query(ModelVersion).filter(ModelVersion.task_id == t.id).all()
         for m in models:
             metrics = m.metrics_json or {}
             downstream.append({
@@ -580,70 +767,151 @@ def get_lineage(db: Session, dataset: Dataset) -> dict:
                 "f1": metrics.get("f1"),
             })
 
-    # ---- Requirement 6: 完整链路 ----
+    # ---- R4: 自动依赖分析 ----
+    auto_analysis: dict = {"layers": 0, "total_nodes": 0, "total_edges": 0}
+    try:
+        layer1 = 1  # dataset itself
+        layer2 = len([d for d in downstream if d["type"] == "training_task"])
+        layer3 = len([d for d in downstream if d["type"] == "model_version"])
+        auto_analysis = {
+            "layers": 1 + bool(layer2) + bool(layer3),
+            "level1_dataset": layer1,
+            "level2_training_tasks": layer2,
+            "level3_model_versions": layer3,
+            "total_nodes": layer1 + layer2 + layer3,
+            "total_edges": layer2 + layer3,
+        }
+    except Exception:
+        pass
+
+    # ---- R5: 血缘图谱（nodes + edges） ----
+    graph: dict = {"nodes": [], "edges": []}
+    try:
+        ds_node_id = f"dataset-{dataset.id}"
+        graph["nodes"].append({"id": ds_node_id, "label": dataset.name, "type": "dataset"})
+        for d in downstream:
+            if d["type"] == "training_task":
+                tid = f"task-{d['task_id']}"
+                graph["nodes"].append({"id": tid, "label": d["task_name"], "type": "task"})
+                graph["edges"].append({"from": ds_node_id, "to": tid, "label": "consumes"})
+            elif d["type"] == "model_version":
+                mid = f"model-{d['model_code']}"
+                graph["nodes"].append({"id": mid, "label": f'{d["model_code"]}:{d["version"]}', "type": "model"})
+                if graph["nodes"]:
+                    last_task = [n for n in graph["nodes"] if n["type"] == "task"]
+                    if last_task:
+                        graph["edges"].append({"from": last_task[-1]["id"], "to": mid, "label": "produces"})
+    except Exception:
+        graph = {"error": "图谱生成失败，请手动检查数据依赖关系", "nodes": [], "edges": []}
+
+    # ---- 其他事件流 1: 质量问题溯源 ----
+    quality_trace: dict | None = None
+    if dataset.quality_status in ("failed", "checking"):
+        quality_trace = {
+            "quality_status": dataset.quality_status,
+            "root_cause_hint": "质量校验未通过，请查看质量报告中的 anomalies 字段定位问题源头",
+            "quality_endpoint": f"/api/v1/datasets/{dataset.id}/quality",
+        }
+
+    # ---- 其他事件流 2: 版本历史 ----
+    version_history: list[dict] = []
+    try:
+        from app.models.system_log import SystemLog
+        logs = (
+            db.query(SystemLog)
+            .filter(SystemLog.resource == "dataset", SystemLog.resource_id == dataset.id)
+            .filter(SystemLog.action.in_(["create", "update", "quality_check", "quality_repair"]))
+            .order_by(SystemLog.created_at.desc())
+            .limit(10)
+            .all()
+        )
+        for lg in logs:
+            version_history.append({
+                "action": lg.action,
+                "detail": lg.detail,
+                "timestamp": lg.created_at.isoformat() if lg.created_at else None,
+            })
+    except Exception:
+        pass
+
+    # ---- 其他事件流 3: 多任务使用风险提示 ----
+    risk_warning: dict | None = None
+    task_count = len([d for d in downstream if d["type"] == "training_task"])
+    if task_count > 1:
+        risk_warning = {
+            "level": "warning",
+            "message": f"该数据集被 {task_count} 个训练任务使用，变更前请评估影响范围",
+            "affected_task_count": task_count,
+            "recommendation": "建议先运行影响分析（/lineage/impact）后再变更",
+        }
+
+    # ---- Business rule 3: 记录血缘查询到永久审计日志 ----
+    try:
+        log_repository.create_log(
+            db, user_id=dataset.owner_id, username=dataset.owner.username if dataset.owner else "system",
+            action="lineage_queried", resource="dataset", resource_id=dataset.id,
+            detail=f"查询血缘链：{dataset.name}",
+        )
+    except Exception:
+        pass  # 血缘查询失败不影响主流程
+
     return {
         "dataset_id": dataset.id,
         "dataset_name": dataset.name,
         "current_version": dataset.version,
         "lineage_status": dataset.lineage_status or "tracked",
-
-        # R1
+        "data_used": data_used,
         "origin": origin,
-
-        # R2
         "transformations": transformations,
-
-        # R3 + R6
         "downstream": downstream,
-
-        # R7 影响分析（也在 impact 端点中）
+        "auto_analysis": auto_analysis,
+        "graph": graph,
+        "quality_trace": quality_trace,
+        "version_history": version_history,
+        "risk_warning": risk_warning,
         "affected_summary": {
-            "training_tasks": len([d for d in downstream if d["type"] == "training_task"]),
+            "training_tasks": task_count,
             "model_versions": len([d for d in downstream if d["type"] == "model_version"]),
         },
     }
 
 
 def get_lineage_impact(db: Session, dataset: Dataset) -> dict:
-    """Analyse impact: which downstream artifacts would be affected if this
-    dataset changes.  Queries the real FK graph dataset → task → model."""
-    # Tasks directly using this dataset
-    tasks = (
-        db.query(TrainingTask)
-        .filter(TrainingTask.dataset_id == dataset.id)
-        .all()
-    )
+    """Analyse impact per Table 4 R7: affected tasks, models, and datasets."""
+    tasks = db.query(TrainingTask).filter(TrainingTask.dataset_id == dataset.id).all()
     affected_tasks = [t.task_code for t in tasks]
-
-    # Models produced by those tasks
     task_ids = [t.id for t in tasks]
     models: list[ModelVersion] = []
     if task_ids:
-        models = (
-            db.query(ModelVersion)
-            .filter(ModelVersion.task_id.in_(task_ids))
-            .all()
-        )
+        models = db.query(ModelVersion).filter(ModelVersion.task_id.in_(task_ids)).all()
     affected_models = [f"{m.model_code}:{m.version}" for m in models]
-
-    # Datasets that reference this dataset's version string
     siblings = (
-        db.query(Dataset)
-        .filter(Dataset.id != dataset.id)
-        .filter(
-            (Dataset.source == dataset.source)
-            | (Dataset.version == dataset.version)
-        )
-        .limit(20)
-        .all()
+        db.query(Dataset).filter(Dataset.id != dataset.id)
+        .filter((Dataset.source == dataset.source) | (Dataset.version == dataset.version))
+        .limit(20).all()
     )
     affected_datasets = [d.name for d in siblings]
+    task_count = len(affected_tasks)
+    risk = None
+    if task_count > 1:
+        risk = {"level": "warning", "message": f"变更将影响 {task_count} 个训练任务", "affected_task_count": task_count}
+
+    # 记录影响分析查询
+    try:
+        log_repository.create_log(
+            db, user_id=dataset.owner_id, username=dataset.owner.username if dataset.owner else "system",
+            action="impact_analysis", resource="dataset", resource_id=dataset.id,
+            detail=f"影响分析：tasks={task_count}, models={len(affected_models)}",
+        )
+    except Exception:
+        pass
 
     return {
         "dataset_id": dataset.id,
         "affected_models": affected_models,
         "affected_tasks": affected_tasks,
         "affected_datasets": affected_datasets,
+        "risk": risk,
     }
 
 
