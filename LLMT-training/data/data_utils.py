@@ -35,6 +35,11 @@ def build_dataloaders(
 
     # Split dataset
     total = len(dataset)
+    if total == 0:
+        raise ValueError(
+            "数据集为空（0 个样本），请检查 dataset_path 是否正确指向一个有效的数据文件。"
+            "如果数据存储在 MinIO，系统会自动下载；如果路径不存在，将导致空数据集。"
+        )
     train_size = int(total * train_split)
     eval_size = total - train_size
 

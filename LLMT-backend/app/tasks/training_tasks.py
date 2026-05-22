@@ -111,7 +111,11 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
             from app.models.dataset import Dataset
             dataset = db.query(Dataset).filter(Dataset.id == task.dataset_id).first()
             if dataset:
-                config_json["dataset_path"] = dataset.storage_path
+                local_path = _resolve_dataset_path(dataset)
+                if local_path:
+                    config_json["dataset_path"] = local_path
+                else:
+                    config_json["dataset_path"] = dataset.storage_path
                 config_json["dataset_format"] = config_json.get("dataset_format") or dataset.data_type
 
     # --- 2. Build full training config ---
@@ -285,6 +289,94 @@ class _CancellationCheckCallback:
 
     def on_error(self, state, **kwargs):
         pass
+
+
+def _resolve_dataset_path(ds) -> str | None:
+    """Return a local file path for the dataset, downloading from MinIO if needed.
+
+    Tries:
+      1. Local filesystem (storage_path exists as-is)
+      2. MinIO download to temp dir, then find the data file
+
+    Returns the path to a data file, or None.
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    storage_path = ds.storage_path or ""
+
+    # 1. Try local filesystem directly
+    if os.path.exists(storage_path):
+        if os.path.isfile(storage_path):
+            return storage_path
+        # It's a directory – look for a data file inside
+        for fname in os.listdir(storage_path):
+            if fname.endswith((".jsonl", ".npy", ".bin", ".txt", ".json", ".csv")):
+                return os.path.join(storage_path, fname)
+        # If directory has subdirectories, search deeper
+        for root, _, files in os.walk(storage_path):
+            for fname in files:
+                if fname.endswith((".jsonl", ".npy", ".bin", ".txt", ".json", ".csv")):
+                    return os.path.join(root, fname)
+
+    # 2. Try MinIO download
+    local_dir = _download_dataset_from_minio(storage_path)
+    if local_dir is not None:
+        for fname in os.listdir(local_dir):
+            if fname.endswith((".jsonl", ".npy", ".bin", ".txt", ".json", ".csv")):
+                return os.path.join(local_dir, fname)
+        for root, _, files in os.walk(local_dir):
+            for fname in files:
+                if fname.endswith((".jsonl", ".npy", ".bin", ".txt", ".json", ".csv")):
+                    return os.path.join(root, fname)
+
+    return None
+
+
+def _download_dataset_from_minio(
+    storage_path: str,
+    bucket: str | None = None,
+) -> str | None:
+    """Download all files under *storage_path* from MinIO to a local temp dir.
+
+    Returns the local directory path, or None if MinIO is unavailable.
+    """
+    import logging
+    import tempfile
+    logger = logging.getLogger(__name__)
+
+    try:
+        from app.core.database import get_minio_client
+
+        minio = get_minio_client()
+        bucket_name = bucket or settings.MINIO_BUCKET_DATASETS
+
+        # Ensure the prefix has no leading slash for MinIO listing
+        prefix = storage_path.lstrip("/")
+
+        objects = list(minio.list_objects(bucket_name, prefix=prefix, recursive=True))
+        files = [o for o in objects if not o.is_dir]
+        if not files:
+            logger.warning("No files found in MinIO at %s/%s", bucket_name, prefix)
+            return None
+
+        local_dir = tempfile.mkdtemp(prefix="train_dataset_")
+        for obj in files:
+            rel_path = obj.object_name
+            if rel_path.startswith(prefix):
+                rel_path = rel_path[len(prefix):]
+            rel_path = rel_path.lstrip("/")
+
+            local_path = os.path.join(local_dir, rel_path)
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+
+            minio.fget_object(bucket_name, obj.object_name, local_path)
+            logger.debug("Downloaded %s -> %s", obj.object_name, local_path)
+
+        logger.info("Downloaded %d files from MinIO to %s", len(files), local_dir)
+        return local_dir
+    except Exception as exc:
+        logger.warning("Failed to download dataset from MinIO: %s", exc)
+        return None
 
 
 def _build_training_config(
