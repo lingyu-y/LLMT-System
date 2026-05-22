@@ -14,6 +14,36 @@ from app.core.config import get_settings
 settings = get_settings()
 
 
+def _ensure_llmt_training_on_path() -> None:
+    """Add LLMT-training to sys.path if the package is not installed."""
+    try:
+        import llmt_training  # noqa: F401
+        return
+    except ImportError:
+        pass
+
+    module_path = settings.LLMT_TRAINING_MODULE_PATH
+    # If it's a filesystem path, add its parent so "from llmt_training.xxx" works
+    if os.path.isdir(module_path):
+        sys.path.insert(0, os.path.dirname(module_path))
+        return
+
+    # Derive from repo layout: LLMT-training is a sibling of LLMT-backend
+    repo_root = os.path.dirname(
+        os.path.dirname(
+            os.path.dirname(
+                os.path.dirname(os.path.abspath(__file__))
+            )
+        )
+    )
+    candidate = os.path.join(repo_root, "LLMT-training")
+    if os.path.isdir(candidate):
+        sys.path.insert(0, repo_root)
+
+
+_ensure_llmt_training_on_path()
+
+
 @celery_app.task(
     name="run_training_task",
     bind=True,

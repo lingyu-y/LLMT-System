@@ -12,8 +12,39 @@ import torch
 from torch.utils.data import DataLoader
 
 from app.core.celery_app import celery_app
+from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
+settings = get_settings()
+
+
+def _ensure_llmt_training_on_path() -> None:
+    """Add LLMT-training to sys.path if the package is not installed."""
+    try:
+        import llmt_training  # noqa: F401
+        return
+    except ImportError:
+        pass
+
+    import sys
+    module_path = settings.LLMT_TRAINING_MODULE_PATH
+    if os.path.isdir(module_path):
+        sys.path.insert(0, os.path.dirname(module_path))
+        return
+
+    repo_root = os.path.dirname(
+        os.path.dirname(
+            os.path.dirname(
+                os.path.dirname(os.path.abspath(__file__))
+            )
+        )
+    )
+    candidate = os.path.join(repo_root, "LLMT-training")
+    if os.path.isdir(candidate):
+        sys.path.insert(0, repo_root)
+
+
+_ensure_llmt_training_on_path()
 
 
 # ---------------------------------------------------------------------------
