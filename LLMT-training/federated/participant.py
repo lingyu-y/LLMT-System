@@ -184,6 +184,7 @@ class FederatedParticipant:
                 total_steps += 1
 
             avg_epoch_loss = epoch_loss / max(epoch_steps, 1)
+            total_loss += epoch_loss
             logger.info(
                 "Participant %s, Round %d, Local Epoch %d/%d, Loss: %.4f",
                 self.participant_id, round_num, epoch + 1, local_epochs, avg_epoch_loss,

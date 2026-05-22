@@ -39,24 +39,30 @@ def run_federated_task(self, task_code: str) -> dict:
         db.commit()
 
         # Import training framework
-        from llmt_training.federated.config import FederatedConfig
+        from llmt_training.federated.config import FederatedConfig, ParticipantConfig
         from llmt_training.federated.coordinator import FederatedCoordinator
         from llmt_training.federated.participant import FederatedParticipant
-        from llmt_training.models.registry import get_model_provider
+        from llmt_training.models.registry import ModelRegistry
 
         # Build config
         config = FederatedConfig(**task.config_json)
 
-        # Build global model
-        provider = get_model_provider(config.model_type)
+        # Build global model & tokenizer
+        provider = ModelRegistry.get(config.model_type)
         model = provider.get_model(config.get_model_config_dict())
+        tokenizer = provider.get_tokenizer(config.get_model_config_dict())
 
         # Build coordinator
         coordinator = FederatedCoordinator(config=config, model=model)
 
+        # Load dataset for participants
+        from app.models.dataset import Dataset as DatasetModel
+        from llmt_training.data.finetune_dataset import FinetuneDataset
+        from torch.utils.data import DataLoader
+
         # Add participants
         for p in task.participants:
-            p_config = config.participants[0].__class__(
+            p_config = ParticipantConfig(
                 participant_id=p.participant_id,
                 name=p.name,
                 weight=p.weight,
@@ -66,10 +72,70 @@ def run_federated_task(self, task_code: str) -> dict:
                 local_learning_rate=p.local_learning_rate,
                 status=p.status,
             )
+
+            # Build data loader for this participant
+            train_dataloader: DataLoader | None = None
+            if p.dataset_id is not None:
+                ds = db.query(DatasetModel).filter(DatasetModel.id == p.dataset_id).first()
+                if ds is not None:
+                    import os
+                    storage_path = ds.storage_path
+                    if os.path.exists(storage_path):
+                        finetune_ds = FinetuneDataset.from_config({
+                            "data": {"dataset_path": storage_path},
+                            "model": {"seq_length": config.seq_length},
+                        })
+                        # If a tokenizer is available, attach it
+                        if tokenizer is not None:
+                            finetune_ds.tokenizer = tokenizer
+                        train_dataloader = DataLoader(
+                            finetune_ds,
+                            batch_size=p.local_batch_size,
+                            shuffle=True,
+                            num_workers=0,
+                            drop_last=False,
+                        )
+                        logger.info(
+                            "Participant %s: loaded dataset '%s' (%d samples)",
+                            p.participant_id, ds.name, len(finetune_ds),
+                        )
+                    else:
+                        logger.warning(
+                            "Participant %s: dataset path '%s' does not exist",
+                            p.participant_id, storage_path,
+                        )
+
+            if train_dataloader is None:
+                logger.warning(
+                    "Participant %s: no dataset available (dataset_id=%s), "
+                    "will use synthetic data",
+                    p.participant_id, p.dataset_id,
+                )
+                # Generate synthetic data so the participant can still train
+                import torch
+                n_samples = max(p.data_size, 100)
+                synthetic_samples = [
+                    {"text": f"federated training sample {i} for participant {p.participant_id}"}
+                    for i in range(n_samples)
+                ]
+                synth_ds = FinetuneDataset(
+                    samples=synthetic_samples,
+                    seq_length=config.seq_length,
+                    tokenizer=tokenizer,
+                )
+                train_dataloader = DataLoader(
+                    synth_ds,
+                    batch_size=p.local_batch_size,
+                    shuffle=True,
+                    num_workers=0,
+                    drop_last=False,
+                )
+
             participant = FederatedParticipant(
                 config=config,
                 participant_config=p_config,
                 model=provider.get_model(config.get_model_config_dict()),
+                train_dataloader=train_dataloader,
                 loss_fn=provider.get_loss_fn(config.get_model_config_dict()),
                 shared_memory=coordinator.shared_memory,
             )
