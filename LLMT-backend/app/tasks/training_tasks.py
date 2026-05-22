@@ -106,6 +106,14 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
         framework = task.framework or "deepspeed"
         parallel_strategy = task.parallel_strategy or "zero2"
 
+        # Resolve dataset_path from dataset_id if not already set
+        if not config_json.get("dataset_path") and task.dataset_id:
+            from app.models.dataset import Dataset
+            dataset = db.query(Dataset).filter(Dataset.id == task.dataset_id).first()
+            if dataset:
+                config_json["dataset_path"] = dataset.storage_path
+                config_json["dataset_format"] = config_json.get("dataset_format") or dataset.data_type
+
     # --- 2. Build full training config ---
     from llmt_training.config.schema import TrainingConfig
 
@@ -328,6 +336,8 @@ def _build_training_config(
     }
 
     for key, value in config_json.items():
+        if value is None:
+            continue  # skip None values so Pydantic defaults are used
         if key in model_keys:
             config["model"][key] = value
         elif key in data_keys:
