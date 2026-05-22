@@ -431,6 +431,131 @@ def _parse_csv_to_rows(data: bytes) -> list[list[str]]:
 _TIME_COLUMN_PATTERNS = ["time", "date", "timestamp", "created", "updated", "采集时间", "时间", "日期", "create_time", "update_time", "dt"]
 
 
+def _ge_validate(sample_data: bytes, dataset: Dataset, rules: dict) -> dict | None:
+    """Produce Great Expectations-compatible validation result.
+
+    Uses the same validation logic as check_quality() but outputs the
+    structured format that GE produces: statistics dict + per-expectation
+    result entries.  Integrates with the existing pandas/numpy stack (no
+    external GE runtime dependency required at the API level).
+    """
+    try:
+        import pandas as pd
+        import numpy as _np
+    except ImportError:
+        return None
+
+    text = sample_data.decode("utf-8", errors="replace")
+    if not text.strip():
+        return None
+
+    if "," in text[:200] or "\t" in text[:200]:
+        df = pd.read_csv(_stdlib_io.StringIO(text), nrows=500)
+    else:
+        lines = [l for l in text.split("\n") if l.strip()]
+        df = pd.DataFrame({"line": lines[:500]})
+
+    if df.empty:
+        return None
+
+    results = []
+    stats = {"evaluated_expectations": 0, "successful_expectations": 0, "unsuccessful_expectations": 0}
+
+    for col in df.columns:
+        # expect_column_values_to_not_be_null
+        total = int(len(df))
+        if total > 0:
+            non_null = int((df[col].notna() & (df[col].astype(str).str.strip() != "")).sum())
+            passed = bool((non_null / total) >= 0.95)
+            stats["evaluated_expectations"] += 1
+            if passed:
+                stats["successful_expectations"] += 1
+            else:
+                stats["unsuccessful_expectations"] += 1
+            results.append({
+                "success": bool(passed),
+                "expectation_config": {
+                    "expectation_type": "expect_column_values_to_not_be_null",
+                    "kwargs": {"column": str(col), "mostly": 0.95},
+                },
+                "result": {"element_count": total, "unexpected_count": total - non_null,
+                           "unexpected_percent": float(round((total - non_null) / total * 100, 2))},
+            })
+
+        # expect_column_values_to_be_between (numeric only)
+        if pd.api.types.is_numeric_dtype(df[col]):
+            lo = float(rules.get(str(col), {}).get("min", -1e9)) if rules.get(str(col), {}).get("min") is not None else -1e9
+            hi = float(rules.get(str(col), {}).get("max", 1e9)) if rules.get(str(col), {}).get("max") is not None else 1e9
+            vals = df[col].dropna()
+            n = int(len(vals))
+            if n > 0:
+                in_range = int(((vals.astype(float) >= lo) & (vals.astype(float) <= hi)).sum())
+                passed = bool((in_range / n) >= 0.99)
+                stats["evaluated_expectations"] += 1
+                if passed:
+                    stats["successful_expectations"] += 1
+                else:
+                    stats["unsuccessful_expectations"] += 1
+                results.append({
+                    "success": bool(passed),
+                    "expectation_config": {
+                        "expectation_type": "expect_column_values_to_be_between",
+                        "kwargs": {"column": str(col), "min_value": lo, "max_value": hi, "mostly": 0.99},
+                    },
+                    "result": {"element_count": n, "unexpected_count": n - in_range,
+                               "unexpected_percent": float(round((n - in_range) / n * 100, 2))},
+                })
+
+        # expect_column_values_to_be_in_set (if rules specify "allowed")
+        allowed = (rules or {}).get(str(col), {}).get("allowed")
+        if allowed and isinstance(allowed, list):
+            allowed_set = {str(a) for a in allowed}
+            vals = df[col].dropna().astype(str)
+            n = int(len(vals))
+            if n > 0:
+                in_set = int(vals.isin(allowed_set).sum())
+                passed = bool(in_set == n)
+                stats["evaluated_expectations"] += 1
+                if passed:
+                    stats["successful_expectations"] += 1
+                else:
+                    stats["unsuccessful_expectations"] += 1
+                results.append({
+                    "success": bool(passed),
+                    "expectation_config": {
+                        "expectation_type": "expect_column_values_to_be_in_set",
+                        "kwargs": {"column": str(col), "value_set": sorted(allowed_set)},
+                    },
+                    "result": {"element_count": n, "unexpected_count": n - in_set,
+                               "unexpected_percent": float(round((n - in_set) / n * 100, 2))},
+                })
+
+    if stats["evaluated_expectations"] == 0:
+        return None
+
+    stats["success_percent"] = float(
+        round(stats["successful_expectations"] / max(stats["evaluated_expectations"], 1) * 100, 1)
+    )
+
+    return {
+        "framework": "Great Expectations 1.17 (compatible output)",
+        "success": bool(stats["unsuccessful_expectations"] == 0),
+        "statistics": {
+            "evaluated_expectations": int(stats["evaluated_expectations"]),
+            "successful_expectations": int(stats["successful_expectations"]),
+            "unsuccessful_expectations": int(stats["unsuccessful_expectations"]),
+            "success_percent": float(stats["success_percent"]),
+        },
+        "results": results,
+        "meta": {
+            "batch_kwargs": {"dataset": dataset.name},
+            "batch_markers": {"dataset_id": dataset.id},
+            "batch_parameters": {},
+            "checkpoint_name": f"quality_check_{dataset.id}",
+        },
+    }
+
+
 def check_quality(
     db: Session,
     dataset: Dataset,
@@ -473,7 +598,10 @@ def check_quality(
         completeness = bool(dataset.name and dataset.data_type and (dataset.file_count or dataset.total_size))
         if not completeness:
             anomalies.append({"field": "metadata", "issue": "名称、类型或数据文件缺失"})
-    scores["completeness"] = 100.0 if completeness else max(0, 100 - missing_rate * 20 - dup_count * 0.1)
+    if not completeness:
+        scores["completeness"] = 0.0 if not has_sample else max(0, 100 - missing_rate * 20 - dup_count * 0.1)
+    else:
+        scores["completeness"] = 100.0
     if not completeness:
         anomalies.append({"field": "completeness", "issue": f"缺失率 {missing_rate:.1f}% > 5%"})
         suggestions.append("补充缺失字段或删除空值行")
@@ -605,6 +733,7 @@ def check_quality(
                         rule_violations += 1
         if rule_violations > 0:
             anomalies.append({"field": "rule_engine", "issue": f"{rule_violations} 个值违反自定义规则"})
+    accuracy = accuracy and rule_violations == 0
     scores["accuracy"] = 100.0 if accuracy else max(0, 100 - outlier_rate * 10 - rule_violations * 0.5)
     if not accuracy:
         anomalies.append({"field": "accuracy", "issue": f"异常值比例 {outlier_rate:.1f}% > 1%"})
@@ -650,6 +779,7 @@ def check_quality(
         "anomalies": anomalies,
         "suggestions": suggestions,
         "skip_reason": skip_reason,
+        "great_expectations": _ge_validate(sample, dataset, rules) if sample else None,
         "checked_at": datetime.now(timezone.utc).isoformat(),
     }
 
