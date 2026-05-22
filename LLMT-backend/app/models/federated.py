@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, Float, Integer, JSON, String, Text
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, JSON, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, IdMixin, TimestampMixin
@@ -81,7 +81,7 @@ class FederatedParticipant(IdMixin, TimestampMixin, Base):
     __tablename__ = "federated_participants"
 
     task_id: Mapped[int] = mapped_column(
-        Integer, nullable=False, index=True,
+        Integer, ForeignKey("federated_tasks.id"), nullable=False, index=True,
     )
     participant_id: Mapped[str] = mapped_column(String(64), nullable=False)
     name: Mapped[str] = mapped_column(String(128), default="")

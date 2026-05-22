@@ -30,6 +30,8 @@ class ParticipantConfigRequest(BaseModel):
 
 class FederatedTaskCreate(BaseModel):
     """Request body for creating a new federated learning task."""
+    model_config = {"protected_namespaces": ()}
+
     task_name: str = Field(..., min_length=1, max_length=128, description="任务名称")
     description: Optional[str] = Field(default=None, description="任务描述")
 
@@ -122,6 +124,8 @@ class ParticipantOut(BaseModel):
 
 class FederatedTaskOut(BaseModel):
     """Full federated task response."""
+    model_config = {"from_attributes": True, "protected_namespaces": ()}
+
     id: int
     task_name: str
     task_code: str
@@ -148,11 +152,11 @@ class FederatedTaskOut(BaseModel):
     created_at: datetime
     participants: list[ParticipantOut] = []
 
-    model_config = {"from_attributes": True}
-
 
 class FederatedTaskListOut(BaseModel):
     """Paginated list item."""
+    model_config = {"from_attributes": True, "protected_namespaces": ()}
+
     id: int
     task_name: str
     task_code: str
@@ -166,8 +170,6 @@ class FederatedTaskListOut(BaseModel):
     best_loss: Optional[float] = None
     started_at: Optional[datetime] = None
     created_at: datetime
-
-    model_config = {"from_attributes": True}
 
 
 class FederatedRoundMetrics(BaseModel):
