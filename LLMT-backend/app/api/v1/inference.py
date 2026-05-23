@@ -2,8 +2,10 @@
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
+import httpx
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.core.responses import success_response
 from app.core.rate_limit import (
     check_rate_limit,
@@ -16,6 +18,7 @@ from app.models.user import User
 from app.repositories import inference_repository
 
 router = APIRouter(prefix="/inference", tags=["模型推理"])
+settings = get_settings()
 
 # 推理接口限流配置
 INFERENCE_RATE_LIMIT = 60  # 次/分钟
@@ -80,33 +83,59 @@ def predict_sync(
 
     # Load model + run real inference
     try:
-        from llmt_training.inference.engine import load_model, run_inference
+        if settings.LLMT_INFERENCE_SERVICE_URL:
+            base_url = settings.LLMT_INFERENCE_SERVICE_URL.rstrip("/")
+            with httpx.Client(timeout=300.0, trust_env=False) as client:
+                response = client.post(
+                    f"{base_url}/predict",
+                    json={
+                        "model_code": model_code,
+                        "version": version,
+                        "model_type": model_type,
+                        "model_config": hyper,
+                        "input": input_text,
+                        "parameters": params,
+                    },
+                )
+            if response.status_code >= 400:
+                try:
+                    detail = response.json().get("detail", response.text)
+                except Exception:
+                    detail = response.text
+                raise HTTPException(status_code=response.status_code, detail=detail)
+            result = response.json()
+        else:
+            from llmt_training.inference.engine import load_model, run_inference
 
-        model_tok = load_model(model_code, version, model_type=model_type,
-                              model_config=hyper)
-        if model_tok is None:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="无法加载模型权重，请确认 MinIO 中 checkpoint 存在",
+            model_tok = load_model(model_code, version, model_type=model_type,
+                                  model_config=hyper)
+            if model_tok is None:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="无法加载模型权重，请确认 MinIO 中 checkpoint 存在",
+                )
+
+            model, tokenizer = model_tok
+            max_new_tokens = int(params.get("max_new_tokens", 20))
+            max_new_tokens = max(1, min(max_new_tokens, 64))
+            output_text, latency_ms = run_inference(
+                model, tokenizer, input_text,
+                max_new_tokens=max_new_tokens,
+                temperature=float(params.get("temperature", 0.8)),
+                top_p=float(params.get("top_p", 0.9)),
+                top_k=int(params.get("top_k", 50)),
             )
-
-        model, tokenizer = model_tok
-        max_new_tokens = int(params.get("max_new_tokens", 20))
-        max_new_tokens = max(1, min(max_new_tokens, 64))
-        output_text, latency_ms = run_inference(
-            model, tokenizer, input_text,
-            max_new_tokens=max_new_tokens,
-            temperature=float(params.get("temperature", 0.8)),
-            top_p=float(params.get("top_p", 0.9)),
-            top_k=int(params.get("top_k", 50)),
+            result = {
+                "model_code": model_code,
+                "output": output_text,
+                "latency_ms": latency_ms,
+                "input": input_text,
+            }
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"推理服务不可用: {exc}",
         )
-
-        result = {
-            "model_code": model_code,
-            "output": output_text,
-            "latency_ms": latency_ms,
-            "input": input_text,
-        }
     except HTTPException:
         raise
     except Exception as exc:

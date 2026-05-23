@@ -7,6 +7,7 @@ import logging
 import os
 import tempfile
 import time
+import gc
 from typing import Any
 
 import torch
@@ -15,6 +16,39 @@ _log = logging.getLogger(__name__)
 
 # In-memory cache: model_code -> (model, tokenizer)
 _cache: dict[str, tuple[torch.nn.Module, Any]] = {}
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        from app.core.config import get_settings
+        value = getattr(get_settings(), name, None)
+        if value is not None:
+            return int(value)
+    except Exception:
+        pass
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_str(name: str, default: str) -> str:
+    try:
+        from app.core.config import get_settings
+        value = getattr(get_settings(), name, None)
+        if value is not None:
+            return str(value)
+    except Exception:
+        pass
+    return os.environ.get(name, default)
+
+
+def _load_checkpoint_file(path: str) -> Any:
+    """Load a checkpoint with lower peak memory when supported by PyTorch."""
+    try:
+        return torch.load(path, map_location="cpu", mmap=True, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
 
 
 def _get_minio_client():
@@ -248,6 +282,18 @@ def load_model(model_code: str, version: str, model_type: str = "gpt2",
     if checkpoint_ref is None:
         return None
     checkpoint_path, delete_checkpoint_path = checkpoint_ref
+    max_checkpoint_mb = _env_int("LLMT_INFERENCE_MAX_CHECKPOINT_MB", 1024)
+    checkpoint_mb = os.path.getsize(checkpoint_path) / (1024 * 1024)
+    if max_checkpoint_mb > 0 and checkpoint_mb > max_checkpoint_mb:
+        if delete_checkpoint_path:
+            try:
+                os.unlink(checkpoint_path)
+            except OSError:
+                pass
+        raise RuntimeError(
+            f"checkpoint is {checkpoint_mb:.1f} MB, above LLMT_INFERENCE_MAX_CHECKPOINT_MB={max_checkpoint_mb}; "
+            "increase the limit or use a smaller model/offline inference service"
+        )
 
     # 2. Build model via registry
     from llmt_training.models.registry import ModelRegistry
@@ -258,7 +304,7 @@ def load_model(model_code: str, version: str, model_type: str = "gpt2",
 
     # 3. Load state dict
     try:
-        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        checkpoint = _load_checkpoint_file(checkpoint_path)
 
         # DeepSpeed saves state dict under 'module'; PyTorchTrainer uses model_state_dict.
         if "module" in checkpoint:
@@ -276,11 +322,13 @@ def load_model(model_code: str, version: str, model_type: str = "gpt2",
             raise ValueError("checkpoint does not contain any parameters matching the model")
 
         model.load_state_dict(filtered, strict=False)
+        del checkpoint, state_dict, filtered
+        gc.collect()
         model.eval()
 
         # Default to CPU for backend sync inference. Loading into the same GPU
         # used for training can kill the API process if memory is tight.
-        device_name = os.environ.get("LLMT_INFERENCE_DEVICE", "cpu")
+        device_name = _env_str("LLMT_INFERENCE_DEVICE", "cpu")
         if device_name == "cuda" and not torch.cuda.is_available():
             device_name = "cpu"
         device = torch.device(device_name)
@@ -298,8 +346,12 @@ def load_model(model_code: str, version: str, model_type: str = "gpt2",
 
     # 4. Cache
     _cache[cache_key] = (model, tokenizer)
-    if len(_cache) > 8:  # evict oldest
+    max_cache_size = max(0, _env_int("LLMT_INFERENCE_CACHE_SIZE", 1))
+    while len(_cache) > max_cache_size:
         _cache.pop(next(iter(_cache)))
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     return model, tokenizer
 
 

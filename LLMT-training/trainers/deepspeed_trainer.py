@@ -158,6 +158,8 @@ class DeepSpeedTrainer(BaseTrainer):
                 use_cuda = False
 
         device = torch.device(f"cuda:{local_rank}" if use_cuda else "cpu")
+        if use_cuda:
+            torch.cuda.set_device(local_rank)
 
         # If running on CPU, adjust DeepSpeed config to avoid CUDA-only features
         if not use_cuda:
@@ -177,18 +179,20 @@ class DeepSpeedTrainer(BaseTrainer):
 
         # In-process backend tasks run sequentially inside the same Python
         # process. A failed/previous DeepSpeed run can leave a stale default
-        # group, so reset it before creating the single-rank group for this job.
-        if torch.distributed.is_initialized():
+        # group, so reset it before DeepSpeed creates the single-rank group.
+        if dist.is_initialized():
             try:
-                torch.distributed.destroy_process_group()
+                dist.destroy_process_group()
             except Exception:
                 pass
 
         backend = "nccl" if use_cuda else "gloo"
-        torch.distributed.init_process_group(
-            backend=backend,
-            rank=0,
-            world_size=1,
+        deepspeed.init_distributed(
+            dist_backend=backend,
+            auto_mpi_discovery=False,
+            distributed_port=int(os.environ.get("MASTER_PORT", "29500")),
+            rank=int(os.environ.get("RANK", "0")),
+            world_size=int(os.environ.get("WORLD_SIZE", "1")),
         )
 
         # Save original sampler before training starts.
@@ -297,9 +301,9 @@ class DeepSpeedTrainer(BaseTrainer):
             self.callbacks.on_error(self.state, error=e)
 
         self.callbacks.on_train_end(self.state)
-        if torch.distributed.is_initialized():
+        if dist.is_initialized():
             try:
-                torch.distributed.destroy_process_group()
+                dist.destroy_process_group()
             except Exception:
                 pass
         return self.state

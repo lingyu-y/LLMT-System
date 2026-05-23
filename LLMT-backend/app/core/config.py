@@ -60,6 +60,10 @@ class Settings(BaseSettings):
     LLMT_TRAINING_MODULE_PATH: str = "llmt_training"
     LLMT_TRAINING_SCRIPTS_DIR: str | None = None  # absolute path to LLMT-training/examples/
     TRAINING_DEFAULT_TIMEOUT_HOURS: int = 168  # 7 days
+    LLMT_INFERENCE_SERVICE_URL: str | None = None
+    LLMT_INFERENCE_MAX_CHECKPOINT_MB: int = 1024
+    LLMT_INFERENCE_CACHE_SIZE: int = 1
+    LLMT_INFERENCE_DEVICE: str = "cpu"
 
     @field_validator("DEBUG", mode="before")
     @classmethod
