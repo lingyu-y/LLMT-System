@@ -572,9 +572,10 @@ const selectModel = async (model: ModelItem) => {
 const runPredict = async () => {
   if (!selectedModel.value || !inferenceInput.value.trim()) return
   predicting.value = true
+  const modelCode = selectedModel.value.raw.model_code || selectedModel.value.id
   try {
-    prediction.value = await predict(selectedModel.value.id, { input: inferenceInput.value.trim() })
-    const usageResult = await getInferenceUsage(selectedModel.value.id)
+    prediction.value = await predict(modelCode, { input: inferenceInput.value.trim() })
+    const usageResult = await getInferenceUsage(modelCode)
     usage.value = usageResult[0]
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '推理失败')
