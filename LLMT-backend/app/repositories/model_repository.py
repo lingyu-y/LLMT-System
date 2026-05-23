@@ -118,6 +118,8 @@ def create_model(
     framework: str | None = None,
     metrics: dict | None = None,
     training_metadata: dict | None = None,
+    task_id: int | None = None,
+    creator_id: int | None = None,
 ) -> ModelVersion:
     version = auto_version(db, model_code)
 
@@ -136,9 +138,50 @@ def create_model(
         dataset_version=(training_metadata or {}).get("dataset_version"),
         metrics_json=metrics or {},
         hyperparams_json=training_metadata or {},
+        task_id=task_id,
+        created_by_id=creator_id,
         is_current=True,
     )
     db.add(model)
     db.commit()
     db.refresh(model)
     return model
+
+
+def delete_model(db: Session, model_code: str, version: str | None = None) -> int:
+    """Delete model version(s). If version is None, delete all versions.
+
+    Also deletes files from MinIO models bucket.
+    Returns count of deleted records.
+    """
+    query = db.query(ModelVersion).filter(ModelVersion.model_code == model_code)
+    if version:
+        query = query.filter(ModelVersion.version == version)
+
+    rows = query.all()
+    if not rows:
+        return 0
+
+    # Delete from MinIO
+    try:
+        from app.core.config import get_settings
+        from app.core.database import get_minio_client
+        minio = get_minio_client()
+        bucket = get_settings().MINIO_BUCKET_MODELS
+        for r in rows:
+            prefix = r.storage_path or f"models/{r.model_code}/{r.version}"
+            if minio.bucket_exists(bucket):
+                objects = list(minio.list_objects(bucket, prefix=prefix, recursive=True))
+                for obj in objects:
+                    try:
+                        minio.remove_object(bucket, obj.object_name)
+                    except Exception:
+                        pass
+    except Exception:
+        pass  # MinIO cleanup is best-effort
+
+    count = len(rows)
+    for r in rows:
+        db.delete(r)
+    db.commit()
+    return count

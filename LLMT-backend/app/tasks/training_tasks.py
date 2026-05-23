@@ -28,12 +28,6 @@ def _ensure_llmt_training_on_path() -> None:
     ``PYTHONPATH`` so that DataLoader worker sub-processes (spawned via
     ``multiprocessing``) can also find the package.
     """
-    try:
-        import llmt_training  # noqa: F401
-        return
-    except ImportError:
-        pass
-
     # Resolve the physical path to the LLMT-training source directory
     module_path = settings.LLMT_TRAINING_MODULE_PATH
     if os.path.isdir(module_path):
@@ -56,22 +50,15 @@ def _ensure_llmt_training_on_path() -> None:
     if not os.path.isfile(init_file):
         return
 
-    # Register llmt_training as a package pointing to source_dir (for main process)
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(
-        "llmt_training",
-        init_file,
-        submodule_search_locations=[source_dir],
-    )
-    if spec is not None and spec.loader is not None:
-        module = importlib.util.module_from_spec(spec)
-        sys.modules["llmt_training"] = module
-        spec.loader.exec_module(module)
-
     # Create a symlink so multiprocessing workers can also find the package.
     # LLMT-training/ (hyphen) -> llmt_training/ (underscore) symlink
     parent_dir = os.path.dirname(source_dir)
     symlink_path = os.path.join(parent_dir, "llmt_training")
+    if os.path.islink(symlink_path) and os.path.realpath(symlink_path) != os.path.realpath(source_dir):
+        try:
+            os.unlink(symlink_path)
+        except OSError:
+            pass
     if not os.path.exists(symlink_path):
         try:
             os.symlink(source_dir, symlink_path)
@@ -84,6 +71,24 @@ def _ensure_llmt_training_on_path() -> None:
     existing_pp = os.environ.get("PYTHONPATH", "")
     if parent_dir not in existing_pp:
         os.environ["PYTHONPATH"] = f"{parent_dir}:{existing_pp}" if existing_pp else parent_dir
+
+    # Register llmt_training as a package pointing to source_dir for this process.
+    try:
+        import llmt_training  # noqa: F401
+        return
+    except ImportError:
+        pass
+
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "llmt_training",
+        init_file,
+        submodule_search_locations=[source_dir],
+    )
+    if spec is not None and spec.loader is not None:
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["llmt_training"] = module
+        spec.loader.exec_module(module)
 
 
 _ensure_llmt_training_on_path()
@@ -154,9 +159,17 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
             from app.models.dataset import Dataset
             dataset = db.query(Dataset).filter(Dataset.id == task.dataset_id).first()
             if dataset:
-                local_path = _resolve_dataset_path(dataset)
-                if local_path:
-                    config_json["dataset_path"] = local_path
+                local_paths = _resolve_dataset_paths(dataset)
+                if local_paths:
+                    # Set primary path + all paths for multi-file streaming
+                    config_json["dataset_path"] = local_paths[0]
+                    if len(local_paths) > 1:
+                        config_json["dataset_paths"] = local_paths
+                    import logging
+                    _log = logging.getLogger(__name__)
+                    _log.info("训练任务 %s 数据集 '%s' 解析到 %d 个文件:", task_code, dataset.name, len(local_paths))
+                    for i, p in enumerate(local_paths):
+                        _log.info("  [%d/%d] %s", i + 1, len(local_paths), p)
                 else:
                     _update_task_status(
                         task_code, "failed",
@@ -172,7 +185,7 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
                     fmt = config_json["dataset_format"]
                 else:
                     fmt = _map_data_type_to_format(
-                        dataset.data_type, local_path,
+                        dataset.data_type, local_paths[0] if local_paths else "",
                     )
                 config_json["dataset_format"] = fmt
 
@@ -208,6 +221,22 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
         from llmt_training.reporting.callback_bridge import ReportingCallbackBridge
         reporting_callback = ReportingCallbackBridge.from_config(config_dict)
 
+        # --- Reload training modules so code changes take effect without ---
+        # --- restarting the Celery worker (in-process path caches imports) ---
+        import importlib
+        import llmt_training.data.finetune_dataset as _fdm
+        import llmt_training.data.pretrain_dataset as _pdm
+        import llmt_training.data.data_utils as _dum
+        import llmt_training.trainers.deepspeed_trainer as _dsm
+        import llmt_training.trainers.pytorch_trainer as _ptm
+        import llmt_training.trainers.factory as _tf
+        importlib.reload(_fdm)
+        importlib.reload(_pdm)
+        importlib.reload(_dum)
+        importlib.reload(_dsm)
+        importlib.reload(_ptm)
+        importlib.reload(_tf)
+
         # Build model from config via ModelRegistry
         from llmt_training.models.registry import ModelRegistry
         model_type = config_dict.get("model", {}).get("model_type", "gpt2")
@@ -218,8 +247,14 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
         from llmt_training.data.data_utils import create_dataset_from_config, build_dataloaders
         is_distributed = config_dict.get("strategy", {}).get("num_gpus", 1) > 1
         dataset = create_dataset_from_config(config_dict)
+        _prepopulate_tokenizer_vocab(dataset)
         train_dataloader, eval_dataloader = build_dataloaders(
             dataset, config_dict, distributed=is_distributed,
+        )
+        print(
+            f"[TrainingTask] dataloaders ready: train_batches={len(train_dataloader)}, "
+            f"eval_batches={len(eval_dataloader) if eval_dataloader is not None else 0}",
+            flush=True,
         )
 
         # Build loss function from model provider
@@ -230,12 +265,21 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
         from llmt_training.core.callbacks import CallbackList
         from llmt_training.core.state import TrainingState
 
+        # Detect resume: if task has previous progress, restore state
+        resume_epoch = task.current_epoch
+        resume_step = task.current_step
+        resume_ckpt = task.checkpoint_path
+
         state = TrainingState(
             task_code=task_code,
             max_epochs=config_dict.get("hyperparams", {}).get("max_epochs", 10),
             max_steps=config_dict.get("hyperparams", {}).get("max_steps"),
         )
-        callbacks = CallbackList([reporting_callback, _CancellationCheckCallback(task_code)])
+        if resume_step > 0:
+            state.epoch = resume_epoch
+            state.global_step = resume_step
+        cancel_cb = _CancellationCheckCallback(task_code)
+        callbacks = CallbackList([reporting_callback, cancel_cb])
 
         trainer = create_trainer(
             framework=framework,
@@ -248,6 +292,20 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
             state=state,
             loss_fn=loss_fn,
         )
+        print(
+            f"[TrainingTask] trainer ready: framework={framework}, "
+            f"strategy={parallel_strategy}, starting training...",
+            flush=True,
+        )
+
+        cancel_cb.set_trainer(trainer)
+
+        # On resume, load the last checkpoint so training continues from there
+        if resume_step > 0 and resume_ckpt:
+            try:
+                trainer.load_checkpoint(resume_ckpt)
+            except Exception:
+                pass  # Best-effort; training proceeds from saved step
 
         # For in-process training (pytorch/deepspeed single-node)
         if framework in ("pytorch", "deepspeed") and _should_run_in_process(config_dict):
@@ -259,7 +317,7 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
 
             # Write config to temp file for the subprocess
             config_path = os.path.join(
-                config_dict.get("checkpoint", {}).get("checkpoint_dir", "./checkpoints"),
+                config_dict.get("checkpoint", {}).get("checkpoint_dir", "/tmp/llmt_checkpoints"),
                 "training_config.json",
             )
             os.makedirs(os.path.dirname(config_path), exist_ok=True)
@@ -281,6 +339,9 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
                 final_state.status = "failed"
                 final_state.error_message = f"Training process exited with code {exit_code}"
 
+        # Save tokenizer vocab alongside checkpoint for inference
+        _save_tokenizer_vocab(dataset, config_dict)
+
         return {
             "task_code": task_code,
             "status": final_state.status,
@@ -292,27 +353,116 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
         return {"task_code": task_code, "status": "failed", "error_message": str(e)}
 
 
+def _save_tokenizer_vocab(dataset, config_dict: dict) -> None:
+    """Save the tokenizer vocabulary alongside the checkpoint for inference.
+
+    Extracts the SimpleTokenizer from the dataset (if available) and
+    writes its reverse vocabulary so the inference engine can decode
+    model outputs into human-readable text.
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    try:
+        tokenizer = getattr(dataset, "tokenizer", None)
+        if tokenizer is None or not hasattr(tokenizer, "save_vocab"):
+            if hasattr(dataset, "_loaded_samples") and hasattr(dataset, "tokenizer"):
+                tokenizer = dataset.tokenizer
+        if tokenizer is None or not hasattr(tokenizer, "save_vocab"):
+            logger.debug("No saveable tokenizer found on dataset, skipping vocab save")
+            return
+
+        # Determine checkpoint directory
+        ckpt_dir_cfg = config_dict.get("checkpoint", {}).get("checkpoint_dir", "/tmp/llmt_checkpoints")
+        ckpt_root = os.path.join(ckpt_dir_cfg) if not os.path.isabs(ckpt_dir_cfg) else ckpt_dir_cfg
+
+        # Also save to ./checkpoints/ for local discovery
+        local_ckpt = "./checkpoints"
+        candidates = [ckpt_root, local_ckpt]
+        # DeepSpeed convention: find the latest step subdirectory
+        for base in candidates:
+            if not os.path.isdir(base):
+                continue
+            latest_file = os.path.join(base, "latest")
+            if os.path.isfile(latest_file):
+                with open(latest_file, "r") as f:
+                    latest_dir = f.read().strip()
+                step_dir = os.path.join(base, latest_dir)
+                if os.path.isdir(step_dir):
+                    vocab_path = os.path.join(step_dir, "tokenizer_vocab.json")
+                    tokenizer.save_vocab(vocab_path)
+                    logger.info("Saved tokenizer vocab (%d words) to %s", len(tokenizer.id_to_word), vocab_path)
+                    continue
+            # Fallback: save directly in the base dir
+            vocab_path = os.path.join(base, "tokenizer_vocab.json")
+            tokenizer.save_vocab(vocab_path)
+            logger.info("Saved tokenizer vocab (%d words) to %s", len(tokenizer.id_to_word), vocab_path)
+    except Exception as exc:
+        logger.warning("Failed to save tokenizer vocab: %s", exc)
+
+
+def _prepopulate_tokenizer_vocab(dataset) -> None:
+    """Pre-populate the tokenizer's vocab from all dataset texts BEFORE training.
+
+    This ensures the reverse vocabulary is fully built regardless of whether
+    DataLoader uses worker subprocesses or launcher spawns a child process.
+    """
+    try:
+        tokenizer = getattr(dataset, "tokenizer", None)
+        if tokenizer is None or not hasattr(tokenizer, "build_vocab_from_texts"):
+            return
+
+        texts: list[str] = []
+        # FinetuneDataset stores samples in self.samples
+        if hasattr(dataset, "samples"):
+            for s in dataset.samples:
+                t = s.get("text", "") if isinstance(s, dict) else str(s)
+                if t:
+                    texts.append(t)
+        # ShardedFinetuneDataset has per-shard samples
+        elif hasattr(dataset, "file_paths"):
+            for path in dataset.file_paths:
+                try:
+                    from llmt_training.data.finetune_dataset import _parse_file_samples
+                    for s in _parse_file_samples(path):
+                        t = s.get("text", "") if isinstance(s, dict) else str(s)
+                        if t:
+                            texts.append(t)
+                except Exception:
+                    pass
+
+        if texts:
+            tokenizer.build_vocab_from_texts(texts)
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info("Pre-populated tokenizer vocab with %d words from %d texts",
+                        len(tokenizer.id_to_word), len(texts))
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 class _CancellationCheckCallback:
-    """Callback that polls the DB for cancellation status.
+    """Callback that polls the DB for cancellation / pause status.
 
-    Celery ``revoke(..., terminate=True)`` only sends SIGTERM to the worker
-    process, which may be ignored or arrive late.  This callback provides
-    cooperative cancellation: on every ``on_step_end`` it queries PostgreSQL
-    for the current task status and, if the row has been marked
-    ``cancelled``, propagates that into ``state.status`` so the trainer's
-    ``_should_stop()`` check will exit the loop cleanly.
+    On ``cancelled`` — propagates to ``state.status`` so the trainer's
+    ``_should_stop()`` exits the loop cleanly.
+
+    On ``paused`` — saves a checkpoint immediately (so we can resume from
+    it), then propagates ``paused`` to ``state.status``.
     """
 
     def __init__(self, task_code: str, poll_every: int = 10):
         self._task_code = task_code
-        self._poll_every = poll_every  # check DB every N steps
+        self._poll_every = poll_every
         self._step_counter = 0
+        self._trainer_ref = None  # set by caller so we can trigger checkpoint
 
-    # -- TrainingCallback interface ------------------------------------------
+    def set_trainer(self, trainer):
+        self._trainer_ref = trainer
 
     def on_train_begin(self, state, **kwargs):
         pass
@@ -337,10 +487,21 @@ class _CancellationCheckCallback:
             _engine = _ce(settings.postgres_database_url)
             with _S(_engine) as db:
                 row = db.query(_TT).filter(_TT.task_code == self._task_code).first()
-                if row is not None and row.status == "cancelled":
+                if row is None:
+                    return
+                if row.status == "cancelled":
                     state.status = "cancelled"
+                elif row.status == "paused":
+                    # Save checkpoint so we can resume from here
+                    if self._trainer_ref is not None:
+                        try:
+                            ckpt_dir = "/tmp/llmt_checkpoints"
+                            self._trainer_ref.save_checkpoint(ckpt_dir)
+                        except Exception:
+                            pass
+                    state.status = "paused"
         except Exception:
-            pass  # best-effort; don't crash training on a DB hiccup
+            pass
 
     def on_checkpoint(self, state, **kwargs):
         pass
@@ -382,45 +543,97 @@ def _map_data_type_to_format(data_type: str, file_path: str) -> str:
     return type_map.get(data_type, "jsonl")
 
 
-def _resolve_dataset_path(ds) -> str | None:
-    """Return a local file path for the dataset, downloading from MinIO if needed.
+def _resolve_dataset_paths(ds) -> list[str]:
+    """Return all local data file paths for the dataset, downloading from MinIO if needed.
 
-    Tries:
-      1. Local filesystem (storage_path exists as-is)
-      2. MinIO download to temp dir, then find the data file
+    **Prefers preprocessed data**: if ``processed/data.jsonl`` exists it is
+    returned exclusively.  Otherwise raw data files are returned in sorted order.
 
-    Returns the path to a data file, or None.
+    Returns a sorted list of paths, or empty list if nothing found.
     """
     import logging
     logger = logging.getLogger(__name__)
     storage_path = ds.storage_path or ""
 
+    valid_ext = (".jsonl", ".npy", ".bin", ".txt", ".json", ".csv")
+    data_files: list[str] = []
+
+    def _find_processed_files(root: str) -> list[str]:
+        """Find processed data files under *root*.
+
+        Prefers sharded files (``data_shard_*.jsonl``), falls back to the
+        legacy single file (``data.jsonl``). Returns empty list if nothing found.
+        """
+        processed_dir = os.path.join(root, "processed")
+        if not os.path.isdir(processed_dir):
+            return []
+
+        shards = sorted(
+            os.path.join(processed_dir, fn)
+            for fn in os.listdir(processed_dir)
+            if fn.startswith("data_shard_") and fn.endswith(".jsonl")
+        )
+        if shards:
+            return shards
+
+        legacy = os.path.join(processed_dir, "data.jsonl")
+        if os.path.isfile(legacy):
+            return [legacy]
+
+        for dirpath, _, filenames in os.walk(root):
+            if "processed" in dirpath.split(os.sep):
+                for fn in filenames:
+                    if fn.startswith("data_shard_") and fn.endswith(".jsonl"):
+                        shards.append(os.path.join(dirpath, fn))
+                if shards:
+                    return shards
+                for fn in filenames:
+                    if fn == "data.jsonl":
+                        return [os.path.join(dirpath, fn)]
+        return []
+
+    def _scan_dir(root: str) -> None:
+        """Recursively collect raw data files, skipping processed/."""
+        if not os.path.isdir(root):
+            return
+        for entry in sorted(os.listdir(root)):
+            full = os.path.join(root, entry)
+            if os.path.isfile(full) and entry.endswith(valid_ext):
+                if "/processed/" in full:
+                    continue
+                data_files.append(full)
+            elif os.path.isdir(full) and not entry.startswith(".") and entry != "processed":
+                _scan_dir(full)
+
     # 1. Try local filesystem directly
     if os.path.exists(storage_path):
-        if os.path.isfile(storage_path):
-            return storage_path
-        # It's a directory – look for a data file inside
-        for fname in os.listdir(storage_path):
-            if fname.endswith((".jsonl", ".npy", ".bin", ".txt", ".json", ".csv")):
-                return os.path.join(storage_path, fname)
-        # If directory has subdirectories, search deeper
-        for root, _, files in os.walk(storage_path):
-            for fname in files:
-                if fname.endswith((".jsonl", ".npy", ".bin", ".txt", ".json", ".csv")):
-                    return os.path.join(root, fname)
+        if os.path.isfile(storage_path) and storage_path.endswith(valid_ext):
+            return [storage_path]
+        # Prefer preprocessed data
+        processed = _find_processed_files(storage_path)
+        if processed:
+            return processed
+        _scan_dir(storage_path)
+        if data_files:
+            return data_files
 
     # 2. Try MinIO download
     local_dir = _download_dataset_from_minio(storage_path)
     if local_dir is not None:
-        for fname in os.listdir(local_dir):
-            if fname.endswith((".jsonl", ".npy", ".bin", ".txt", ".json", ".csv")):
-                return os.path.join(local_dir, fname)
-        for root, _, files in os.walk(local_dir):
-            for fname in files:
-                if fname.endswith((".jsonl", ".npy", ".bin", ".txt", ".json", ".csv")):
-                    return os.path.join(root, fname)
+        processed = _find_processed_files(local_dir)
+        if processed:
+            return processed
+        _scan_dir(local_dir)
+        if data_files:
+            return data_files
 
-    return None
+    return []
+
+
+def _resolve_dataset_path(ds) -> str | None:
+    """Legacy wrapper returning the first resolved file path."""
+    paths = _resolve_dataset_paths(ds)
+    return paths[0] if paths else None
 
 
 def _download_dataset_from_minio(
@@ -505,7 +718,7 @@ def _build_training_config(
         "max_position_embeddings", "dropout", "layer_norm_eps", "activation",
     }
     data_keys = {
-        "dataset_path", "dataset_format", "train_split", "seed", "num_workers", "pin_memory",
+        "dataset_path", "dataset_paths", "dataset_format", "train_split", "seed", "num_workers", "pin_memory",
     }
     hyperparam_keys = {
         "batch_size", "learning_rate", "min_lr", "weight_decay", "max_epochs",
@@ -548,10 +761,10 @@ def _update_task_status(
 ) -> None:
     """Update TrainingTask status in PostgreSQL directly via SQLAlchemy."""
     try:
+        from datetime import datetime as _dt, timezone as _tz
         from sqlalchemy import create_engine as _ce, update as _upd
         from sqlalchemy.orm import Session as _S
         from app.models.training_task import TrainingTask as _TT
-        from datetime import datetime as _dt, timezone as _tz
         _engine = _ce(settings.postgres_database_url)
         with _S(_engine) as db:
             values: dict[str, Any] = {"status": status}
@@ -561,8 +774,183 @@ def _update_task_status(
                 values["ended_at"] = _dt.now(_tz.utc)
             db.execute(_upd(_TT).where(_TT.task_code == task_code).values(**values))
             db.commit()
+
+        # When training completes, promote checkpoints to a ModelVersion
+        if status == "completed":
+            _promote_to_model(task_code)
     except Exception:
         pass  # Best-effort status update
+
+
+def _promote_to_model(task_code: str) -> dict | None:
+    """Promote training checkpoints to a ModelVersion after successful training.
+
+    Copies checkpoint files from the checkpoints bucket to the models bucket
+    in MinIO, then creates a ModelVersion record linked to the training task.
+    """
+    import logging
+    import re
+
+    logger = logging.getLogger(__name__)
+
+    try:
+        from sqlalchemy import create_engine as _ce
+        from sqlalchemy.orm import Session as _S
+        from app.models.training_task import TrainingTask as _TT
+        from app.repositories import model_repository
+
+        _engine = _ce(settings.postgres_database_url)
+        with _S(_engine) as db:
+            task = db.query(_TT).filter(_TT.task_code == task_code).first()
+            if task is None:
+                return None
+
+            # Check if already promoted
+            existing = (
+                db.query(model_repository.ModelVersion)
+                .filter(model_repository.ModelVersion.task_id == task.id)
+                .first()
+            )
+            if existing:
+                logger.info("Task %s already promoted to model %s v%s", task_code, existing.model_code, existing.version)
+                return {"model_code": existing.model_code, "version": existing.version, "id": existing.id}
+
+            config = task.config_json or {}
+            model_type = config.get("model_type", "gpt2")
+            framework = task.framework or "pytorch"
+
+            # Generate model_code from task_name (sanitize for use as model code)
+            model_code = re.sub(r"[^a-zA-Z0-9一-鿿_-]", "-", task.task_name.lower())
+            model_code = re.sub(r"-+", "-", model_code).strip("-")
+            if not model_code:
+                model_code = f"model-{task_code.lower()}"
+
+            model_name = task.task_name
+
+            # Build structured hyperparams from training config
+            hyperparams: dict[str, Any] = {
+                "framework": framework,
+                "parallel_strategy": task.parallel_strategy,
+                "model_type": model_type,
+            }
+            for key in (
+                "learning_rate", "batch_size", "max_epochs", "max_steps",
+                "seq_length", "hidden_size", "num_layers", "num_attention_heads",
+                "precision", "optimizer", "weight_decay", "warmup_steps",
+                "gradient_accumulation_steps", "vocab_size", "train_split",
+            ):
+                if key in config:
+                    hyperparams[key] = config[key]
+
+            # Copy checkpoints from checkpoints bucket → models bucket
+            version_str = model_repository.auto_version(db, model_code)
+            storage_path = f"models/{model_code}/{version_str}"
+
+            ckpt_uploaded = False
+            try:
+                from app.core.database import get_minio_client
+                from minio.commonconfig import CopySource
+
+                minio = get_minio_client()
+                ckpt_bucket = settings.MINIO_BUCKET_CHECKPOINTS
+                model_bucket = settings.MINIO_BUCKET_MODELS
+                prefix = f"{task_code}/"
+
+                if minio.bucket_exists(ckpt_bucket):
+                    objects = list(minio.list_objects(ckpt_bucket, prefix=prefix, recursive=True))
+                    ckpt_files = [o for o in objects if not o.is_dir]
+                    step_groups = sorted(
+                        {
+                            parts[1]
+                            for o in ckpt_files
+                            for parts in [o.object_name.split("/")]
+                            if len(parts) > 2 and parts[1].startswith("step-")
+                        },
+                        key=lambda name: int(name.rsplit("-", 1)[1]) if name.rsplit("-", 1)[1].isdigit() else -1,
+                    )
+                    latest_group = step_groups[-1] if step_groups else ""
+                    selected_files = [
+                        o for o in ckpt_files
+                        if not latest_group or o.object_name.startswith(f"{prefix}{latest_group}/")
+                    ]
+                    for obj in selected_files:
+                        if latest_group:
+                            rel = obj.object_name[len(f"{prefix}{latest_group}/"):]
+                            target_name = f"{storage_path}/{rel}".replace("\\", "/")
+                        else:
+                            target_name = obj.object_name.replace(prefix, storage_path + "/", 1)
+                        minio.copy_object(model_bucket, target_name, CopySource(ckpt_bucket, obj.object_name))
+                    if selected_files:
+                        ckpt_uploaded = True
+                        logger.info("Copied latest checkpoint (%d files): %s -> %s", len(selected_files), f"{ckpt_bucket}/{prefix}{latest_group}", f"{model_bucket}/{storage_path}")
+                        for obj in ckpt_files:
+                            try:
+                                minio.remove_object(ckpt_bucket, obj.object_name)
+                            except Exception:
+                                pass
+                        logger.info("Removed %d source checkpoint files for task %s", len(ckpt_files), task_code)
+            except Exception as exc:
+                logger.warning("MinIO checkpoint copy failed: %s", exc)
+
+            # Fallback: upload from local checkpoint directories if MinIO copy failed
+            local_ckpt_dirs = [
+                "/tmp/llmt_checkpoints",
+                "/tmp/llmt_checkpoints/ckpt",
+                "/tmp/llmt_checkpoints/latest",
+                "./checkpoints",
+                "./checkpoints/step-500",
+            ]
+            # Also include any DeepSpeed step subdirectories under ./checkpoints/
+            if os.path.isdir("./checkpoints"):
+                latest_file = os.path.join("./checkpoints", "latest")
+                if os.path.isfile(latest_file):
+                    with open(latest_file, "r") as f:
+                        latest_dir = f.read().strip()
+                    local_ckpt_dirs.append(os.path.join("./checkpoints", latest_dir))
+            if not ckpt_uploaded:
+                try:
+                    minio = get_minio_client()
+                    model_bucket = settings.MINIO_BUCKET_MODELS
+                    for local_dir in local_ckpt_dirs:
+                        if not os.path.isdir(local_dir):
+                            continue
+                        for root, _dirs, files in os.walk(local_dir):
+                            for fn in files:
+                                local_path = os.path.join(root, fn)
+                                rel = os.path.relpath(local_path, local_dir)
+                                object_name = f"{storage_path}/{rel}".replace("\\", "/")
+                                minio.fput_object(model_bucket, object_name, local_path)
+                        ckpt_uploaded = True
+                        logger.info("Uploaded local checkpoint %s -> %s/%s", local_dir, model_bucket, storage_path)
+                        break
+                except Exception as exc:
+                    logger.warning("Local checkpoint upload failed: %s", exc)
+
+            if not ckpt_uploaded:
+                logger.info("No checkpoint files found, model version created without weights")
+
+            # Build metrics placeholder (will be populated from actual training metrics)
+            metrics: dict[str, Any] = {}
+
+            model = model_repository.create_model(
+                db,
+                model_name=model_name,
+                model_code=model_code,
+                tag=f"auto-{task_code}",
+                description=f"自动从训练任务 {task_code} 创建",
+                framework=framework,
+                metrics=metrics,
+                training_metadata=hyperparams,
+                task_id=task.id,
+                creator_id=task.creator_id,
+            )
+
+            logger.info("Promoted training task %s to model %s v%s (id=%d)", task_code, model_code, model.version, model.id)
+            return {"model_code": model_code, "version": model.version, "id": model.id}
+
+    except Exception as exc:
+        logger.warning("Failed to promote task %s to model: %s", task_code, exc)
+        return None
 
 
 def ConfigValidator_safe_validate(config: dict) -> dict:

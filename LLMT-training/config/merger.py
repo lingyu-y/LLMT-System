@@ -39,6 +39,7 @@ class ConfigMerger:
                     "betas": [hp.beta1, hp.beta2],
                     "eps": hp.adam_epsilon,
                     "weight_decay": hp.weight_decay,
+                    "torch_adam": True,
                 },
             }
         elif hp.optimizer == "adam":
@@ -63,14 +64,17 @@ class ConfigMerger:
             "constant_warmup": "WarmupConstantLR",
             "polynomial": "WarmupPolynomialLR",
         }.get(hp.scheduler, "WarmupDecayLR")
+        total_steps = hp.max_steps or (hp.max_epochs * 100)
+        warmup_steps = min(hp.warmup_steps, total_steps)
+        warmup_min_lr = hp.learning_rate / max(warmup_steps, 1)
 
         ds_config["scheduler"] = {
             "type": scheduler_type,
             "params": {
-                "warmup_min_lr": 0,
+                "warmup_min_lr": warmup_min_lr,
                 "warmup_max_lr": hp.learning_rate,
-                "warmup_num_steps": hp.warmup_steps,
-                "total_num_steps": hp.max_steps or (hp.max_epochs * 1000),
+                "warmup_num_steps": warmup_steps,
+                "total_num_steps": total_steps,
             },
         }
 

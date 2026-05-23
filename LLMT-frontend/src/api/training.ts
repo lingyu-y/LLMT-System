@@ -1,4 +1,4 @@
-import { get, post, type PageResult } from './http'
+import { del, get, post, type PageResult } from './http'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -167,3 +167,9 @@ export const fetchTrainingStats = () =>
 
 export const validateTrainingConfig = (body: TrainingTaskCreate) =>
   post<{ message: string; data: ValidationResult }>('/training/validate-config', body)
+
+export const promoteTrainingTask = (id: number) =>
+  post<{ message: string; data: Record<string, unknown> }>(`/training/tasks/${id}/promote-to-model`)
+
+export const deleteTrainingTask = (id: number) =>
+  del<{ message: string }>(`/training/tasks/${id}`)

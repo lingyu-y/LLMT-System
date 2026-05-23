@@ -10,6 +10,7 @@ ENV PYTHONUNBUFFERED=1
 # System dependencies
 RUN apt-get update && apt-get install -y \
     python3.10 python3-pip python3.10-venv \
+    build-essential g++ gcc \
     git wget curl \
     && rm -rf /var/lib/apt/lists/*
 

@@ -22,6 +22,7 @@ class GPTConfig:
         num_attention_heads: int = 12,
         intermediate_size: int | None = None,
         max_position_embeddings: int = 1024,
+        seq_length: int | None = None,
         dropout: float = 0.1,
         layer_norm_eps: float = 1e-5,
         activation: str = "gelu_new",
@@ -126,20 +127,28 @@ class GPTModel(nn.Module):
             def __init__(self, logits):
                 self.logits = logits
 
-        return ModelOutput(self.wte(hidden_states))  # weight tying: project back to vocab
+        # Weight tying: project hidden_states through the transposed embedding
+        # matrix to produce logits. Using F.linear() instead of wte() because
+        # nn.Embedding.forward expects integer indices, not float hidden states.
+        logits = torch.nn.functional.linear(hidden_states, self.wte.weight)
+        return ModelOutput(logits)
 
 
 class GPTModelProvider(BaseModelProvider):
     """Provider for GPT-2 series models."""
 
     def get_model(self, config: dict[str, Any]) -> nn.Module:
+        config = config.get("model", config)
+        max_positions = config.get("max_position_embeddings") or config.get(
+            "seq_length", 1024,
+        )
         gpt_config = GPTConfig(
             vocab_size=config.get("vocab_size", 50257),
             hidden_size=config.get("hidden_size", 768),
             num_layers=config.get("num_layers", 12),
             num_attention_heads=config.get("num_attention_heads", 12),
             intermediate_size=config.get("intermediate_size"),
-            max_position_embeddings=config.get("max_position_embeddings", 1024),
+            max_position_embeddings=max_positions,
             dropout=config.get("dropout", 0.1),
             layer_norm_eps=config.get("layer_norm_eps", 1e-5),
             activation=config.get("activation", "gelu_new"),
@@ -150,10 +159,7 @@ class GPTModelProvider(BaseModelProvider):
         vocab_size = config.get("vocab_size", 50257)
         try:
             from transformers import GPT2Tokenizer
-            try:
-                return GPT2Tokenizer.from_pretrained("gpt2", local_files_only=True)
-            except Exception:
-                return SimpleTokenizer(vocab_size=vocab_size)
+            return GPT2Tokenizer.from_pretrained("gpt2", local_files_only=True)
         except Exception:
             return SimpleTokenizer(vocab_size=vocab_size)
 

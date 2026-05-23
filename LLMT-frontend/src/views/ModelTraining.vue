@@ -91,6 +91,50 @@
               </el-radio-group>
             </el-form-item>
           </el-form>
+          <el-collapse style="margin-top:12px">
+            <el-collapse-item title="训练超参数（点击展开）" name="hp">
+              <el-form label-position="top">
+                <el-row :gutter="12">
+                  <el-col :span="8">
+                    <el-form-item label="Batch Size">
+                      <el-input-number v-model="form.config.batch_size" :min="1" :max="256" style="width:100%" />
+                    </el-form-item>
+                  </el-col>
+                  <el-col :span="8">
+                    <el-form-item label="Learning Rate">
+                      <el-input-number v-model="form.config.learning_rate" :min="1e-7" :max="1e-1" :step="1e-5" :precision="6" style="width:100%" />
+                    </el-form-item>
+                  </el-col>
+                  <el-col :span="8">
+                    <el-form-item label="Seq Length">
+                      <el-input-number v-model="form.config.seq_length" :min="64" :max="4096" :step="64" style="width:100%" />
+                    </el-form-item>
+                  </el-col>
+                </el-row>
+                <el-row :gutter="12">
+                  <el-col :span="8">
+                    <el-form-item label="Max Epochs">
+                      <el-input-number v-model="form.config.max_epochs" :min="1" :max="1000" style="width:100%" />
+                    </el-form-item>
+                  </el-col>
+                  <el-col :span="8">
+                    <el-form-item label="Max Steps（0=仅用epoch控制）">
+                      <el-input-number v-model="form.config.max_steps" :min="0" :max="100000" :step="100" style="width:100%" />
+                    </el-form-item>
+                  </el-col>
+                  <el-col :span="8">
+                    <el-form-item label="Precision">
+                      <el-select v-model="form.config.precision" style="width:100%">
+                        <el-option label="FP16" value="fp16" />
+                        <el-option label="BF16" value="bf16" />
+                        <el-option label="FP32" value="fp32" />
+                      </el-select>
+                    </el-form-item>
+                  </el-col>
+                </el-row>
+              </el-form>
+            </el-collapse-item>
+          </el-collapse>
         </div>
       </div>
 
@@ -175,13 +219,17 @@
               </div>
             </template>
           </el-table-column>
-          <el-table-column label="操作" width="260">
+          <el-table-column label="操作" width="340">
             <template #default="{ row }">
               <el-button size="small" :disabled="row.status !== 'running'" @click="handlePause(row)">暂停</el-button>
               <el-button size="small" :disabled="row.status !== 'paused'" @click="handleResume(row)">恢复</el-button>
-              <el-button size="small" @click="openScaleDialog(row)">扩缩容</el-button>
-              <el-button size="small" type="danger" :disabled="!['created', 'queued', 'running'].includes(row.status)" @click="handleCancel(row)">取消</el-button>
+              <el-button size="small" :disabled="row.status !== 'completed'" @click="handlePromote(row)">转为模型</el-button>
               <el-button size="small" @click="selectTask(row)">监控</el-button>
+              <el-popconfirm title="确定删除此训练任务？" @confirm="handleDeleteTask(row)">
+                <template #reference>
+                  <el-button size="small" type="danger">删除</el-button>
+                </template>
+              </el-popconfirm>
             </template>
           </el-table-column>
         </el-table>
@@ -225,11 +273,11 @@ import { DocumentChecked, VideoPlay } from '@element-plus/icons-vue'
 
 import {
   createTrainingTask,
-  cancelTrainingTask,
+  deleteTrainingTask,
   pauseTrainingTask,
   resumeTrainingTask,
-  scaleTrainingTask,
   validateTrainingConfig,
+  promoteTrainingTask,
   fetchTrainingTasks,
   fetchTrainingTask,
   fetchTrainingOptions,
@@ -288,17 +336,18 @@ const form = reactive({
   parallel_strategy: 'zero2' as string,
   config: {
     model_type: 'gpt2',
-    num_gpus: 4,
-    batch_size: 32,
+    num_gpus: 1,
+    batch_size: 4,
     learning_rate: 2e-5,
     max_epochs: 10,
-    seq_length: 1024,
+    max_steps: 0,
+    seq_length: 256,
     precision: 'fp16' as const,
   },
 })
 
 const scaleForm = reactive({
-  gpu_count: 4,
+  gpu_count: 1,
   parallel_strategy: undefined as string | undefined,
 })
 
@@ -432,15 +481,14 @@ const startTraining = async () => {
   }
   try {
     const gpuCount = Number(gpuOptionValue.value)
+    const cfg: Record<string, any> = { ...form.config, num_gpus: gpuCount }
+    if (!cfg.max_steps) delete cfg.max_steps  // 0 means "don't limit by steps"
     const body = {
       task_name: form.task_name,
       dataset_id: form.dataset_id!,
       framework: form.framework,
       parallel_strategy: form.parallel_strategy as any,
-      config: {
-        ...form.config,
-        num_gpus: gpuCount,
-      },
+      config: cfg,
     }
     const res = await createTrainingTask(body)
     ElMessage.success(`训练任务已创建: ${res.data?.task_code ?? ''}`)
@@ -482,6 +530,28 @@ const handleCancel = async (row: TrainingTaskListItem) => {
     await loadStats()
   } catch (e: unknown) {
     ElMessage.error((e as Error).message || '取消失败')
+  }
+}
+
+const handlePromote = async (row: TrainingTaskListItem) => {
+  try {
+    const res = await promoteTrainingTask(row.id)
+    ElMessage.success(`已转为模型版本: ${(res.data as any)?.model_code ?? ''} v${(res.data as any)?.version ?? ''}`)
+    await loadTasks()
+    await loadStats()
+  } catch (e: unknown) {
+    ElMessage.error((e as Error).message || '转为模型失败，可能已存在对应版本')
+  }
+}
+
+const handleDeleteTask = async (row: TrainingTaskListItem) => {
+  try {
+    await deleteTrainingTask(row.id)
+    ElMessage.success(`任务 ${row.task_code} 已删除`)
+    await loadTasks()
+    await loadStats()
+  } catch (e: unknown) {
+    ElMessage.error((e as Error).message || '删除失败')
   }
 }
 

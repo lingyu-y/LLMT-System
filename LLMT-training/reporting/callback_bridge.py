@@ -27,6 +27,8 @@ class ReportingCallbackBridge(TrainingCallback):
         minio_checkpointer: MinIOCheckpointer | None = None,
         report_interval_steps: int = 10,
         report_gpu_metrics: bool = True,
+        upload_to_minio: bool = True,
+        max_checkpoints: int = 2,
     ):
         self.task_code = task_code
         self.influxdb_writer = influxdb_writer
@@ -34,12 +36,15 @@ class ReportingCallbackBridge(TrainingCallback):
         self.minio_checkpointer = minio_checkpointer
         self.report_interval_steps = report_interval_steps
         self.report_gpu_metrics = report_gpu_metrics
+        self.upload_to_minio = upload_to_minio
+        self.max_checkpoints = max(1, max_checkpoints)
         self._step_count = 0
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "ReportingCallbackBridge":
         """Create a ReportingCallbackBridge from a training config dict."""
         reporting = config.get("reporting", {})
+        checkpoint = config.get("checkpoint", {})
         task_code = config.get("task_code", "")
 
         influxdb_writer = InfluxDBMetricsWriter(
@@ -63,6 +68,8 @@ class ReportingCallbackBridge(TrainingCallback):
             minio_checkpointer=minio_checkpointer,
             report_interval_steps=reporting.get("report_interval_steps", 10),
             report_gpu_metrics=reporting.get("report_gpu_metrics", True),
+            upload_to_minio=checkpoint.get("upload_to_minio", True),
+            max_checkpoints=checkpoint.get("max_checkpoints", 2),
         )
 
     def on_train_begin(self, state: TrainingState, **kwargs: Any) -> None:
@@ -113,11 +120,15 @@ class ReportingCallbackBridge(TrainingCallback):
     def on_checkpoint(self, state: TrainingState, **kwargs: Any) -> None:
         """Upload checkpoint to MinIO."""
         checkpoint_path = kwargs.get("checkpoint_path", "")
-        if self.minio_checkpointer and checkpoint_path:
+        if self.minio_checkpointer and checkpoint_path and self.upload_to_minio:
             self.minio_checkpointer.upload_checkpoint(
                 task_code=self.task_code,
                 local_dir=checkpoint_path,
                 step=state.global_step,
+            )
+            self.minio_checkpointer.prune_checkpoints(
+                task_code=self.task_code,
+                keep=self.max_checkpoints,
             )
 
     def on_error(self, state: TrainingState, **kwargs: Any) -> None:

@@ -698,11 +698,14 @@ def _iter_dataset_objects(minio, bucket: str, dataset: Dataset):
     ]
 
 
-def _preprocess_object_to_jsonl(minio, bucket: str, object_name: str, output) -> tuple[int, int]:
+def _iter_object_records(minio, bucket: str, object_name: str):
+    """Yield individual text strings from a raw MinIO object.
+
+    Parses JSONL, CSV, or plain text line-by-line so the caller can process
+    records one at a time (e.g.  for per-record shard rotation).
+    """
     suffix = object_name.rsplit(".", 1)[-1].lower() if "." in object_name else "txt"
     response = minio.get_object(bucket, object_name)
-    record_count = 0
-    bytes_written = 0
     try:
         lines = _iter_response_lines(response)
         if suffix in {"json", "jsonl"}:
@@ -713,36 +716,41 @@ def _preprocess_object_to_jsonl(minio, bucket: str, object_name: str, output) ->
                 try:
                     parsed = json.loads(stripped)
                 except json.JSONDecodeError:
-                    bytes_written += _write_jsonl_record(output, stripped)
-                    record_count += 1
+                    yield stripped
                     continue
-                texts = _extract_json_texts(parsed)
-                for text in texts:
-                    written = _write_jsonl_record(output, text)
-                    if written:
-                        bytes_written += written
-                        record_count += 1
+                for text in _extract_json_texts(parsed):
+                    yield text
         elif suffix == "csv":
             reader = _stdlib_csv.reader(lines)
             for row in reader:
                 text = _normalize_text(" ".join(cell for cell in row if cell is not None))
-                written = _write_jsonl_record(output, text)
-                if written:
-                    bytes_written += written
-                    record_count += 1
+                if text:
+                    yield text
         else:
             for line in lines:
-                written = _write_jsonl_record(output, line)
-                if written:
-                    bytes_written += written
-                    record_count += 1
+                if line.strip():
+                    yield line
     finally:
         response.close()
         response.release_conn()
+
+
+def _preprocess_object_to_jsonl(minio, bucket: str, object_name: str, output) -> tuple[int, int]:
+    """Write all records from *object_name* to *output* in JSONL format.
+
+    Returns (record_count, bytes_written).
+    """
+    record_count = 0
+    bytes_written = 0
+    for text in _iter_object_records(minio, bucket, object_name):
+        written = _write_jsonl_record(output, text)
+        if written:
+            bytes_written += written
+            record_count += 1
     return record_count, bytes_written
 
 
-def _preprocess_dataset_to_jsonl(dataset: Dataset) -> dict:
+def _preprocess_dataset_to_jsonl(dataset: Dataset, shard_size_mb: int = 0) -> dict:
     settings = get_settings()
     minio = get_minio_client()
     bucket = settings.MINIO_BUCKET_DATASETS
@@ -750,40 +758,107 @@ def _preprocess_dataset_to_jsonl(dataset: Dataset) -> dict:
     if not raw_objects:
         raise ValueError("没有可预处理的原始数据文件")
 
-    output_object = _object_name(dataset, "processed/data.jsonl")
+    shard_limit = shard_size_mb * 1048576 if shard_size_mb > 0 else 0
     total_records = 0
     total_bytes = 0
-    with tempfile.TemporaryFile() as output:
-        for obj in raw_objects:
-            records, written = _preprocess_object_to_jsonl(minio, bucket, obj.object_name, output)
-            total_records += records
+
+    temp_files: list[tempfile.TemporaryFile] = [tempfile.TemporaryFile()]
+    shard_record_counts: list[int] = [0]
+    shard_byte_sizes: list[int] = [0]
+    current = 0
+
+    for obj in raw_objects:
+        for text in _iter_object_records(minio, bucket, obj.object_name):
+            written = _write_jsonl_record(temp_files[current], text)
+            if not written:
+                continue
+            total_records += 1
             total_bytes += written
-        if total_records == 0:
-            raise ValueError("预处理未抽取到有效文本")
-        output.seek(0)
+            shard_record_counts[current] += 1
+            shard_byte_sizes[current] += written
+
+            if shard_limit > 0 and shard_byte_sizes[current] >= shard_limit:
+                temp_files[current].seek(0)
+                temp_files.append(tempfile.TemporaryFile())
+                current += 1
+                shard_record_counts.append(0)
+                shard_byte_sizes.append(0)
+
+    if total_records == 0:
+        raise ValueError("预处理未抽取到有效文本")
+
+    num_shards = current + 1
+
+    if num_shards == 1:
+        output_object = _object_name(dataset, "processed/data.jsonl")
+        temp_files[0].seek(0)
         minio.put_object(
             bucket,
             output_object,
-            data=output,
+            data=temp_files[0],
             length=total_bytes,
             content_type="application/x-ndjson; charset=utf-8",
         )
+        return {
+            "output_path": f"s3://{bucket}/{output_object}",
+            "output_object": output_object,
+            "record_count": total_records,
+            "size": total_bytes,
+            "source_file_count": len(raw_objects),
+            "shard_count": 1,
+        }
 
+    for i in range(num_shards):
+        shard_name = f"processed/data_shard_{i:05d}.jsonl"
+        shard_obj = _object_name(dataset, shard_name)
+        temp_files[i].seek(0)
+        _minio_retry_put(
+            minio, bucket, shard_obj,
+            temp_files[i].read(),
+            "application/x-ndjson; charset=utf-8",
+        )
+
+    manifest = {
+        "shard_count": num_shards,
+        "shard_size_mb": shard_size_mb,
+        "total_records": total_records,
+        "total_bytes": total_bytes,
+        "shards": [
+            {
+                "path": f"processed/data_shard_{i:05d}.jsonl",
+                "records": shard_record_counts[i],
+                "bytes": shard_byte_sizes[i],
+            }
+            for i in range(num_shards)
+        ],
+    }
+    manifest_bytes = json.dumps(manifest, ensure_ascii=False).encode("utf-8")
+    manifest_obj = _object_name(dataset, "processed/shards_manifest.json")
+    _minio_retry_put(minio, bucket, manifest_obj, manifest_bytes, "application/json")
+
+    first_obj = _object_name(dataset, "processed/data_shard_00000.jsonl")
     return {
-        "output_path": f"s3://{bucket}/{output_object}",
-        "output_object": output_object,
+        "output_path": f"s3://{bucket}/{first_obj}",
+        "output_object": first_obj,
         "record_count": total_records,
         "size": total_bytes,
         "source_file_count": len(raw_objects),
+        "shard_count": num_shards,
     }
 
 
-def start_preprocess(db: Session, dataset: Dataset) -> dict:
-    dataset_repository.update_dataset(db, dataset, quality_status="checking")
+def start_preprocess(db: Session, dataset: Dataset, shard_size_mb: int = 0) -> dict:
+    dataset_repository.update_dataset(db, dataset, quality_status="checking", processing_status="processing")
     job = dataset_repository.create_processing_job(db, dataset, "preprocess")
     try:
-        preprocess_result = _preprocess_dataset_to_jsonl(dataset)
+        preprocess_result = _preprocess_dataset_to_jsonl(dataset, shard_size_mb=shard_size_mb)
         report = check_quality(db, dataset)
+        # Mark dataset as preprocessed so training can find processed/data.jsonl
+        dataset_repository.update_dataset(
+            db, dataset,
+            quality_status="passed" if report["passed"] else "failed",
+            processing_status="completed",
+        )
         return dataset_repository.update_processing_job(
             job["job_id"],
             status="completed" if report["passed"] else "failed",
@@ -795,7 +870,7 @@ def start_preprocess(db: Session, dataset: Dataset) -> dict:
             source_file_count=preprocess_result["source_file_count"],
         ) or job
     except Exception as exc:
-        dataset_repository.update_dataset(db, dataset, quality_status="failed")
+        dataset_repository.update_dataset(db, dataset, quality_status="failed", processing_status="failed")
         return dataset_repository.update_processing_job(
             job["job_id"],
             status="failed",
@@ -823,8 +898,9 @@ def _sample_data_from_minio(dataset: Dataset, max_bytes: int = 1024 * 1024) -> t
         for prefix in _storage_prefix_candidates(dataset):
             processed.extend(
                 o for o in minio.list_objects(bucket, prefix=prefix.rstrip("/") + "/processed/", recursive=True)
-                if not o.is_dir and o.object_name.endswith("processed/data.jsonl")
+                if not o.is_dir and o.object_name.endswith(".jsonl") and "shards_manifest" not in o.object_name
             )
+        processed.sort(key=lambda o: o.object_name)
         files = processed or files
         if not files:
             return None, "no objects in storage"

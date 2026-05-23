@@ -67,10 +67,48 @@ class DeepSpeedTrainer(BaseTrainer):
                         "betas": [hp.get("beta1", 0.9), hp.get("beta2", 0.999)],
                         "eps": hp.get("adam_epsilon", 1e-8),
                         "weight_decay": hp.get("weight_decay", 0.01),
+                        "torch_adam": True,
                     },
                 },
                 "zero_optimization": {"stage": 2},
             }
+
+    @staticmethod
+    def _estimate_total_steps(
+        hp: dict[str, Any],
+        train_dataloader: DataLoader | None,
+    ) -> int:
+        """Resolve the exact training step budget used by both loop and scheduler."""
+        max_steps = hp.get("max_steps")
+        if max_steps:
+            return int(max_steps)
+
+        max_epochs = int(hp.get("max_epochs", 10))
+        if train_dataloader is not None:
+            try:
+                return max(1, max_epochs * len(train_dataloader))
+            except TypeError:
+                pass
+        return max(1, max_epochs * 1000)
+
+    @staticmethod
+    def _sync_scheduler_steps(
+        ds_config: dict[str, Any],
+        hp: dict[str, Any],
+        total_steps: int,
+    ) -> None:
+        """Make DeepSpeed scheduler use the same step budget as the trainer loop."""
+        scheduler = ds_config.get("scheduler")
+        if not isinstance(scheduler, dict):
+            return
+
+        params = scheduler.setdefault("params", {})
+        warmup_steps = min(int(hp.get("warmup_steps", 1000)), total_steps)
+        learning_rate = float(hp.get("learning_rate", 2e-5))
+        params["warmup_num_steps"] = warmup_steps
+        params["total_num_steps"] = total_steps
+        params["warmup_max_lr"] = learning_rate
+        params["warmup_min_lr"] = learning_rate / max(warmup_steps, 1)
 
     def train(self) -> TrainingState:
         """Run the DeepSpeed training loop."""
@@ -80,10 +118,21 @@ class DeepSpeedTrainer(BaseTrainer):
         self.callbacks.on_train_begin(self.state)
 
         ds_config = self._get_or_build_ds_config()
+        hp = self.config.get("hyperparams", {})
+        max_epochs = int(hp.get("max_epochs", 10))
+        total_steps = self._estimate_total_steps(hp, self.train_dataloader)
+        self._sync_scheduler_steps(ds_config, hp, total_steps)
+        scheduler_params = ds_config.get("scheduler", {}).get("params", {})
+        print(
+            "[DeepSpeedTrainer] scheduler ready: "
+            f"total_steps={scheduler_params.get('total_num_steps', total_steps)} "
+            f"warmup_steps={scheduler_params.get('warmup_num_steps')}",
+            flush=True,
+        )
 
         # Write ds_config to temp file (required by deepspeed.initialize in some cases)
         ds_config_path = os.path.join(
-            self.config.get("checkpoint", {}).get("checkpoint_dir", "./checkpoints"),
+            self.config.get("checkpoint", {}).get("checkpoint_dir", "/tmp/llmt_checkpoints"),
             "ds_config.json",
         )
         os.makedirs(os.path.dirname(ds_config_path), exist_ok=True)
@@ -117,6 +166,7 @@ class DeepSpeedTrainer(BaseTrainer):
 
         # Move model to correct device before init
         self.model = self.model.to(device)
+        print(f"[DeepSpeedTrainer] initializing DeepSpeed on device={device}", flush=True)
 
         # Ensure distributed init environment variables are set (required by DeepSpeed)
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
@@ -134,21 +184,20 @@ class DeepSpeedTrainer(BaseTrainer):
                 world_size=1,
             )
 
-        # DeepSpeed initialize
+        # Save original sampler before training starts.
+        _train_sampler = getattr(self.train_dataloader, "sampler", None) if self.train_dataloader is not None else None
+
+        # Keep the caller-built DataLoader. Passing training_data to DeepSpeed
+        # makes DeepSpeed rebuild a loader internally, which can re-enable
+        # multiprocessing workers and lose the package path prepared by backend.
         model_engine, optimizer, train_dataloader, scheduler = deepspeed.initialize(
             model=self.model,
             model_parameters=[p for p in self.model.parameters() if p.requires_grad],
-            training_data=self.train_dataloader,
             config=ds_config,
         )
+        print("[DeepSpeedTrainer] DeepSpeed initialized, entering training loop", flush=True)
         self._ds_engine = model_engine
         self.train_dataloader = train_dataloader or self.train_dataloader
-
-        hp = self.config.get("hyperparams", {})
-        max_epochs = hp.get("max_epochs", 10)
-        max_steps = hp.get("max_steps")
-        grad_accum = hp.get("gradient_accumulation_steps", 1)
-        max_grad_norm = hp.get("max_grad_norm", 1.0)
 
         start_time = time.time()
 
@@ -157,25 +206,36 @@ class DeepSpeedTrainer(BaseTrainer):
                 self.state.epoch = epoch
                 self.callbacks.on_epoch_begin(self.state)
 
-                if isinstance(self.train_dataloader.sampler, DistributedSampler):
-                    self.train_dataloader.sampler.set_epoch(epoch)
+                if isinstance(_train_sampler, DistributedSampler):
+                    _train_sampler.set_epoch(epoch)
 
                 for step, batch in enumerate(self.train_dataloader):
+                    if self.state.global_step == 0 and step == 0:
+                        print("[DeepSpeedTrainer] first batch received", flush=True)
                     if self._should_stop():
+                        break
+                    if total_steps and self.state.global_step >= total_steps:
                         break
 
                     # Move batch to device
                     batch = {k: v.to(model_engine.device) if isinstance(v, torch.Tensor) else v
                              for k, v in batch.items()}
+                    if "input_ids" in batch and isinstance(batch["input_ids"], torch.Tensor):
+                        batch["input_ids"] = batch["input_ids"].long()
+                    if "attention_mask" in batch and isinstance(batch["attention_mask"], torch.Tensor):
+                        batch["attention_mask"] = batch["attention_mask"].long()
+                    if "labels" in batch and isinstance(batch["labels"], torch.Tensor):
+                        batch["labels"] = batch["labels"].long()
 
                     # Forward
                     outputs = model_engine(**{k: v for k, v in batch.items()
                                               if k in ("input_ids", "attention_mask")})
+
                     loss = self.loss_fn(
                         outputs.logits.view(-1, outputs.logits.size(-1)),
                         batch["labels"].view(-1),
                     )
-                    # Backward (DeepSpeed handles gradient accumulation internally)
+                    # Backward + step via DeepSpeed engine
                     model_engine.backward(loss)
                     model_engine.step()
 
@@ -184,6 +244,17 @@ class DeepSpeedTrainer(BaseTrainer):
                     self.state.loss = loss.item()
                     self.state.learning_rate = optimizer.param_groups[0]["lr"]
                     self.state.elapsed_seconds = time.time() - start_time
+
+                    log_interval = max(1, int(hp.get("log_interval", 10)))
+                    if self.state.global_step == 1 or self.state.global_step % log_interval == 0:
+                        print(
+                            "[DeepSpeedTrainer] "
+                            f"step={self.state.global_step}/{total_steps} "
+                            f"epoch={epoch} loss={self.state.loss:.4f} "
+                            f"lr={self.state.learning_rate:.3e} "
+                            f"elapsed={self.state.elapsed_seconds:.1f}s",
+                            flush=True,
+                        )
 
                     self.callbacks.on_step_end(
                         self.state,
@@ -195,15 +266,23 @@ class DeepSpeedTrainer(BaseTrainer):
                     ckpt_cfg = self.config.get("checkpoint", {})
                     save_interval = ckpt_cfg.get("save_interval", 500)
                     if self.state.global_step % save_interval == 0:
-                        ckpt_dir = ckpt_cfg.get("checkpoint_dir", "./checkpoints")
+                        ckpt_dir = ckpt_cfg.get("checkpoint_dir", "/tmp/llmt_checkpoints")
                         self.save_checkpoint(ckpt_dir)
 
                 self.callbacks.on_epoch_end(self.state)
 
-                if max_steps and self.state.global_step >= max_steps:
+                if self._should_stop():
+                    break
+                if total_steps and self.state.global_step >= total_steps:
                     break
 
-            self.state.status = "completed"
+            if self.state.status not in ("cancelled", "failed", "paused"):
+                self.state.status = "completed"
+                if self.state.global_step > 0:
+                    ckpt_dir = self.config.get("checkpoint", {}).get(
+                        "checkpoint_dir", "/tmp/llmt_checkpoints",
+                    )
+                    self.save_checkpoint(ckpt_dir)
 
         except Exception as e:
             self.state.status = "failed"
@@ -211,6 +290,11 @@ class DeepSpeedTrainer(BaseTrainer):
             self.callbacks.on_error(self.state, error=e)
 
         self.callbacks.on_train_end(self.state)
+        if torch.distributed.is_initialized():
+            try:
+                torch.distributed.destroy_process_group()
+            except Exception:
+                pass
         return self.state
 
     def evaluate(self) -> dict[str, float]:
@@ -239,13 +323,19 @@ class DeepSpeedTrainer(BaseTrainer):
         return {"eval_loss": total_loss / max(total_steps, 1)}
 
     def save_checkpoint(self, path: str) -> str:
-        """Save DeepSpeed checkpoint."""
+        """Save DeepSpeed checkpoint — overwrites previous one."""
         if self._ds_engine is None:
             return ""
         os.makedirs(path, exist_ok=True)
-        tag = f"step-{self.state.global_step}"
-        self._ds_engine.save_checkpoint(path, tag=tag)
+        tag = "ckpt"
         ckpt_path = os.path.join(path, tag)
+        if os.path.exists(ckpt_path):
+            import shutil
+            if os.path.isdir(ckpt_path):
+                shutil.rmtree(ckpt_path)
+            else:
+                os.remove(ckpt_path)
+        self._ds_engine.save_checkpoint(path, tag=tag)
         self.callbacks.on_checkpoint(self.state, checkpoint_path=ckpt_path)
         return ckpt_path
 

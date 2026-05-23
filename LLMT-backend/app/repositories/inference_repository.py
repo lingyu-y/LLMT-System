@@ -33,6 +33,8 @@ def get_inference_models(db: Session) -> list[dict]:
             "version": m.version,
             "framework": m.framework,
             "tag": m.tag,
+            "model_type": (m.hyperparams_json or {}).get("model_type", "gpt2"),
+            "storage_path": m.storage_path,
         }
         for m in models
     ]

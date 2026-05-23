@@ -46,11 +46,13 @@ class ModelConfig(BaseModel):
 class DataConfig(BaseModel):
     """Data loading configuration."""
     dataset_path: str = ""
+    dataset_paths: list[str] = Field(default_factory=list)
     dataset_format: Literal["jsonl", "parquet", "megatron_bin_idx", "npy"] = "jsonl"
     train_split: float = 0.95
     seed: int = 42
     num_workers: int = 0
     pin_memory: bool = True
+    shard_size_mb: int = 0
 
 
 class HyperParamsConfig(BaseModel):
@@ -104,9 +106,9 @@ class CheckpointConfig(BaseModel):
     """Checkpointing configuration."""
     save_interval: int = 500
     eval_interval: int = 100
-    max_checkpoints: int = 5
+    max_checkpoints: int = 2
     upload_to_minio: bool = True
-    checkpoint_dir: str = "./checkpoints"
+    checkpoint_dir: str = "/tmp/llmt_checkpoints"
 
 
 class ReportingConfig(BaseModel):

@@ -72,6 +72,18 @@
                   </div>
                   <div class="button-row">
                     <el-button type="primary" :icon="Upload" @click="openAppendDialog">追加文件</el-button>
+                    <span style="display:inline-flex;align-items:center;gap:4px;margin:0 8px">
+                      <span style="white-space:nowrap;font-size:13px">分片大小</span>
+                      <el-input-number
+                        v-model="shardSizeMb"
+                        :min="0"
+                        :max="10240"
+                        :step="100"
+                        size="small"
+                        style="width:110px"
+                      />
+                      <span style="white-space:nowrap;font-size:13px">MB</span>
+                    </span>
                     <el-button :icon="VideoPlay" @click="startPreprocessJob">启动预处理</el-button>
                     <el-button :icon="Clock" @click="refreshProcessingJobs">刷新处理任务</el-button>
                   </div>
@@ -461,6 +473,7 @@ const lineageReport = ref<Lineage>()
 const lineageImpact = ref<LineageImpact>({ dataset_id: 0, affected_models: [], affected_tasks: [], affected_datasets: [] })
 const processingJobs = ref<ProcessingJob[]>([])
 const resumeEnabled = ref(true)
+const shardSizeMb = ref(512)
 const uploadMode = ref<'create' | 'append'>('create')
 const importForm = reactive({
   name: '',
@@ -801,7 +814,7 @@ const startPreprocessJob = async () => {
   }
   const datasetId = selectedDataset.value.id
   try {
-    await startPreprocess(datasetId)
+    await startPreprocess(datasetId, shardSizeMb.value)
     await refreshProcessingJobs()
     await loadDatasets()
     await loadDatasetDetails(datasetId)

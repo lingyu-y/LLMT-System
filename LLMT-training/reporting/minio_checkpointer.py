@@ -146,7 +146,7 @@ class MinIOCheckpointer:
         return results
 
     def prune_checkpoints(self, task_code: str, keep: int = 5) -> list[str]:
-        """Remove old checkpoints, keeping only the N most recent.
+        """Remove old checkpoint groups, keeping only the N most recent steps.
 
         Args:
             task_code: Training task code.
@@ -159,16 +159,32 @@ class MinIOCheckpointer:
         if self._client is None:
             return []
 
+        if keep <= 0:
+            keep = 1
+
         all_objects = list(
             self._client.list_objects(self.bucket, prefix=f"{task_code}/", recursive=True)
         )
 
-        if len(all_objects) <= keep:
+        groups: dict[str, list[Any]] = {}
+        for obj in all_objects:
+            parts = obj.object_name.split("/")
+            group = parts[1] if len(parts) > 1 and parts[1].startswith("step-") else "__root__"
+            groups.setdefault(group, []).append(obj)
+
+        step_groups = [name for name in groups if name.startswith("step-")]
+        if len(step_groups) <= keep:
             return []
 
-        # Sort by last_modified, keep the most recent
-        all_objects.sort(key=lambda o: o.last_modified or "", reverse=True)
-        to_remove = all_objects[keep:]
+        def _step_num(name: str) -> int:
+            try:
+                return int(name.rsplit("-", 1)[1])
+            except (IndexError, ValueError):
+                return -1
+
+        step_groups.sort(key=_step_num, reverse=True)
+        remove_groups = set(step_groups[keep:])
+        to_remove = [obj for group in remove_groups for obj in groups.get(group, [])]
 
         removed = []
         for obj in to_remove:

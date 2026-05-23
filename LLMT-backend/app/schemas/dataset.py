@@ -22,6 +22,7 @@ class DatasetListOut(BaseModel):
     file_count: int
     total_size: int
     quality_status: str
+    processing_status: str
     lineage_status: str
     source: Optional[str]
     owner: Optional[DatasetOwnerOut] = None
@@ -41,6 +42,7 @@ class DatasetOut(BaseModel):
     file_count: int
     total_size: int
     quality_status: str
+    processing_status: str
     lineage_status: str
     owner: Optional[DatasetOwnerOut] = None
     created_at: datetime

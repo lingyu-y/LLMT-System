@@ -70,7 +70,7 @@ class TrainingConfigDict(BaseModel):
     # Checkpoint
     save_interval: int = 500
     eval_interval: int = 100
-    max_checkpoints: int = 5
+    max_checkpoints: int = 2
     upload_to_minio: bool = True
 
     # Framework-specific overrides
