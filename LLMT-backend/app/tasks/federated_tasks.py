@@ -20,13 +20,6 @@ settings = get_settings()
 
 def _ensure_llmt_training_on_path() -> None:
     """Register the llmt_training package even if pip install -e . wasn't run."""
-    try:
-        import llmt_training  # noqa: F401
-        return
-    except ImportError:
-        pass
-
-    import importlib.util
     import sys
 
     module_path = settings.LLMT_TRAINING_MODULE_PATH
@@ -49,6 +42,32 @@ def _ensure_llmt_training_on_path() -> None:
     if not os.path.isfile(init_file):
         return
 
+    parent_dir = os.path.dirname(source_dir)
+    symlink_path = os.path.join(parent_dir, "llmt_training")
+    if os.path.islink(symlink_path) and os.path.realpath(symlink_path) != os.path.realpath(source_dir):
+        try:
+            os.unlink(symlink_path)
+        except OSError:
+            pass
+    if not os.path.exists(symlink_path):
+        try:
+            os.symlink(source_dir, symlink_path)
+        except OSError:
+            pass
+
+    if parent_dir not in sys.path:
+        sys.path.insert(0, parent_dir)
+    existing_pp = os.environ.get("PYTHONPATH", "")
+    if parent_dir not in existing_pp:
+        os.environ["PYTHONPATH"] = f"{parent_dir}:{existing_pp}" if existing_pp else parent_dir
+
+    try:
+        import llmt_training  # noqa: F401
+        return
+    except ImportError:
+        pass
+
+    import importlib.util
     spec = importlib.util.spec_from_file_location(
         "llmt_training",
         init_file,

@@ -44,9 +44,9 @@ def list_inference_models(
     return success_response(models)
 
 
-@router.post("/models/{model_code}/predict")
+@router.post("/models/{model_ref}/predict")
 def predict_sync(
-    model_code: str,
+    model_ref: str,
     body: dict,
     request: Request,
     db: Session = Depends(get_db),
@@ -59,15 +59,17 @@ def predict_sync(
 
     # Look up model metadata from DB
     from app.models.model_version import ModelVersion
-    mv = db.query(ModelVersion).filter(
-        ModelVersion.model_code == model_code,
-        ModelVersion.is_current == True,
-    ).first()
+    query = db.query(ModelVersion).filter(ModelVersion.is_current == True)
+    if model_ref.isdigit():
+        mv = query.filter(ModelVersion.id == int(model_ref)).first()
+    else:
+        mv = query.filter(ModelVersion.model_code == model_ref).first()
     if mv is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型不存在或不可用")
 
     # Extract model type & config from stored hyperparams
     hyper = mv.hyperparams_json or {}
+    model_code = mv.model_code
     model_type = hyper.get("model_type", "gpt2")
     version = mv.version or "v1.0.0"
 
@@ -84,12 +86,14 @@ def predict_sync(
             )
 
         model, tokenizer = model_tok
+        max_new_tokens = int(params.get("max_new_tokens", 20))
+        max_new_tokens = max(1, min(max_new_tokens, 64))
         output_text, latency_ms = run_inference(
             model, tokenizer, input_text,
-            max_new_tokens=params.get("max_new_tokens", 50),
-            temperature=params.get("temperature", 0.8),
-            top_p=params.get("top_p", 0.9),
-            top_k=params.get("top_k", 50),
+            max_new_tokens=max_new_tokens,
+            temperature=float(params.get("temperature", 0.8)),
+            top_p=float(params.get("top_p", 0.9)),
+            top_k=int(params.get("top_k", 50)),
         )
 
         result = {

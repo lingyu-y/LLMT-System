@@ -456,18 +456,42 @@ def promote_to_model(db: Session, task_id: int) -> dict | None:
         if minio.bucket_exists(ckpt_bucket):
             objects = list(minio.list_objects(ckpt_bucket, prefix=prefix, recursive=True))
             ckpt_files = [o for o in objects if not o.is_dir]
-            for obj in ckpt_files:
-                target_name = obj.object_name.replace(prefix, storage_path + "/", 1)
+            step_groups = sorted(
+                {
+                    parts[1]
+                    for o in ckpt_files
+                    for parts in [o.object_name.split("/")]
+                    if len(parts) > 2 and parts[1].startswith("step-")
+                },
+                key=lambda name: int(name.rsplit("-", 1)[1]) if name.rsplit("-", 1)[1].isdigit() else -1,
+            )
+            latest_group = step_groups[-1] if step_groups else ""
+            selected_files = [
+                o for o in ckpt_files
+                if not latest_group or o.object_name.startswith(f"{prefix}{latest_group}/")
+            ]
+            for obj in selected_files:
+                if latest_group:
+                    rel = obj.object_name[len(f"{prefix}{latest_group}/"):]
+                    target_name = f"{storage_path}/{rel}".replace("\\", "/")
+                else:
+                    target_name = obj.object_name.replace(prefix, storage_path + "/", 1)
                 minio.copy_object(model_bucket, target_name, CopySource(ckpt_bucket, obj.object_name))
-            if ckpt_files:
+            if selected_files:
                 ckpt_uploaded = True
-                logger.info("Promoted %d checkpoints for task %s to model %s", len(ckpt_files), task_code, model_code)
+                logger.info("Promoted latest checkpoint (%d files) for task %s to model %s", len(selected_files), task_code, model_code)
+                for obj in ckpt_files:
+                    try:
+                        minio.remove_object(ckpt_bucket, obj.object_name)
+                    except Exception:
+                        pass
+                logger.info("Removed %d source checkpoint files for task %s", len(ckpt_files), task_code)
     except Exception as exc:
         logger.warning("MinIO checkpoint copy failed: %s", exc)
 
     if not ckpt_uploaded:
         import os as _os
-        local_dirs = ["/tmp/llmt_checkpoints/ckpt", "/tmp/llmt_checkpoints/latest"]
+        local_dirs = ["/tmp/llmt_checkpoints", "/tmp/llmt_checkpoints/ckpt", "/tmp/llmt_checkpoints/latest"]
         try:
             minio = get_minio_client()
             model_bucket = settings.MINIO_BUCKET_MODELS

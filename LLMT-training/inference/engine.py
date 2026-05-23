@@ -3,7 +3,6 @@ text generation using the same model providers that power training."""
 
 from __future__ import annotations
 
-import io
 import logging
 import os
 import tempfile
@@ -37,21 +36,76 @@ def _get_minio_client():
             return None
 
 
-def _download_checkpoint(model_code: str, version: str) -> bytes | None:
-    """Download the DeepSpeed model checkpoint — tries local first, then MinIO.
+def _copy_minio_object_to_temp(minio: Any, bucket: str, object_name: str) -> str | None:
+    """Download one MinIO object to a temporary file without buffering it all in RAM."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".pt", delete=False)
+    tmp_path = tmp.name
+    try:
+        response = minio.get_object(bucket, object_name)
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            tmp.write(chunk)
+        response.close()
+        response.release_conn()
+        tmp.close()
+        return tmp_path
+    except Exception:
+        tmp.close()
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return None
 
-    Returns the raw bytes of the checkpoint file, or None on failure.
+
+def _find_checkpoint_path(model_code: str, version: str) -> tuple[str, bool] | None:
+    """Find/download a model-version checkpoint.
+
+    Returns ``(path, delete_after_load)``.
     """
-    # 1. Try local checkpoint directory first (most recent training run)
+    minio = _get_minio_client()
+    if minio is not None:
+        try:
+            from app.core.config import get_settings
+            bucket = get_settings().MINIO_BUCKET_MODELS
+        except Exception:
+            bucket = "models"
+
+        prefix = f"models/{model_code}/{version}/"
+        preferred_suffixes = (
+            "mp_rank_00_model_states.pt",
+            "checkpoint.pt",
+            "model_states.pt",
+        )
+        try:
+            for suffix in preferred_suffixes:
+                object_name = f"{prefix}{suffix}"
+                tmp_path = _copy_minio_object_to_temp(minio, bucket, object_name)
+                if tmp_path is not None:
+                    return tmp_path, True
+
+            for obj in minio.list_objects(bucket, prefix=prefix, recursive=True):
+                if obj.object_name.endswith(preferred_suffixes):
+                    tmp_path = _copy_minio_object_to_temp(minio, bucket, obj.object_name)
+                    if tmp_path is not None:
+                        return tmp_path, True
+        except Exception as exc:
+            _log.warning("Failed to download checkpoint under %s/%s: %s", bucket, prefix, exc)
+
+    # Local fallback is only a development convenience. It may be a different
+    # model version, so keep it after model-version object storage lookup.
     local_paths = [
+        os.path.join("/tmp/llmt_checkpoints", "checkpoint.pt"),
         os.path.join("/tmp/llmt_checkpoints", "ckpt", "mp_rank_00_model_states.pt"),
         os.path.join("/tmp/llmt_checkpoints", "latest", "mp_rank_00_model_states.pt"),
+        os.path.join("./checkpoints", "checkpoint.pt"),
         os.path.join("./checkpoints", "ckpt", "mp_rank_00_model_states.pt"),
     ]
     for lp in local_paths:
         if os.path.isfile(lp):
-            with open(lp, "rb") as f:
-                return f.read()
+            return lp, False
 
     # DeepSpeed convention: checkpoints/latest is a file containing the dir name
     latest_file = os.path.join("./checkpoints", "latest")
@@ -60,8 +114,15 @@ def _download_checkpoint(model_code: str, version: str) -> bytes | None:
             latest_dir = f.read().strip()
         candidate = os.path.join("./checkpoints", latest_dir, "mp_rank_00_model_states.pt")
         if os.path.isfile(candidate):
-            with open(candidate, "rb") as f:
-                return f.read()
+            return candidate, False
+
+    latest_file = os.path.join("/tmp/llmt_checkpoints", "latest")
+    if os.path.isfile(latest_file):
+        with open(latest_file, "r") as f:
+            latest_dir = f.read().strip()
+        candidate = os.path.join("/tmp/llmt_checkpoints", latest_dir, "mp_rank_00_model_states.pt")
+        if os.path.isfile(candidate):
+            return candidate, False
 
     # Fallback: scan checkpoints/ for any DeepSpeed step dir
     ckpt_root = "./checkpoints"
@@ -69,43 +130,13 @@ def _download_checkpoint(model_code: str, version: str) -> bytes | None:
         for entry in sorted(os.listdir(ckpt_root), reverse=True):
             entry_path = os.path.join(ckpt_root, entry)
             if os.path.isdir(entry_path):
-                candidate = os.path.join(entry_path, "mp_rank_00_model_states.pt")
-                if os.path.isfile(candidate):
-                    with open(candidate, "rb") as f:
-                        return f.read()
+                for filename in ("checkpoint.pt", "mp_rank_00_model_states.pt"):
+                    candidate = os.path.join(entry_path, filename)
+                    if os.path.isfile(candidate):
+                        return candidate, False
 
-    # 2. Try MinIO models bucket
-    minio = _get_minio_client()
-    if minio is None:
-        _log.warning("Checkpoint not found locally and MinIO unavailable")
-        return None
-
-    try:
-        from app.core.config import get_settings
-        bucket = get_settings().MINIO_BUCKET_MODELS
-    except Exception:
-        bucket = "models"
-
-    object_name = f"models/{model_code}/{version}/mp_rank_00_model_states.pt"
-    try:
-        response = minio.get_object(bucket, object_name)
-        data = response.read()
-        response.close()
-        response.release_conn()
-        return data
-    except Exception as exc:
-        _log.warning("Failed to download checkpoint %s/%s: %s", bucket, object_name, exc)
-        try:
-            for obj in minio.list_objects(bucket, prefix=f"models/{model_code}/{version}/", recursive=True):
-                if obj.object_name.endswith("model_states.pt"):
-                    response = minio.get_object(bucket, obj.object_name)
-                    data = response.read()
-                    response.close()
-                    response.release_conn()
-                    return data
-        except Exception:
-            pass
-        return None
+    _log.warning("Checkpoint not found for model=%s version=%s", model_code, version)
+    return None
 
 
 def _find_tokenizer_vocab(model_code: str = "", version: str = "") -> str | None:
@@ -210,10 +241,12 @@ def load_model(model_code: str, version: str, model_type: str = "gpt2",
     if cache_key in _cache:
         return _cache[cache_key]
 
-    # 1. Download checkpoint
-    checkpoint_bytes = _download_checkpoint(model_code, version)
-    if checkpoint_bytes is None:
+    # 1. Locate/download checkpoint. Keep it as a file to avoid duplicating
+    # large checkpoint bytes in the FastAPI process memory.
+    checkpoint_ref = _find_checkpoint_path(model_code, version)
+    if checkpoint_ref is None:
         return None
+    checkpoint_path, delete_checkpoint_path = checkpoint_ref
 
     # 2. Build model via registry
     from llmt_training.models.registry import ModelRegistry
@@ -224,16 +257,13 @@ def load_model(model_code: str, version: str, model_type: str = "gpt2",
 
     # 3. Load state dict
     try:
-        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as tmp:
-            tmp.write(checkpoint_bytes)
-            tmp_path = tmp.name
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
 
-        checkpoint = torch.load(tmp_path, map_location="cpu")
-        os.unlink(tmp_path)
-
-        # DeepSpeed saves state dict under 'module' key
+        # DeepSpeed saves state dict under 'module'; PyTorchTrainer uses model_state_dict.
         if "module" in checkpoint:
             state_dict = checkpoint["module"]
+        elif "model_state_dict" in checkpoint:
+            state_dict = checkpoint["model_state_dict"]
         else:
             state_dict = checkpoint
 
@@ -241,16 +271,29 @@ def load_model(model_code: str, version: str, model_type: str = "gpt2",
         model_keys = set(model.state_dict().keys())
         filtered = {k: v for k, v in state_dict.items() if k in model_keys}
 
+        if not filtered:
+            raise ValueError("checkpoint does not contain any parameters matching the model")
+
         model.load_state_dict(filtered, strict=False)
         model.eval()
 
-        # Move to GPU if available
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Default to CPU for backend sync inference. Loading into the same GPU
+        # used for training can kill the API process if memory is tight.
+        device_name = os.environ.get("LLMT_INFERENCE_DEVICE", "cpu")
+        if device_name == "cuda" and not torch.cuda.is_available():
+            device_name = "cpu"
+        device = torch.device(device_name)
         model = model.to(device)
 
     except Exception as exc:
         _log.error("Failed to load checkpoint for %s: %s", cache_key, exc)
         return None
+    finally:
+        if delete_checkpoint_path:
+            try:
+                os.unlink(checkpoint_path)
+            except OSError:
+                pass
 
     # 4. Cache
     _cache[cache_key] = (model, tokenizer)

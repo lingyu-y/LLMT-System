@@ -110,7 +110,7 @@ class FinetuneDataset(BaseDataset):
             samples.extend(file_samples)
 
         print(f"[FinetuneDataset] 总样本数: {len(samples)}")
-        return cls(samples, seq_length=seq_length)
+        return cls(samples, seq_length=seq_length, tokenizer=tokenizer)
 
 
 def _parse_file_samples(path: str) -> list[dict[str, Any]]:

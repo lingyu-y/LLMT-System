@@ -159,13 +159,17 @@ class BERTModelProvider(BaseModelProvider):
     """Provider for BERT models (MLM + classification)."""
 
     def get_model(self, config: dict[str, Any]) -> nn.Module:
+        config = config.get("model", config)
+        max_positions = config.get("max_position_embeddings") or config.get(
+            "seq_length", 512,
+        )
         bert_config = BertConfig(
             vocab_size=config.get("vocab_size", 30522),
             hidden_size=config.get("hidden_size", 768),
             num_layers=config.get("num_layers", 12),
             num_attention_heads=config.get("num_attention_heads", 12),
             intermediate_size=config.get("intermediate_size", 3072),
-            max_position_embeddings=config.get("max_position_embeddings", 512),
+            max_position_embeddings=max_positions,
             type_vocab_size=config.get("type_vocab_size", 2),
             dropout=config.get("dropout", 0.1),
             layer_norm_eps=config.get("layer_norm_eps", 1e-12),

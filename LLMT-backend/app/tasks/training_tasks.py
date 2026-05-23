@@ -28,12 +28,6 @@ def _ensure_llmt_training_on_path() -> None:
     ``PYTHONPATH`` so that DataLoader worker sub-processes (spawned via
     ``multiprocessing``) can also find the package.
     """
-    try:
-        import llmt_training  # noqa: F401
-        return
-    except ImportError:
-        pass
-
     # Resolve the physical path to the LLMT-training source directory
     module_path = settings.LLMT_TRAINING_MODULE_PATH
     if os.path.isdir(module_path):
@@ -56,22 +50,15 @@ def _ensure_llmt_training_on_path() -> None:
     if not os.path.isfile(init_file):
         return
 
-    # Register llmt_training as a package pointing to source_dir (for main process)
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(
-        "llmt_training",
-        init_file,
-        submodule_search_locations=[source_dir],
-    )
-    if spec is not None and spec.loader is not None:
-        module = importlib.util.module_from_spec(spec)
-        sys.modules["llmt_training"] = module
-        spec.loader.exec_module(module)
-
     # Create a symlink so multiprocessing workers can also find the package.
     # LLMT-training/ (hyphen) -> llmt_training/ (underscore) symlink
     parent_dir = os.path.dirname(source_dir)
     symlink_path = os.path.join(parent_dir, "llmt_training")
+    if os.path.islink(symlink_path) and os.path.realpath(symlink_path) != os.path.realpath(source_dir):
+        try:
+            os.unlink(symlink_path)
+        except OSError:
+            pass
     if not os.path.exists(symlink_path):
         try:
             os.symlink(source_dir, symlink_path)
@@ -84,6 +71,24 @@ def _ensure_llmt_training_on_path() -> None:
     existing_pp = os.environ.get("PYTHONPATH", "")
     if parent_dir not in existing_pp:
         os.environ["PYTHONPATH"] = f"{parent_dir}:{existing_pp}" if existing_pp else parent_dir
+
+    # Register llmt_training as a package pointing to source_dir for this process.
+    try:
+        import llmt_training  # noqa: F401
+        return
+    except ImportError:
+        pass
+
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "llmt_training",
+        init_file,
+        submodule_search_locations=[source_dir],
+    )
+    if spec is not None and spec.loader is not None:
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["llmt_training"] = module
+        spec.loader.exec_module(module)
 
 
 _ensure_llmt_training_on_path()
@@ -246,6 +251,11 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
         train_dataloader, eval_dataloader = build_dataloaders(
             dataset, config_dict, distributed=is_distributed,
         )
+        print(
+            f"[TrainingTask] dataloaders ready: train_batches={len(train_dataloader)}, "
+            f"eval_batches={len(eval_dataloader) if eval_dataloader is not None else 0}",
+            flush=True,
+        )
 
         # Build loss function from model provider
         loss_fn = model_provider.get_loss_fn(config_dict.get("model", {}))
@@ -281,6 +291,11 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
             callbacks=callbacks,
             state=state,
             loss_fn=loss_fn,
+        )
+        print(
+            f"[TrainingTask] trainer ready: framework={framework}, "
+            f"strategy={parallel_strategy}, starting training...",
+            flush=True,
         )
 
         cancel_cb.set_trainer(trainer)
@@ -844,19 +859,45 @@ def _promote_to_model(task_code: str) -> dict | None:
                 if minio.bucket_exists(ckpt_bucket):
                     objects = list(minio.list_objects(ckpt_bucket, prefix=prefix, recursive=True))
                     ckpt_files = [o for o in objects if not o.is_dir]
-                    for obj in ckpt_files:
-                        target_name = obj.object_name.replace(prefix, storage_path + "/", 1)
+                    step_groups = sorted(
+                        {
+                            parts[1]
+                            for o in ckpt_files
+                            for parts in [o.object_name.split("/")]
+                            if len(parts) > 2 and parts[1].startswith("step-")
+                        },
+                        key=lambda name: int(name.rsplit("-", 1)[1]) if name.rsplit("-", 1)[1].isdigit() else -1,
+                    )
+                    latest_group = step_groups[-1] if step_groups else ""
+                    selected_files = [
+                        o for o in ckpt_files
+                        if not latest_group or o.object_name.startswith(f"{prefix}{latest_group}/")
+                    ]
+                    for obj in selected_files:
+                        if latest_group:
+                            rel = obj.object_name[len(f"{prefix}{latest_group}/"):]
+                            target_name = f"{storage_path}/{rel}".replace("\\", "/")
+                        else:
+                            target_name = obj.object_name.replace(prefix, storage_path + "/", 1)
                         minio.copy_object(model_bucket, target_name, CopySource(ckpt_bucket, obj.object_name))
-                    if ckpt_files:
+                    if selected_files:
                         ckpt_uploaded = True
-                        logger.info("Copied %d checkpoint files: %s -> %s", len(ckpt_files), f"{ckpt_bucket}/{prefix}", f"{model_bucket}/{storage_path}")
+                        logger.info("Copied latest checkpoint (%d files): %s -> %s", len(selected_files), f"{ckpt_bucket}/{prefix}{latest_group}", f"{model_bucket}/{storage_path}")
+                        for obj in ckpt_files:
+                            try:
+                                minio.remove_object(ckpt_bucket, obj.object_name)
+                            except Exception:
+                                pass
+                        logger.info("Removed %d source checkpoint files for task %s", len(ckpt_files), task_code)
             except Exception as exc:
                 logger.warning("MinIO checkpoint copy failed: %s", exc)
 
             # Fallback: upload from local checkpoint directories if MinIO copy failed
             local_ckpt_dirs = [
+                "/tmp/llmt_checkpoints",
                 "/tmp/llmt_checkpoints/ckpt",
                 "/tmp/llmt_checkpoints/latest",
+                "./checkpoints",
                 "./checkpoints/step-500",
             ]
             # Also include any DeepSpeed step subdirectories under ./checkpoints/

@@ -97,22 +97,23 @@ class PyTorchTrainer(BaseTrainer):
         scheduler_type = hp.get("scheduler", "linear_warmup_decay")
         warmup_steps = hp.get("warmup_steps", 1000)
         min_lr_ratio = hp.get("min_lr", 0.0) / max(hp.get("learning_rate", 2e-5), 1e-10)
+        warmup_steps = min(warmup_steps, max(total_steps, 1))
 
         def _linear_warmup_decay(step: int) -> float:
             if step < warmup_steps:
-                return step / max(warmup_steps, 1)
+                return (step + 1) / max(warmup_steps, 1)
             progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
             return max(min_lr_ratio, 1.0 - progress)
 
         def _cosine(step: int) -> float:
             if step < warmup_steps:
-                return step / max(warmup_steps, 1)
+                return (step + 1) / max(warmup_steps, 1)
             progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
             return max(min_lr_ratio, 0.5 * (1.0 + __import__("math").cos(__import__("math").pi * progress)))
 
         def _constant_warmup(step: int) -> float:
             if step < warmup_steps:
-                return step / max(warmup_steps, 1)
+                return (step + 1) / max(warmup_steps, 1)
             return 1.0
 
         fn_map = {
@@ -245,6 +246,11 @@ class PyTorchTrainer(BaseTrainer):
 
             if self.state.status not in ("cancelled", "failed", "paused"):
                 self.state.status = "completed"
+                if self.state.global_step > 0:
+                    ckpt_dir = self.config.get("checkpoint", {}).get(
+                        "checkpoint_dir", "/tmp/llmt_checkpoints",
+                    )
+                    self.save_checkpoint(ckpt_dir)
 
         except Exception as e:
             self.state.status = "failed"
