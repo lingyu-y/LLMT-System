@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     MINIO_BUCKET_MODELS: str = "models"
     MINIO_BUCKET_CHECKPOINTS: str = "checkpoints"
     MINIO_SECURE: bool = False
+    KEEP_TRAINING_CHECKPOINTS: bool = True
 
     ELASTICSEARCH_URL: str = "http://localhost:9200"
     ELASTICSEARCH_USERNAME: str | None = None
