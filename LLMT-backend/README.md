@@ -42,18 +42,55 @@ python scripts/init_datastores.py --skip-postgres
 
 ## 运行后端
 
-完成数据库和存储初始化后，可以启动 FastAPI：
+完成数据库和存储初始化后，主后端和在线推理服务分开启动。主后端负责鉴权、数据库、
+训练任务和模型版本管理；推理服务单独加载模型权重，避免大模型推理把主后端进程拖垮。
+
+先确认 `.env` 中配置了独立推理服务地址和推理保护参数：
+
+```env
+LLMT_INFERENCE_SERVICE_URL=http://127.0.0.1:8001
+LLMT_INFERENCE_MAX_CHECKPOINT_MB=2048
+LLMT_INFERENCE_CACHE_SIZE=0
+LLMT_INFERENCE_DEVICE=cpu
+```
+
+终端 1：启动主后端：
 
 ```bash
 conda activate llmt-backend
-uvicorn app.main:app --reload
+uvicorn app.main:app --reload --port 8000
 ```
 
-默认接口地址：
+终端 2：启动独立推理服务：
+
+```bash
+conda activate llmt-backend
+uvicorn app.inference_service:app --host 127.0.0.1 --port 8001
+```
+
+默认地址：
 
 ```text
-http://127.0.0.1:8000
+主后端：http://127.0.0.1:8000
+推理服务：http://127.0.0.1:8001
 ```
+
+健康检查：
+
+```bash
+curl --noproxy '*' http://127.0.0.1:8000/api/v1/health
+curl --noproxy '*' http://127.0.0.1:8001/health
+```
+
+如果开发机开启了系统代理/梯子，请确保本地地址直连，不走代理：
+
+```bash
+export NO_PROXY=localhost,127.0.0.1,::1
+export no_proxy=localhost,127.0.0.1,::1
+```
+
+主后端转发到推理服务时会忽略代理环境变量；浏览器和终端仍建议把 `localhost`、
+`127.0.0.1` 加到代理绕过列表，避免前端开发代理返回 502。
 
 ## 登录与注册
 
@@ -69,8 +106,8 @@ http://127.0.0.1:8000
 健康检查接口：
 
 ```text
-http://127.0.0.1:8000/api/health
-http://127.0.0.1:8000/api/health/databases
+http://127.0.0.1:8000/api/v1/health
+http://127.0.0.1:8000/api/v1/health/databases
 ```
 
 ## 数据层说明
