@@ -134,11 +134,15 @@ class DeepSpeedTrainer(BaseTrainer):
                 world_size=1,
             )
 
-        # DeepSpeed initialize
+        # Save original sampler before deepspeed.initialize replaces the dataloader
+        _train_sampler = getattr(self.train_dataloader, "sampler", None) if self.train_dataloader is not None else None
+
+        # DeepSpeed initialize — training_data must be a Dataset, not DataLoader
+        train_dataset = self.train_dataloader.dataset if self.train_dataloader is not None else None
         model_engine, optimizer, train_dataloader, scheduler = deepspeed.initialize(
             model=self.model,
             model_parameters=[p for p in self.model.parameters() if p.requires_grad],
-            training_data=self.train_dataloader,
+            training_data=train_dataset,
             config=ds_config,
         )
         self._ds_engine = model_engine
@@ -149,6 +153,7 @@ class DeepSpeedTrainer(BaseTrainer):
         max_steps = hp.get("max_steps")
         grad_accum = hp.get("gradient_accumulation_steps", 1)
         max_grad_norm = hp.get("max_grad_norm", 1.0)
+        _precision = hp.get("precision", "fp16")
 
         start_time = time.time()
 
@@ -157,8 +162,8 @@ class DeepSpeedTrainer(BaseTrainer):
                 self.state.epoch = epoch
                 self.callbacks.on_epoch_begin(self.state)
 
-                if isinstance(self.train_dataloader.sampler, DistributedSampler):
-                    self.train_dataloader.sampler.set_epoch(epoch)
+                if isinstance(_train_sampler, DistributedSampler):
+                    _train_sampler.set_epoch(epoch)
 
                 for step, batch in enumerate(self.train_dataloader):
                     if self._should_stop():
@@ -168,14 +173,33 @@ class DeepSpeedTrainer(BaseTrainer):
                     batch = {k: v.to(model_engine.device) if isinstance(v, torch.Tensor) else v
                              for k, v in batch.items()}
 
-                    # Forward
-                    outputs = model_engine(**{k: v for k, v in batch.items()
-                                              if k in ("input_ids", "attention_mask")})
+                    # Ensure integer tensors stay Long (DeepSpeed engine
+                    # __call__ casts them, corrupting token IDs >2048 in fp16)
+                    batch["input_ids"] = batch["input_ids"].long()
+                    batch["labels"] = batch["labels"].long()
+                    if "attention_mask" in batch:
+                        batch["attention_mask"] = batch["attention_mask"].long()
+
+                    # Forward via raw module to avoid DeepSpeed's dtype casting.
+                    # PyTorch autocast correctly leaves integer tensors alone.
+                    use_amp = _precision == "fp16" and model_engine.device.type == "cuda"
+                    if use_amp:
+                        with torch.cuda.amp.autocast():
+                            outputs = model_engine.module(
+                                input_ids=batch["input_ids"],
+                                attention_mask=batch.get("attention_mask"),
+                            )
+                    else:
+                        outputs = model_engine.module(
+                            input_ids=batch["input_ids"],
+                            attention_mask=batch.get("attention_mask"),
+                        )
+
                     loss = self.loss_fn(
                         outputs.logits.view(-1, outputs.logits.size(-1)),
                         batch["labels"].view(-1),
                     )
-                    # Backward (DeepSpeed handles gradient accumulation internally)
+                    # Backward + step via DeepSpeed engine
                     model_engine.backward(loss)
                     model_engine.step()
 
@@ -226,8 +250,12 @@ class DeepSpeedTrainer(BaseTrainer):
             for batch in self.eval_dataloader:
                 batch = {k: v.to(self._ds_engine.device) if isinstance(v, torch.Tensor) else v
                          for k, v in batch.items()}
-                outputs = self._ds_engine(**{k: v for k, v in batch.items()
-                                             if k in ("input_ids", "attention_mask")})
+                if "input_ids" in batch:
+                    batch["input_ids"] = batch["input_ids"].long()
+                outputs = self._ds_engine.module(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch.get("attention_mask"),
+                )
                 loss = self.loss_fn(
                     outputs.logits.view(-1, outputs.logits.size(-1)),
                     batch["labels"].view(-1),

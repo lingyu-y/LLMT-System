@@ -263,13 +263,14 @@ def delete_dataset(
 @router.post("/{dataset_id}/preprocess")
 def start_preprocess(
     dataset_id: int,
+    shard_size_mb: int = Query(0, ge=0, description="分片大小（MB），0 表示单文件模式"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     ds = dataset_repository.get_dataset_by_id(db, dataset_id)
     if ds is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="数据集不存在")
-    job = dataset_service.start_preprocess(db, ds)
+    job = dataset_service.start_preprocess(db, ds, shard_size_mb=shard_size_mb)
     log_service.create_log(
         db, user_id=current_user.id, username=current_user.username,
         action="preprocess", resource="dataset", resource_id=ds.id,

@@ -79,10 +79,11 @@ class PostgresStatusUpdater:
         if not updates:
             return True
 
-        # Add timestamp for started_at / ended_at
-        if kwargs.get("status") == "running":
+        status = kwargs.get("status")
+
+        if status == "running":
             updates.append("started_at = COALESCE(started_at, NOW())")
-        if kwargs.get("status") in ("completed", "failed", "cancelled"):
+        if status in ("completed", "failed", "cancelled"):
             updates.append("ended_at = NOW()")
 
         sql = text(f"UPDATE training_tasks SET {', '.join(updates)} WHERE task_code = :task_code")
@@ -90,7 +91,38 @@ class PostgresStatusUpdater:
         with Session(engine) as session:
             result = session.execute(sql, params)
             session.commit()
-            return result.rowcount > 0
+
+        # Auto-promote completed training to a ModelVersion
+        if status == "completed":
+            self._try_promote_to_model(task_code)
+
+        return result.rowcount > 0
+
+    def _try_promote_to_model(self, task_code: str) -> None:
+        """Attempt to promote a completed training task to a ModelVersion.
+
+        Tries the backend's Python API first (when running inside the Celery
+        worker process), then falls back to the HTTP endpoint.
+        """
+        # Path 1: Direct import (when running inside the backend process)
+        try:
+            from app.tasks.training_tasks import _promote_to_model
+            _promote_to_model(task_code)
+            return
+        except ImportError:
+            pass
+        except Exception:
+            return  # Silently ignore on failure
+
+        # Path 2: HTTP API (when running in a separate training subprocess)
+        try:
+            import httpx
+            httpx.post(
+                f"{self.api_url}/training/internal/promote-by-code/{task_code}",
+                timeout=30,
+            )
+        except Exception:
+            pass  # Best-effort; user can promote manually from the UI
 
     def _update_via_api(self, task_code: str, **kwargs: Any) -> bool:
         """Update via HTTP API call (for separate training processes)."""

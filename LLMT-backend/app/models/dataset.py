@@ -30,6 +30,11 @@ class Dataset(IdMixin, TimestampMixin, Base):
         default="unchecked",
         nullable=False,
     )
+    processing_status: Mapped[str] = mapped_column(
+        String(32),
+        default="pending",
+        nullable=False,
+    )
     lineage_status: Mapped[str] = mapped_column(
         String(32),
         default="none",

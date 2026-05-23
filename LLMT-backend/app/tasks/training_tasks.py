@@ -154,9 +154,17 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
             from app.models.dataset import Dataset
             dataset = db.query(Dataset).filter(Dataset.id == task.dataset_id).first()
             if dataset:
-                local_path = _resolve_dataset_path(dataset)
-                if local_path:
-                    config_json["dataset_path"] = local_path
+                local_paths = _resolve_dataset_paths(dataset)
+                if local_paths:
+                    # Set primary path + all paths for multi-file streaming
+                    config_json["dataset_path"] = local_paths[0]
+                    if len(local_paths) > 1:
+                        config_json["dataset_paths"] = local_paths
+                    import logging
+                    _log = logging.getLogger(__name__)
+                    _log.info("训练任务 %s 数据集 '%s' 解析到 %d 个文件:", task_code, dataset.name, len(local_paths))
+                    for i, p in enumerate(local_paths):
+                        _log.info("  [%d/%d] %s", i + 1, len(local_paths), p)
                 else:
                     _update_task_status(
                         task_code, "failed",
@@ -172,7 +180,7 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
                     fmt = config_json["dataset_format"]
                 else:
                     fmt = _map_data_type_to_format(
-                        dataset.data_type, local_path,
+                        dataset.data_type, local_paths[0] if local_paths else "",
                     )
                 config_json["dataset_format"] = fmt
 
@@ -382,45 +390,97 @@ def _map_data_type_to_format(data_type: str, file_path: str) -> str:
     return type_map.get(data_type, "jsonl")
 
 
-def _resolve_dataset_path(ds) -> str | None:
-    """Return a local file path for the dataset, downloading from MinIO if needed.
+def _resolve_dataset_paths(ds) -> list[str]:
+    """Return all local data file paths for the dataset, downloading from MinIO if needed.
 
-    Tries:
-      1. Local filesystem (storage_path exists as-is)
-      2. MinIO download to temp dir, then find the data file
+    **Prefers preprocessed data**: if ``processed/data.jsonl`` exists it is
+    returned exclusively.  Otherwise raw data files are returned in sorted order.
 
-    Returns the path to a data file, or None.
+    Returns a sorted list of paths, or empty list if nothing found.
     """
     import logging
     logger = logging.getLogger(__name__)
     storage_path = ds.storage_path or ""
 
+    valid_ext = (".jsonl", ".npy", ".bin", ".txt", ".json", ".csv")
+    data_files: list[str] = []
+
+    def _find_processed_files(root: str) -> list[str]:
+        """Find processed data files under *root*.
+
+        Prefers sharded files (``data_shard_*.jsonl``), falls back to the
+        legacy single file (``data.jsonl``). Returns empty list if nothing found.
+        """
+        processed_dir = os.path.join(root, "processed")
+        if not os.path.isdir(processed_dir):
+            return []
+
+        shards = sorted(
+            os.path.join(processed_dir, fn)
+            for fn in os.listdir(processed_dir)
+            if fn.startswith("data_shard_") and fn.endswith(".jsonl")
+        )
+        if shards:
+            return shards
+
+        legacy = os.path.join(processed_dir, "data.jsonl")
+        if os.path.isfile(legacy):
+            return [legacy]
+
+        for dirpath, _, filenames in os.walk(root):
+            if "processed" in dirpath.split(os.sep):
+                for fn in filenames:
+                    if fn.startswith("data_shard_") and fn.endswith(".jsonl"):
+                        shards.append(os.path.join(dirpath, fn))
+                if shards:
+                    return shards
+                for fn in filenames:
+                    if fn == "data.jsonl":
+                        return [os.path.join(dirpath, fn)]
+        return []
+
+    def _scan_dir(root: str) -> None:
+        """Recursively collect raw data files, skipping processed/."""
+        if not os.path.isdir(root):
+            return
+        for entry in sorted(os.listdir(root)):
+            full = os.path.join(root, entry)
+            if os.path.isfile(full) and entry.endswith(valid_ext):
+                if "/processed/" in full:
+                    continue
+                data_files.append(full)
+            elif os.path.isdir(full) and not entry.startswith(".") and entry != "processed":
+                _scan_dir(full)
+
     # 1. Try local filesystem directly
     if os.path.exists(storage_path):
-        if os.path.isfile(storage_path):
-            return storage_path
-        # It's a directory – look for a data file inside
-        for fname in os.listdir(storage_path):
-            if fname.endswith((".jsonl", ".npy", ".bin", ".txt", ".json", ".csv")):
-                return os.path.join(storage_path, fname)
-        # If directory has subdirectories, search deeper
-        for root, _, files in os.walk(storage_path):
-            for fname in files:
-                if fname.endswith((".jsonl", ".npy", ".bin", ".txt", ".json", ".csv")):
-                    return os.path.join(root, fname)
+        if os.path.isfile(storage_path) and storage_path.endswith(valid_ext):
+            return [storage_path]
+        # Prefer preprocessed data
+        processed = _find_processed_files(storage_path)
+        if processed:
+            return processed
+        _scan_dir(storage_path)
+        if data_files:
+            return data_files
 
     # 2. Try MinIO download
     local_dir = _download_dataset_from_minio(storage_path)
     if local_dir is not None:
-        for fname in os.listdir(local_dir):
-            if fname.endswith((".jsonl", ".npy", ".bin", ".txt", ".json", ".csv")):
-                return os.path.join(local_dir, fname)
-        for root, _, files in os.walk(local_dir):
-            for fname in files:
-                if fname.endswith((".jsonl", ".npy", ".bin", ".txt", ".json", ".csv")):
-                    return os.path.join(root, fname)
+        processed = _find_processed_files(local_dir)
+        if processed:
+            return processed
+        _scan_dir(local_dir)
+        if data_files:
+            return data_files
 
-    return None
+    return []
+
+
+def _resolve_dataset_path(ds) -> str | None:
+    """Legacy wrapper returning the first resolved file path."""
+    paths = _resolve_dataset_paths(ds)
+    return paths[0] if paths else None
 
 
 def _download_dataset_from_minio(
@@ -505,7 +565,7 @@ def _build_training_config(
         "max_position_embeddings", "dropout", "layer_norm_eps", "activation",
     }
     data_keys = {
-        "dataset_path", "dataset_format", "train_split", "seed", "num_workers", "pin_memory",
+        "dataset_path", "dataset_paths", "dataset_format", "train_split", "seed", "num_workers", "pin_memory",
     }
     hyperparam_keys = {
         "batch_size", "learning_rate", "min_lr", "weight_decay", "max_epochs",
@@ -548,10 +608,10 @@ def _update_task_status(
 ) -> None:
     """Update TrainingTask status in PostgreSQL directly via SQLAlchemy."""
     try:
+        from datetime import datetime as _dt, timezone as _tz
         from sqlalchemy import create_engine as _ce, update as _upd
         from sqlalchemy.orm import Session as _S
         from app.models.training_task import TrainingTask as _TT
-        from datetime import datetime as _dt, timezone as _tz
         _engine = _ce(settings.postgres_database_url)
         with _S(_engine) as db:
             values: dict[str, Any] = {"status": status}
@@ -561,8 +621,120 @@ def _update_task_status(
                 values["ended_at"] = _dt.now(_tz.utc)
             db.execute(_upd(_TT).where(_TT.task_code == task_code).values(**values))
             db.commit()
+
+        # When training completes, promote checkpoints to a ModelVersion
+        if status == "completed":
+            _promote_to_model(task_code)
     except Exception:
         pass  # Best-effort status update
+
+
+def _promote_to_model(task_code: str) -> dict | None:
+    """Promote training checkpoints to a ModelVersion after successful training.
+
+    Copies checkpoint files from the checkpoints bucket to the models bucket
+    in MinIO, then creates a ModelVersion record linked to the training task.
+    """
+    import logging
+    import re
+
+    logger = logging.getLogger(__name__)
+
+    try:
+        from sqlalchemy import create_engine as _ce
+        from sqlalchemy.orm import Session as _S
+        from app.models.training_task import TrainingTask as _TT
+        from app.repositories import model_repository
+
+        _engine = _ce(settings.postgres_database_url)
+        with _S(_engine) as db:
+            task = db.query(_TT).filter(_TT.task_code == task_code).first()
+            if task is None:
+                return None
+
+            # Check if already promoted
+            existing = (
+                db.query(model_repository.ModelVersion)
+                .filter(model_repository.ModelVersion.task_id == task.id)
+                .first()
+            )
+            if existing:
+                logger.info("Task %s already promoted to model %s v%s", task_code, existing.model_code, existing.version)
+                return {"model_code": existing.model_code, "version": existing.version, "id": existing.id}
+
+            config = task.config_json or {}
+            model_type = config.get("model_type", "gpt2")
+            framework = task.framework or "pytorch"
+
+            # Generate model_code from task_name (sanitize for use as model code)
+            model_code = re.sub(r"[^a-zA-Z0-9一-鿿_-]", "-", task.task_name.lower())
+            model_code = re.sub(r"-+", "-", model_code).strip("-")
+            if not model_code:
+                model_code = f"model-{task_code.lower()}"
+
+            model_name = task.task_name
+
+            # Build structured hyperparams from training config
+            hyperparams: dict[str, Any] = {
+                "framework": framework,
+                "parallel_strategy": task.parallel_strategy,
+                "model_type": model_type,
+            }
+            for key in (
+                "learning_rate", "batch_size", "max_epochs", "max_steps",
+                "seq_length", "hidden_size", "num_layers", "num_attention_heads",
+                "precision", "optimizer", "weight_decay", "warmup_steps",
+                "gradient_accumulation_steps", "vocab_size", "train_split",
+            ):
+                if key in config:
+                    hyperparams[key] = config[key]
+
+            # Copy checkpoints from checkpoints bucket → models bucket
+            storage_path = f"models/{model_code}/{model_repository.auto_version(db, model_code)}"
+
+            try:
+                from app.core.database import get_minio_client
+                from minio.commonconfig import CopySource
+
+                minio = get_minio_client()
+                ckpt_bucket = settings.MINIO_BUCKET_CHECKPOINTS
+                model_bucket = settings.MINIO_BUCKET_MODELS
+                prefix = f"{task_code}/"
+
+                if minio.bucket_exists(ckpt_bucket):
+                    objects = list(minio.list_objects(ckpt_bucket, prefix=prefix, recursive=True))
+                    ckpt_files = [o for o in objects if not o.is_dir]
+                    for obj in ckpt_files:
+                        target_name = obj.object_name.replace(prefix, storage_path + "/", 1)
+                        minio.copy_object(model_bucket, target_name, CopySource(ckpt_bucket, obj.object_name))
+                    logger.info("Copied %d checkpoint files: %s -> %s", len(ckpt_files), f"{ckpt_bucket}/{prefix}", f"{model_bucket}/{storage_path}")
+                else:
+                    logger.info("Checkpoint bucket %s does not exist, model version created without files", ckpt_bucket)
+            except Exception as exc:
+                logger.warning("MinIO checkpoint copy failed (model version still created): %s", exc)
+
+            # Build metrics placeholder (will be populated from actual training metrics)
+            metrics: dict[str, Any] = {}
+
+            model = model_repository.create_model(
+                db,
+                model_name=model_name,
+                model_code=model_code,
+                tag=f"auto-{task_code}",
+                description=f"自动从训练任务 {task_code} 创建",
+                framework=framework,
+                metrics=metrics,
+                training_metadata=hyperparams,
+                task_id=task.id,
+                creator_id=task.creator_id,
+            )
+
+            logger.info("Promoted training task %s to model %s v%s (id=%d)", task_code, model_code, model.version, model.id)
+            return {"model_code": model_code, "version": model.version, "id": model.id}
+
+    except Exception as exc:
+        logger.warning("Failed to promote task %s to model: %s", task_code, exc)
+        return None
 
 
 def ConfigValidator_safe_validate(config: dict) -> dict:

@@ -181,6 +181,7 @@
               <el-button size="small" :disabled="row.status !== 'paused'" @click="handleResume(row)">恢复</el-button>
               <el-button size="small" @click="openScaleDialog(row)">扩缩容</el-button>
               <el-button size="small" type="danger" :disabled="!['created', 'queued', 'running'].includes(row.status)" @click="handleCancel(row)">取消</el-button>
+              <el-button size="small" :disabled="row.status !== 'completed'" @click="handlePromote(row)">转为模型</el-button>
               <el-button size="small" @click="selectTask(row)">监控</el-button>
             </template>
           </el-table-column>
@@ -230,6 +231,7 @@ import {
   resumeTrainingTask,
   scaleTrainingTask,
   validateTrainingConfig,
+  promoteTrainingTask,
   fetchTrainingTasks,
   fetchTrainingTask,
   fetchTrainingOptions,
@@ -482,6 +484,17 @@ const handleCancel = async (row: TrainingTaskListItem) => {
     await loadStats()
   } catch (e: unknown) {
     ElMessage.error((e as Error).message || '取消失败')
+  }
+}
+
+const handlePromote = async (row: TrainingTaskListItem) => {
+  try {
+    const res = await promoteTrainingTask(row.id)
+    ElMessage.success(`已转为模型版本: ${(res.data as any)?.model_code ?? ''} v${(res.data as any)?.version ?? ''}`)
+    await loadTasks()
+    await loadStats()
+  } catch (e: unknown) {
+    ElMessage.error((e as Error).message || '转为模型失败，可能已存在对应版本')
   }
 }
 

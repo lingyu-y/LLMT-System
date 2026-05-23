@@ -118,6 +118,8 @@ def create_model(
     framework: str | None = None,
     metrics: dict | None = None,
     training_metadata: dict | None = None,
+    task_id: int | None = None,
+    creator_id: int | None = None,
 ) -> ModelVersion:
     version = auto_version(db, model_code)
 
@@ -136,6 +138,8 @@ def create_model(
         dataset_version=(training_metadata or {}).get("dataset_version"),
         metrics_json=metrics or {},
         hyperparams_json=training_metadata or {},
+        task_id=task_id,
+        created_by_id=creator_id,
         is_current=True,
     )
     db.add(model)

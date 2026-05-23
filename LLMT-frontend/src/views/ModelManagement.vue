@@ -25,10 +25,10 @@
             <span class="model-icon" :style="{ background: model.color }"><el-icon><Management /></el-icon></span>
             <span class="model-info">
               <strong>{{ model.name }}</strong>
-              <span>{{ model.type }}</span>
+              <span>{{ model.type }} · {{ model.params }}</span>
             </span>
             <span class="model-meta">
-              <span>{{ model.version }}</span>
+              <span class="version-badge">{{ model.version }}</span>
               <span>{{ model.accuracy }}</span>
             </span>
           </button>
@@ -365,19 +365,51 @@ const colors = [
 ]
 
 const getMetricText = (metrics?: Record<string, unknown>) => {
-  const accuracy = metrics?.accuracy ?? metrics?.acc ?? metrics?.score
+  if (!metrics || Object.keys(metrics).length === 0) return '-'
+  const accuracy = metrics.accuracy_train ?? metrics.accuracy_val ?? metrics.accuracy ?? metrics.acc ?? metrics.score
   if (typeof accuracy === 'number') return `${accuracy > 1 ? accuracy.toFixed(1) : (accuracy * 100).toFixed(1)}%`
   if (typeof accuracy === 'string') return accuracy
+  // Show loss if no accuracy
+  const loss = metrics.loss_final
+  if (typeof loss === 'number') return `loss ${loss.toFixed(4)}`
   return '-'
+}
+
+const getParamsText = (hyperparams?: Record<string, unknown>) => {
+  if (!hyperparams) return '-'
+  const { hidden_size, num_layers, num_attention_heads, vocab_size } = hyperparams
+  const parts: string[] = []
+  if (typeof hidden_size === 'number') parts.push(`${hidden_size}`)
+  if (typeof num_layers === 'number') parts.push(`${num_layers}层`)
+  return parts.length ? parts.join('·') : '-'
+}
+
+const getHyperSummary = (hyperparams?: Record<string, unknown>): Record<string, string> => {
+  if (!hyperparams) return {}
+  const result: Record<string, string> = {}
+  const keyLabels: Record<string, string> = {
+    framework: '训练框架', parallel_strategy: '并行策略', model_type: '模型架构',
+    learning_rate: '学习率', batch_size: 'Batch Size', max_epochs: '最大Epoch',
+    seq_length: '序列长度', hidden_size: '隐层维度', num_layers: '层数',
+    num_attention_heads: '注意力头数', precision: '精度', optimizer: '优化器',
+    weight_decay: '权重衰减', warmup_steps: '预热步数', max_steps: '最大步数',
+  }
+  for (const [key, label] of Object.entries(keyLabels)) {
+    if (key in hyperparams) {
+      const val = hyperparams[key]
+      result[label] = val != null ? String(val) : '-'
+    }
+  }
+  return result
 }
 
 const mapModel = (item: BackendModel, index = 0): ModelItem => ({
   id: item.model_code,
   name: item.model_name,
-  type: `${item.framework ?? 'Unknown'} · ${item.tag ?? '模型'}`,
+  type: item.framework ?? 'Unknown',
   version: item.version,
   accuracy: getMetricText(item.metrics_json),
-  params: typeof item.hyperparams_json?.params === 'string' ? item.hyperparams_json.params : '-',
+  params: getParamsText(item.hyperparams_json),
   color: colors[index % colors.length]!,
   raw: item,
 })
@@ -386,9 +418,9 @@ const mapVersion = (item: BackendModel): VersionItem => ({
   version: item.version,
   status: item.is_current ? '当前版本' : item.tag ?? '',
   date: item.created_at?.replace('T', ' ').slice(0, 16) ?? '-',
-  metrics: Object.keys(item.metrics_json ?? {}).length ? JSON.stringify(item.metrics_json) : '暂无评估指标',
-  params: `框架 ${item.framework ?? '-'} · 超参数 ${JSON.stringify(item.hyperparams_json ?? {})}`,
-  training: `数据集版本 ${item.dataset_version ?? '-'} · 模型编码 ${item.model_code}`,
+  metrics: getMetricText(item.metrics_json),
+  params: getParamsText(item.hyperparams_json),
+  training: item.dataset_version ? `数据集 ${item.dataset_version}` : `模型 ${item.model_code}`,
   current: item.is_current,
   raw: item,
 })
@@ -428,61 +460,49 @@ const filteredModels = computed(() =>
   }),
 )
 
-const trainingMetaMap = {
-  bert: {
-    taskId: 'TR-20260425-01',
-    dataset: '电商评论文本数据 v2.3',
-    framework: 'DeepSpeed',
-    parallel: '数据并行 + 流水线并行',
-    resource: '4x A100 80GB',
-    checkpoint: 'ckpt/TR-20260425-01/step-12840',
-    config: 'configs/TR-20260425-01.yaml',
-  },
-  resnet: {
-    taskId: 'TR-20260425-02',
-    dataset: '产品图像分类集 v1.8',
-    framework: 'PyTorch',
-    parallel: '数据并行',
-    resource: '2x A100 80GB',
-    checkpoint: 'ckpt/TR-20260425-02/best',
-    config: 'configs/TR-20260425-02.yaml',
-  },
-  whisper: {
-    taskId: 'TR-20260424-09',
-    dataset: '语音指令识别数据 v1.4',
-    framework: 'PyTorch',
-    parallel: '数据并行',
-    resource: '1x A100 80GB',
-    checkpoint: 'ckpt/TR-20260424-09/paused-step-8400',
-    config: 'configs/TR-20260424-09.yaml',
-  },
-} as const
+const selectedTrainingMeta = computed(() => {
+  const raw = selectedModel.value?.raw
+  const hp = raw?.hyperparams_json ?? {}
+  const meta = raw?.training_metadata ?? {}
+  return {
+    taskId: raw?.id ? `TASK-${raw.id}` : '-',
+    dataset: (typeof hp.dataset_id === 'number' ? `数据集 #${hp.dataset_id}` : null)
+      ?? (typeof meta.dataset_version === 'string' ? meta.dataset_version : null)
+      ?? '-',
+    framework: (typeof hp.framework === 'string' ? hp.framework : null)
+      ?? (typeof raw?.framework === 'string' ? raw.framework : null)
+      ?? '-',
+    parallel: typeof hp.parallel_strategy === 'string' ? hp.parallel_strategy : '-',
+    resource: typeof hp.num_gpus === 'number' ? `${hp.num_gpus}x GPU` : '-',
+    checkpoint: typeof raw?.storage_path === 'string' ? raw.storage_path : '-',
+    config: typeof raw?.model_code === 'string' ? `models/${raw.model_code}/${raw?.version ?? 'latest'}` : '-',
+  }
+})
 
-const defaultTrainingMeta = {
-  taskId: 'TR-20260420-06',
-  dataset: '训练数据集 v1.0',
-  framework: 'DeepSpeed',
-  parallel: '数据并行',
-  resource: '2x A100 80GB',
-  checkpoint: 'ckpt/default/best',
-  config: 'configs/default.yaml',
-}
+const hyperParamsSummary = computed(() => {
+  const hp = selectedModel.value?.raw?.hyperparams_json
+  return hp ? getHyperSummary(hp) : {}
+})
 
-const selectedTrainingMeta = computed(() =>
-  selectedModel.value ? (trainingMetaMap[selectedModel.value.id as keyof typeof trainingMetaMap] ?? defaultTrainingMeta) : defaultTrainingMeta,
-)
-
-const trainingSourceItems = computed<[string, string][]>(() => [
-  ['训练任务', selectedTrainingMeta.value.taskId],
-  ['数据集版本', selectedTrainingMeta.value.dataset],
-  ['训练框架', selectedTrainingMeta.value.framework],
-  ['资源规格', selectedTrainingMeta.value.resource],
-])
+const trainingSourceItems = computed<[string, string][]>(() => {
+  const meta = selectedTrainingMeta.value
+  const hpSum = hyperParamsSummary.value
+  const items: [string, string][] = [
+    ['训练任务', meta.taskId],
+    ['训练框架', meta.framework],
+    ['并行策略', meta.parallel],
+    ['资源规格', meta.resource],
+  ]
+  for (const [label, value] of Object.entries(hpSum).slice(0, 4)) {
+    items.push([label, value])
+  }
+  return items
+})
 
 const trainingTrace = computed(() => [
   { label: '并行策略', value: selectedTrainingMeta.value.parallel, detail: '由训练模块的混合并行配置生成' },
-  { label: '配置文件', value: selectedTrainingMeta.value.config, detail: '保存训练框架、资源规格和监控采集配置' },
-  { label: '数据来源', value: selectedTrainingMeta.value.dataset, detail: '关联数据处理模块中的数据集版本和质量校验结果' },
+  { label: '模型存储', value: selectedTrainingMeta.value.checkpoint, detail: 'MinIO 模型仓库中的版本化存储路径' },
+  { label: '训练框架', value: selectedTrainingMeta.value.framework, detail: '支持 PyTorch / DeepSpeed / Megatron-LM' },
 ])
 
 const artifacts = computed(() => [

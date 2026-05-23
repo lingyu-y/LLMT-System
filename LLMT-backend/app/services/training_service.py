@@ -277,7 +277,12 @@ def get_options(db: Session) -> dict[str, Any]:
         for m in models
     ]
 
-    datasets = db.query(Dataset).order_by(Dataset.id).all()
+    datasets = (
+        db.query(Dataset)
+        .filter(Dataset.processing_status == "completed")
+        .order_by(Dataset.id)
+        .all()
+    )
     dataset_options = [
         {"value": d.id, "label": f"{d.name} ({d.data_type}, {d.version})"}
         for d in datasets
@@ -361,6 +366,93 @@ def validate_config(config: TrainingConfigDict, framework: str, strategy: str) -
         "errors": errors,
         "warnings": warnings,
     }
+
+
+# ---------------------------------------------------------------------------
+# Promote to model
+# ---------------------------------------------------------------------------
+
+def promote_to_model(db: Session, task_id: int) -> dict | None:
+    """Promote a completed training task's checkpoints to a ModelVersion.
+
+    Copies checkpoint files from the checkpoints bucket to the models bucket
+    in MinIO, then creates a ModelVersion record linked to the training task.
+    """
+    import re
+
+    from app.models.model_version import ModelVersion
+    from app.repositories import model_repository
+
+    task = repo.get_by_id(db, task_id)
+    if task is None or task.status != "completed":
+        return None
+
+    # Check if already promoted
+    existing = db.query(ModelVersion).filter(ModelVersion.task_id == task.id).first()
+    if existing:
+        return {"model_code": existing.model_code, "version": existing.version, "id": existing.id}
+
+    config = task.config_json or {}
+    model_type = config.get("model_type", "gpt2")
+    framework = task.framework or "pytorch"
+
+    model_code = re.sub(r"[^a-zA-Z0-9一-鿿_-]", "-", task.task_name.lower())
+    model_code = re.sub(r"-+", "-", model_code).strip("-")
+    if not model_code:
+        model_code = f"model-{task.task_code.lower()}"
+
+    hyperparams: dict[str, Any] = {
+        "framework": framework,
+        "parallel_strategy": task.parallel_strategy,
+        "model_type": model_type,
+    }
+    for key in (
+        "learning_rate", "batch_size", "max_epochs", "max_steps",
+        "seq_length", "hidden_size", "num_layers", "num_attention_heads",
+        "precision", "optimizer", "weight_decay", "warmup_steps",
+        "gradient_accumulation_steps", "vocab_size", "train_split",
+    ):
+        if key in config:
+            hyperparams[key] = config[key]
+
+    # Copy checkpoints from checkpoints bucket → models bucket
+    try:
+        from minio.commonconfig import CopySource
+
+        minio = get_minio_client()
+        ckpt_bucket = settings.MINIO_BUCKET_CHECKPOINTS
+        model_bucket = settings.MINIO_BUCKET_MODELS
+        task_code = task.task_code
+        prefix = f"{task_code}/"
+
+        if minio.bucket_exists(ckpt_bucket):
+            objects = list(minio.list_objects(ckpt_bucket, prefix=prefix, recursive=True))
+            ckpt_files = [o for o in objects if not o.is_dir]
+
+            version = model_repository.auto_version(db, model_code)
+            storage_path = f"models/{model_code}/{version}"
+            for obj in ckpt_files:
+                target_name = obj.object_name.replace(prefix, storage_path + "/", 1)
+                minio.copy_object(model_bucket, target_name, CopySource(ckpt_bucket, obj.object_name))
+            logger.info("Promoted %d checkpoints for task %s to model %s", len(ckpt_files), task_code, model_code)
+    except Exception as exc:
+        logger.warning("MinIO checkpoint copy failed (model version still created): %s", exc)
+
+    model = model_repository.create_model(
+        db,
+        model_name=task.task_name,
+        model_code=model_code,
+        tag=f"from-{task.task_code}",
+        description=f"从训练任务 {task.task_code} 创建",
+        framework=framework,
+        metrics={},
+        training_metadata=hyperparams,
+        task_id=task.id,
+        creator_id=task.creator_id,
+    )
+
+    logger.info("Promoted training task %d to model %s v%s", task_id, model_code, model.version)
+    return {"model_code": model_code, "version": model.version, "id": model.id}
 
 
 # ---------------------------------------------------------------------------

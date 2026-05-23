@@ -167,3 +167,6 @@ export const fetchTrainingStats = () =>
 
 export const validateTrainingConfig = (body: TrainingTaskCreate) =>
   post<{ message: string; data: ValidationResult }>('/training/validate-config', body)
+
+export const promoteTrainingTask = (id: number) =>
+  post<{ message: string; data: Record<string, unknown> }>(`/training/tasks/${id}/promote-to-model`)

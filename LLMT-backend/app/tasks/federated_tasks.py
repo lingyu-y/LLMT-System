@@ -117,47 +117,42 @@ def _download_dataset_from_minio(
 # Helper – resolve a dataset to a local JSONL path for training
 # ---------------------------------------------------------------------------
 
-def _resolve_dataset_path(ds, config) -> str | None:
-    """Return a local file path for the dataset, downloading from MinIO if needed.
+def _resolve_dataset_paths(ds, config) -> list[str]:
+    """Return all local data file paths for the dataset, downloading from MinIO if needed.
 
-    Tries:
-      1. Local filesystem (storage_path exists as-is)
-      2. MinIO download to temp dir, then find the JSONL file
-
-    Returns the path to a JSONL file, or None.
+    For multi-file datasets, all matching files are returned in sorted order.
     """
     storage_path = ds.storage_path or ""
+    valid_ext = (".jsonl", ".txt", ".json", ".csv", ".npy", ".bin")
+
+    def _collect_files(root: str) -> list[str]:
+        files: list[str] = []
+        if not os.path.isdir(root):
+            return files
+        for entry in sorted(os.listdir(root)):
+            full = os.path.join(root, entry)
+            if os.path.isfile(full) and entry.endswith(valid_ext):
+                files.append(full)
+            elif os.path.isdir(full) and not entry.startswith("."):
+                files.extend(_collect_files(full))
+        return files
 
     # 1. Try local filesystem directly
     if os.path.exists(storage_path):
-        if os.path.isfile(storage_path):
-            return storage_path
-        # It's a directory – look for a JSONL file inside
-        for fname in os.listdir(storage_path):
-            if fname.endswith(".jsonl"):
-                return os.path.join(storage_path, fname)
-        # If no JSONL, try any text file
-        for fname in os.listdir(storage_path):
-            if fname.endswith((".txt", ".json", ".csv")):
-                return os.path.join(storage_path, fname)
+        if os.path.isfile(storage_path) and storage_path.endswith(valid_ext):
+            return [storage_path]
+        result = _collect_files(storage_path)
+        if result:
+            return result
 
     # 2. Try MinIO download
     local_dir = _download_dataset_from_minio(storage_path)
     if local_dir is not None:
-        for fname in os.listdir(local_dir):
-            if fname.endswith(".jsonl"):
-                return os.path.join(local_dir, fname)
-        # Try any text file
-        for fname in os.listdir(local_dir):
-            if fname.endswith((".txt", ".json", ".csv")):
-                return os.path.join(local_dir, fname)
-        # If directory has subdirectories, search deeper
-        for root, _, files in os.walk(local_dir):
-            for fname in files:
-                if fname.endswith(".jsonl"):
-                    return os.path.join(root, fname)
+        result = _collect_files(local_dir)
+        if result:
+            return result
 
-    return None
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -202,10 +197,10 @@ def _build_participant_from_db(
     if p.dataset_id is not None:
         ds = db.query(DatasetModel).filter(DatasetModel.id == p.dataset_id).first()
         if ds is not None:
-            local_path = _resolve_dataset_path(ds, config)
-            if local_path is not None:
+            local_paths = _resolve_dataset_paths(ds, config)
+            if local_paths:
                 finetune_ds = FinetuneDataset.from_config({
-                    "data": {"dataset_path": local_path},
+                    "data": {"dataset_path": local_paths[0], "dataset_paths": local_paths},
                     "model": {"seq_length": config.seq_length},
                 })
                 if tokenizer is not None:

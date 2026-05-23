@@ -196,6 +196,47 @@ def scale_training_task(
 
 
 # ---------------------------------------------------------------------------
+# Promote to model
+# ---------------------------------------------------------------------------
+
+@router.post("/tasks/{task_id}/promote-to-model")
+def promote_to_model(
+    task_id: int,
+    db: Session = Depends(get_db),
+    _user=Depends(get_current_user),
+):
+    """Promote a completed training task to a model version.
+
+    Copies checkpoint files from the checkpoints bucket to the models bucket,
+    creates a ModelVersion record, and links it to this training task.
+    """
+    result = training_service.promote_to_model(db, task_id)
+    if result is None:
+        raise HTTPException(status_code=400, detail="任务不存在、尚未完成或已转为模型版本")
+    return success_response(result, "已转为模型版本")
+
+
+# ---------------------------------------------------------------------------
+# Internal endpoint (called by training subprocess after completion)
+# ---------------------------------------------------------------------------
+
+@router.post("/internal/promote-by-code/{task_code}")
+def internal_promote_by_code(task_code: str, db: Session = Depends(get_db)):
+    """Internal endpoint: promote a completed task by task_code.
+
+    Called by the training subprocess via PostgresStatusUpdater
+    after training completes. No auth required (localhost only).
+    """
+    task = training_service.get_task_by_code(db, task_code)
+    if task is None or task.status != "completed":
+        raise HTTPException(status_code=400, detail="任务不存在或尚未完成")
+    result = training_service.promote_to_model(db, task.id)
+    if result is None:
+        raise HTTPException(status_code=400, detail="转为模型版本失败")
+    return success_response(result, "已转为模型版本")
+
+
+# ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
 

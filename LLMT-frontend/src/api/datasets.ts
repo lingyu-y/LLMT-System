@@ -20,6 +20,7 @@ export interface BackendDataset {
   file_count: number
   total_size: number
   quality_status: string
+  processing_status: string
   lineage_status: string
   owner?: DatasetOwner | null
   created_at: string
@@ -214,8 +215,11 @@ export const importExternalDataset = async (payload: {
 }) =>
   unwrap(await post<ApiMessage<{ dataset: BackendDataset; imported_files: number; total_size: number; errors: string[] }>>('/datasets/import/external', payload))
 
-export const startPreprocess = async (datasetId: number) =>
-  unwrap(await post<ApiMessage<ProcessingJob>>(`/datasets/${datasetId}/preprocess`))
+export const startPreprocess = async (datasetId: number, shardSizeMb?: number) => {
+  const params: Record<string, string | number> = {}
+  if (shardSizeMb != null && shardSizeMb > 0) params.shard_size_mb = shardSizeMb
+  return unwrap(await post<ApiMessage<ProcessingJob>>(`/datasets/${datasetId}/preprocess`, undefined, params))
+}
 
 export const listProcessingJobs = (params?: { page?: number; page_size?: number }) =>
   get<PageResult<ProcessingJob>>('/datasets/processing-jobs', params)
