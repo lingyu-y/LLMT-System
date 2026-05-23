@@ -169,6 +169,8 @@ class PyTorchTrainer(BaseTrainer):
                 for step, batch in enumerate(self.train_dataloader):
                     if self._should_stop():
                         break
+                    if total_steps_estimate and self.state.global_step >= total_steps_estimate:
+                        break
 
                     # Move batch to device
                     batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
@@ -231,15 +233,18 @@ class PyTorchTrainer(BaseTrainer):
                     ckpt_cfg = self.config.get("checkpoint", {})
                     save_interval = ckpt_cfg.get("save_interval", 500)
                     if self.state.global_step % save_interval == 0:
-                        ckpt_dir = ckpt_cfg.get("checkpoint_dir", "./checkpoints")
+                        ckpt_dir = ckpt_cfg.get("checkpoint_dir", "/tmp/llmt_checkpoints")
                         ckpt_path = self.save_checkpoint(ckpt_dir)
 
                 self.callbacks.on_epoch_end(self.state)
 
-                if max_steps and self.state.global_step >= max_steps:
+                if self._should_stop():
+                    break
+                if total_steps_estimate and self.state.global_step >= total_steps_estimate:
                     break
 
-            self.state.status = "completed"
+            if self.state.status not in ("cancelled", "failed", "paused"):
+                self.state.status = "completed"
 
         except Exception as e:
             self.state.status = "failed"
@@ -282,12 +287,10 @@ class PyTorchTrainer(BaseTrainer):
         return {"eval_loss": total_loss / max(total_steps, 1)}
 
     def save_checkpoint(self, path: str) -> str:
-        """Save model checkpoint."""
+        """Save model checkpoint — overwrites previous one."""
         os.makedirs(path, exist_ok=True)
         model = self.model if not isinstance(self.model, DDP) else self.model.module
-        ckpt_path = os.path.join(
-            path, f"checkpoint-step{self.state.global_step}.pt"
-        )
+        ckpt_path = os.path.join(path, "checkpoint.pt")
         torch.save({
             "model_state_dict": model.state_dict(),
             "epoch": self.state.epoch,

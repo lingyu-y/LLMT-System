@@ -108,7 +108,7 @@ class CheckpointConfig(BaseModel):
     eval_interval: int = 100
     max_checkpoints: int = 5
     upload_to_minio: bool = True
-    checkpoint_dir: str = "./checkpoints"
+    checkpoint_dir: str = "/tmp/llmt_checkpoints"
 
 
 class ReportingConfig(BaseModel):

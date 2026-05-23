@@ -216,6 +216,22 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
         from llmt_training.reporting.callback_bridge import ReportingCallbackBridge
         reporting_callback = ReportingCallbackBridge.from_config(config_dict)
 
+        # --- Reload training modules so code changes take effect without ---
+        # --- restarting the Celery worker (in-process path caches imports) ---
+        import importlib
+        import llmt_training.data.finetune_dataset as _fdm
+        import llmt_training.data.pretrain_dataset as _pdm
+        import llmt_training.data.data_utils as _dum
+        import llmt_training.trainers.deepspeed_trainer as _dsm
+        import llmt_training.trainers.pytorch_trainer as _ptm
+        import llmt_training.trainers.factory as _tf
+        importlib.reload(_fdm)
+        importlib.reload(_pdm)
+        importlib.reload(_dum)
+        importlib.reload(_dsm)
+        importlib.reload(_ptm)
+        importlib.reload(_tf)
+
         # Build model from config via ModelRegistry
         from llmt_training.models.registry import ModelRegistry
         model_type = config_dict.get("model", {}).get("model_type", "gpt2")
@@ -226,6 +242,7 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
         from llmt_training.data.data_utils import create_dataset_from_config, build_dataloaders
         is_distributed = config_dict.get("strategy", {}).get("num_gpus", 1) > 1
         dataset = create_dataset_from_config(config_dict)
+        _prepopulate_tokenizer_vocab(dataset)
         train_dataloader, eval_dataloader = build_dataloaders(
             dataset, config_dict, distributed=is_distributed,
         )
@@ -238,12 +255,21 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
         from llmt_training.core.callbacks import CallbackList
         from llmt_training.core.state import TrainingState
 
+        # Detect resume: if task has previous progress, restore state
+        resume_epoch = task.current_epoch
+        resume_step = task.current_step
+        resume_ckpt = task.checkpoint_path
+
         state = TrainingState(
             task_code=task_code,
             max_epochs=config_dict.get("hyperparams", {}).get("max_epochs", 10),
             max_steps=config_dict.get("hyperparams", {}).get("max_steps"),
         )
-        callbacks = CallbackList([reporting_callback, _CancellationCheckCallback(task_code)])
+        if resume_step > 0:
+            state.epoch = resume_epoch
+            state.global_step = resume_step
+        cancel_cb = _CancellationCheckCallback(task_code)
+        callbacks = CallbackList([reporting_callback, cancel_cb])
 
         trainer = create_trainer(
             framework=framework,
@@ -257,6 +283,15 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
             loss_fn=loss_fn,
         )
 
+        cancel_cb.set_trainer(trainer)
+
+        # On resume, load the last checkpoint so training continues from there
+        if resume_step > 0 and resume_ckpt:
+            try:
+                trainer.load_checkpoint(resume_ckpt)
+            except Exception:
+                pass  # Best-effort; training proceeds from saved step
+
         # For in-process training (pytorch/deepspeed single-node)
         if framework in ("pytorch", "deepspeed") and _should_run_in_process(config_dict):
             final_state = trainer.train()
@@ -267,7 +302,7 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
 
             # Write config to temp file for the subprocess
             config_path = os.path.join(
-                config_dict.get("checkpoint", {}).get("checkpoint_dir", "./checkpoints"),
+                config_dict.get("checkpoint", {}).get("checkpoint_dir", "/tmp/llmt_checkpoints"),
                 "training_config.json",
             )
             os.makedirs(os.path.dirname(config_path), exist_ok=True)
@@ -289,6 +324,9 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
                 final_state.status = "failed"
                 final_state.error_message = f"Training process exited with code {exit_code}"
 
+        # Save tokenizer vocab alongside checkpoint for inference
+        _save_tokenizer_vocab(dataset, config_dict)
+
         return {
             "task_code": task_code,
             "status": final_state.status,
@@ -300,27 +338,116 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
         return {"task_code": task_code, "status": "failed", "error_message": str(e)}
 
 
+def _save_tokenizer_vocab(dataset, config_dict: dict) -> None:
+    """Save the tokenizer vocabulary alongside the checkpoint for inference.
+
+    Extracts the SimpleTokenizer from the dataset (if available) and
+    writes its reverse vocabulary so the inference engine can decode
+    model outputs into human-readable text.
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    try:
+        tokenizer = getattr(dataset, "tokenizer", None)
+        if tokenizer is None or not hasattr(tokenizer, "save_vocab"):
+            if hasattr(dataset, "_loaded_samples") and hasattr(dataset, "tokenizer"):
+                tokenizer = dataset.tokenizer
+        if tokenizer is None or not hasattr(tokenizer, "save_vocab"):
+            logger.debug("No saveable tokenizer found on dataset, skipping vocab save")
+            return
+
+        # Determine checkpoint directory
+        ckpt_dir_cfg = config_dict.get("checkpoint", {}).get("checkpoint_dir", "/tmp/llmt_checkpoints")
+        ckpt_root = os.path.join(ckpt_dir_cfg) if not os.path.isabs(ckpt_dir_cfg) else ckpt_dir_cfg
+
+        # Also save to ./checkpoints/ for local discovery
+        local_ckpt = "./checkpoints"
+        candidates = [ckpt_root, local_ckpt]
+        # DeepSpeed convention: find the latest step subdirectory
+        for base in candidates:
+            if not os.path.isdir(base):
+                continue
+            latest_file = os.path.join(base, "latest")
+            if os.path.isfile(latest_file):
+                with open(latest_file, "r") as f:
+                    latest_dir = f.read().strip()
+                step_dir = os.path.join(base, latest_dir)
+                if os.path.isdir(step_dir):
+                    vocab_path = os.path.join(step_dir, "tokenizer_vocab.json")
+                    tokenizer.save_vocab(vocab_path)
+                    logger.info("Saved tokenizer vocab (%d words) to %s", len(tokenizer.id_to_word), vocab_path)
+                    continue
+            # Fallback: save directly in the base dir
+            vocab_path = os.path.join(base, "tokenizer_vocab.json")
+            tokenizer.save_vocab(vocab_path)
+            logger.info("Saved tokenizer vocab (%d words) to %s", len(tokenizer.id_to_word), vocab_path)
+    except Exception as exc:
+        logger.warning("Failed to save tokenizer vocab: %s", exc)
+
+
+def _prepopulate_tokenizer_vocab(dataset) -> None:
+    """Pre-populate the tokenizer's vocab from all dataset texts BEFORE training.
+
+    This ensures the reverse vocabulary is fully built regardless of whether
+    DataLoader uses worker subprocesses or launcher spawns a child process.
+    """
+    try:
+        tokenizer = getattr(dataset, "tokenizer", None)
+        if tokenizer is None or not hasattr(tokenizer, "build_vocab_from_texts"):
+            return
+
+        texts: list[str] = []
+        # FinetuneDataset stores samples in self.samples
+        if hasattr(dataset, "samples"):
+            for s in dataset.samples:
+                t = s.get("text", "") if isinstance(s, dict) else str(s)
+                if t:
+                    texts.append(t)
+        # ShardedFinetuneDataset has per-shard samples
+        elif hasattr(dataset, "file_paths"):
+            for path in dataset.file_paths:
+                try:
+                    from llmt_training.data.finetune_dataset import _parse_file_samples
+                    for s in _parse_file_samples(path):
+                        t = s.get("text", "") if isinstance(s, dict) else str(s)
+                        if t:
+                            texts.append(t)
+                except Exception:
+                    pass
+
+        if texts:
+            tokenizer.build_vocab_from_texts(texts)
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info("Pre-populated tokenizer vocab with %d words from %d texts",
+                        len(tokenizer.id_to_word), len(texts))
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 class _CancellationCheckCallback:
-    """Callback that polls the DB for cancellation status.
+    """Callback that polls the DB for cancellation / pause status.
 
-    Celery ``revoke(..., terminate=True)`` only sends SIGTERM to the worker
-    process, which may be ignored or arrive late.  This callback provides
-    cooperative cancellation: on every ``on_step_end`` it queries PostgreSQL
-    for the current task status and, if the row has been marked
-    ``cancelled``, propagates that into ``state.status`` so the trainer's
-    ``_should_stop()`` check will exit the loop cleanly.
+    On ``cancelled`` — propagates to ``state.status`` so the trainer's
+    ``_should_stop()`` exits the loop cleanly.
+
+    On ``paused`` — saves a checkpoint immediately (so we can resume from
+    it), then propagates ``paused`` to ``state.status``.
     """
 
     def __init__(self, task_code: str, poll_every: int = 10):
         self._task_code = task_code
-        self._poll_every = poll_every  # check DB every N steps
+        self._poll_every = poll_every
         self._step_counter = 0
+        self._trainer_ref = None  # set by caller so we can trigger checkpoint
 
-    # -- TrainingCallback interface ------------------------------------------
+    def set_trainer(self, trainer):
+        self._trainer_ref = trainer
 
     def on_train_begin(self, state, **kwargs):
         pass
@@ -345,10 +472,21 @@ class _CancellationCheckCallback:
             _engine = _ce(settings.postgres_database_url)
             with _S(_engine) as db:
                 row = db.query(_TT).filter(_TT.task_code == self._task_code).first()
-                if row is not None and row.status == "cancelled":
+                if row is None:
+                    return
+                if row.status == "cancelled":
                     state.status = "cancelled"
+                elif row.status == "paused":
+                    # Save checkpoint so we can resume from here
+                    if self._trainer_ref is not None:
+                        try:
+                            ckpt_dir = "/tmp/llmt_checkpoints"
+                            self._trainer_ref.save_checkpoint(ckpt_dir)
+                        except Exception:
+                            pass
+                    state.status = "paused"
         except Exception:
-            pass  # best-effort; don't crash training on a DB hiccup
+            pass
 
     def on_checkpoint(self, state, **kwargs):
         pass
@@ -690,8 +828,10 @@ def _promote_to_model(task_code: str) -> dict | None:
                     hyperparams[key] = config[key]
 
             # Copy checkpoints from checkpoints bucket → models bucket
-            storage_path = f"models/{model_code}/{model_repository.auto_version(db, model_code)}"
+            version_str = model_repository.auto_version(db, model_code)
+            storage_path = f"models/{model_code}/{version_str}"
 
+            ckpt_uploaded = False
             try:
                 from app.core.database import get_minio_client
                 from minio.commonconfig import CopySource
@@ -707,11 +847,46 @@ def _promote_to_model(task_code: str) -> dict | None:
                     for obj in ckpt_files:
                         target_name = obj.object_name.replace(prefix, storage_path + "/", 1)
                         minio.copy_object(model_bucket, target_name, CopySource(ckpt_bucket, obj.object_name))
-                    logger.info("Copied %d checkpoint files: %s -> %s", len(ckpt_files), f"{ckpt_bucket}/{prefix}", f"{model_bucket}/{storage_path}")
-                else:
-                    logger.info("Checkpoint bucket %s does not exist, model version created without files", ckpt_bucket)
+                    if ckpt_files:
+                        ckpt_uploaded = True
+                        logger.info("Copied %d checkpoint files: %s -> %s", len(ckpt_files), f"{ckpt_bucket}/{prefix}", f"{model_bucket}/{storage_path}")
             except Exception as exc:
-                logger.warning("MinIO checkpoint copy failed (model version still created): %s", exc)
+                logger.warning("MinIO checkpoint copy failed: %s", exc)
+
+            # Fallback: upload from local checkpoint directories if MinIO copy failed
+            local_ckpt_dirs = [
+                "/tmp/llmt_checkpoints/ckpt",
+                "/tmp/llmt_checkpoints/latest",
+                "./checkpoints/step-500",
+            ]
+            # Also include any DeepSpeed step subdirectories under ./checkpoints/
+            if os.path.isdir("./checkpoints"):
+                latest_file = os.path.join("./checkpoints", "latest")
+                if os.path.isfile(latest_file):
+                    with open(latest_file, "r") as f:
+                        latest_dir = f.read().strip()
+                    local_ckpt_dirs.append(os.path.join("./checkpoints", latest_dir))
+            if not ckpt_uploaded:
+                try:
+                    minio = get_minio_client()
+                    model_bucket = settings.MINIO_BUCKET_MODELS
+                    for local_dir in local_ckpt_dirs:
+                        if not os.path.isdir(local_dir):
+                            continue
+                        for root, _dirs, files in os.walk(local_dir):
+                            for fn in files:
+                                local_path = os.path.join(root, fn)
+                                rel = os.path.relpath(local_path, local_dir)
+                                object_name = f"{storage_path}/{rel}".replace("\\", "/")
+                                minio.fput_object(model_bucket, object_name, local_path)
+                        ckpt_uploaded = True
+                        logger.info("Uploaded local checkpoint %s -> %s/%s", local_dir, model_bucket, storage_path)
+                        break
+                except Exception as exc:
+                    logger.warning("Local checkpoint upload failed: %s", exc)
+
+            if not ckpt_uploaded:
+                logger.info("No checkpoint files found, model version created without weights")
 
             # Build metrics placeholder (will be populated from actual training metrics)
             metrics: dict[str, Any] = {}

@@ -53,8 +53,8 @@ class BaseTrainer(ABC):
         """Load a checkpoint from the given path."""
 
     def _should_stop(self) -> bool:
-        """Check if training should stop (cancelled, max steps reached, etc.)."""
-        if self.state.status in ("cancelled", "failed"):
+        """Check if training should stop (cancelled, paused, failed, etc.)."""
+        if self.state.status in ("cancelled", "failed", "paused"):
             return True
         if self.state.max_steps and self.state.global_step >= self.state.max_steps:
             return True

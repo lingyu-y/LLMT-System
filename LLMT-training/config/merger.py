@@ -70,7 +70,7 @@ class ConfigMerger:
                 "warmup_min_lr": 0,
                 "warmup_max_lr": hp.learning_rate,
                 "warmup_num_steps": hp.warmup_steps,
-                "total_num_steps": hp.max_steps or (hp.max_epochs * 1000),
+                "total_num_steps": hp.max_steps or (hp.max_epochs * 100),
             },
         }
 

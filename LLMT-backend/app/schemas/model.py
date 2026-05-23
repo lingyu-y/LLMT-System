@@ -101,6 +101,8 @@ class ModelListOut(BaseModel):
     description: Optional[str] = None
     framework: Optional[str] = None
     dataset_version: Optional[str] = None
+    hyperparams_json: dict[str, Any] = Field(default_factory=dict)
+    storage_path: str = ""
     is_current: bool
     created_at: datetime
 
@@ -117,6 +119,7 @@ class ModelOut(BaseModel):
     framework: Optional[str] = None
     metrics: ModelMetrics = Field(default_factory=ModelMetrics)
     training_metadata: TrainingMetadata = Field(default_factory=TrainingMetadata)
+    hyperparams_json: dict[str, Any] = Field(default_factory=dict)
     storage_path: str = ""
     is_current: bool
     created_at: datetime

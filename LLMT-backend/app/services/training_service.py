@@ -119,6 +119,21 @@ def cancel_task(db: Session, task_id: int) -> TrainingTaskOut | None:
     return _to_task_out(task)
 
 
+def delete_task(db: Session, task_id: int) -> bool:
+    """Delete a training task (any status). Revokes Celery if running."""
+    task = repo.get_by_id(db, task_id)
+    if task is None:
+        return False
+    try:
+        from app.core.celery_app import celery_app
+        celery_app.control.revoke(task.task_code, terminate=True)
+    except Exception:
+        pass
+    db.delete(task)
+    db.commit()
+    return True
+
+
 def pause_task(db: Session, task_id: int) -> TrainingTaskOut | None:
     """Pause a running training task."""
     task = repo.get_by_id(db, task_id)
@@ -131,13 +146,23 @@ def pause_task(db: Session, task_id: int) -> TrainingTaskOut | None:
 
 
 def resume_task(db: Session, task_id: int) -> TrainingTaskOut | None:
-    """Resume a paused training task."""
+    """Resume a paused training task.
+
+    Re-submits the Celery task so the training loop restarts from the
+    last checkpoint using the saved current_epoch / current_step.
+    """
     task = repo.get_by_id(db, task_id)
     if task is None or task.status != "paused":
         return None
     task.status = "running"
     db.commit()
     db.refresh(task)
+
+    # Re-submit Celery task — run_training_task detects resume_step > 0
+    # and loads the checkpoint automatically
+    from app.tasks.training_tasks import run_training_task
+    run_training_task.delay(task.task_code)
+
     return _to_task_out(task)
 
 
@@ -415,10 +440,13 @@ def promote_to_model(db: Session, task_id: int) -> dict | None:
         if key in config:
             hyperparams[key] = config[key]
 
-    # Copy checkpoints from checkpoints bucket → models bucket
+    # Copy checkpoints → models bucket (MinIO copy first, local upload fallback)
+    version = model_repository.auto_version(db, model_code)
+    storage_path = f"models/{model_code}/{version}"
+    ckpt_uploaded = False
+
     try:
         from minio.commonconfig import CopySource
-
         minio = get_minio_client()
         ckpt_bucket = settings.MINIO_BUCKET_CHECKPOINTS
         model_bucket = settings.MINIO_BUCKET_MODELS
@@ -428,15 +456,35 @@ def promote_to_model(db: Session, task_id: int) -> dict | None:
         if minio.bucket_exists(ckpt_bucket):
             objects = list(minio.list_objects(ckpt_bucket, prefix=prefix, recursive=True))
             ckpt_files = [o for o in objects if not o.is_dir]
-
-            version = model_repository.auto_version(db, model_code)
-            storage_path = f"models/{model_code}/{version}"
             for obj in ckpt_files:
                 target_name = obj.object_name.replace(prefix, storage_path + "/", 1)
                 minio.copy_object(model_bucket, target_name, CopySource(ckpt_bucket, obj.object_name))
-            logger.info("Promoted %d checkpoints for task %s to model %s", len(ckpt_files), task_code, model_code)
+            if ckpt_files:
+                ckpt_uploaded = True
+                logger.info("Promoted %d checkpoints for task %s to model %s", len(ckpt_files), task_code, model_code)
     except Exception as exc:
-        logger.warning("MinIO checkpoint copy failed (model version still created): %s", exc)
+        logger.warning("MinIO checkpoint copy failed: %s", exc)
+
+    if not ckpt_uploaded:
+        import os as _os
+        local_dirs = ["/tmp/llmt_checkpoints/ckpt", "/tmp/llmt_checkpoints/latest"]
+        try:
+            minio = get_minio_client()
+            model_bucket = settings.MINIO_BUCKET_MODELS
+            for ld in local_dirs:
+                if not _os.path.isdir(ld):
+                    continue
+                for root, _dirs, files in _os.walk(ld):
+                    for fn in files:
+                        local_path = _os.path.join(root, fn)
+                        rel = _os.path.relpath(local_path, ld)
+                        object_name = f"{storage_path}/{rel}".replace("\\", "/")
+                        minio.fput_object(model_bucket, object_name, local_path)
+                ckpt_uploaded = True
+                logger.info("Uploaded local checkpoint %s -> %s/%s", ld, model_bucket, storage_path)
+                break
+        except Exception as exc:
+            logger.warning("Local checkpoint upload failed: %s", exc)
 
     model = model_repository.create_model(
         db,
@@ -463,9 +511,32 @@ def _to_task_out(task: TrainingTask) -> TrainingTaskOut:
     return TrainingTaskOut.model_validate(task)
 
 
+def _extract_max_steps_from_config(cfg: dict) -> int | None:
+    """Extract max_steps from either nested TrainingConfig or flat config."""
+    hp = cfg.get("hyperparams", {})
+    if isinstance(hp, dict) and hp.get("max_steps"):
+        return hp["max_steps"]
+    flat = cfg.get("max_steps")
+    if flat:
+        return flat
+    # Fallback: estimate from max_epochs * approximate steps per epoch
+    return None
+
+
 def _to_list_out(task: TrainingTask) -> TrainingTaskListOut:
     cfg = task.config_json or {}
-    progress = round(task.current_epoch / task.max_epoch * 100) if task.max_epoch and task.max_epoch > 0 else 0
+    # Prefer step-based progress (training stays in epoch 0 for most runs)
+    hp = cfg.get("hyperparams", {})
+    max_steps = hp.get("max_steps") or _extract_max_steps_from_config(cfg)
+    max_epoch = task.max_epoch
+    if max_steps and max_steps > 0:
+        progress = min(round(task.current_step / max_steps * 100), 100)
+    elif max_epoch and max_epoch > 0:
+        # Fallback: estimate total steps (matches ConfigMerger default)
+        total_steps = max_epoch * 1000
+        progress = min(round(task.current_step / total_steps * 100), 100)
+    else:
+        progress = 0
     gpu_count = cfg.get("num_gpus", 1)
     gpu_display = f"{gpu_count}x A100"
 

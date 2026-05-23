@@ -126,7 +126,11 @@ class GPTModel(nn.Module):
             def __init__(self, logits):
                 self.logits = logits
 
-        return ModelOutput(self.wte(hidden_states))  # weight tying: project back to vocab
+        # Weight tying: project hidden_states through the transposed embedding
+        # matrix to produce logits. Using F.linear() instead of wte() because
+        # nn.Embedding.forward expects integer indices, not float hidden states.
+        logits = torch.nn.functional.linear(hidden_states, self.wte.weight)
+        return ModelOutput(logits)
 
 
 class GPTModelProvider(BaseModelProvider):
@@ -150,10 +154,7 @@ class GPTModelProvider(BaseModelProvider):
         vocab_size = config.get("vocab_size", 50257)
         try:
             from transformers import GPT2Tokenizer
-            try:
-                return GPT2Tokenizer.from_pretrained("gpt2", local_files_only=True)
-            except Exception:
-                return SimpleTokenizer(vocab_size=vocab_size)
+            return GPT2Tokenizer.from_pretrained("gpt2", local_files_only=True)
         except Exception:
             return SimpleTokenizer(vocab_size=vocab_size)
 

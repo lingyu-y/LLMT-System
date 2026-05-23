@@ -48,6 +48,11 @@
           <el-button :icon="Upload" @click="importDialogVisible = true">导入</el-button>
           <el-button :icon="Download" @click="openExportDialog">导出</el-button>
           <el-button type="primary" :icon="Plus" @click="openVersionDialog">创建新版本</el-button>
+          <el-popconfirm title="确定删除此模型？将删除所有版本及MinIO文件" @confirm="handleDeleteModel">
+            <template #reference>
+              <el-button type="danger" :icon="Delete">删除</el-button>
+            </template>
+          </el-popconfirm>
         </div>
       </div>
 
@@ -287,13 +292,14 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { ArrowLeft, Check, DataLine, Download, Management, Plus, Promotion, RefreshLeft, Upload } from '@element-plus/icons-vue'
+import { ArrowLeft, Check, DataLine, Delete, Download, Management, Plus, Promotion, RefreshLeft, Upload } from '@element-plus/icons-vue'
 
 import { getInferenceUsage, predict, type InferenceUsage, type PredictResult } from '@/api/inference'
 import StatusBadge from '@/components/StatusBadge.vue'
 import {
   compareModelVersions,
   createModelVersion,
+  deleteModel,
   exportModel,
   getModelDownloadUrl,
   getModelRateLimit,
@@ -525,6 +531,18 @@ const openCompareDrawer = async (version: VersionItem) => {
 const openVersionDialog = () => {
   versionForm.value = { version: '', tag: '', description: '' }
   versionDialogVisible.value = true
+}
+
+const handleDeleteModel = async () => {
+  if (!selectedModel.value?.id) return
+  try {
+    await deleteModel(selectedModel.value.id)
+    ElMessage.success('模型已删除')
+    selectedModel.value = null
+    await loadModels()
+  } catch (e: unknown) {
+    ElMessage.error((e as Error).message || '删除失败')
+  }
 }
 
 const openExportDialog = () => {

@@ -236,6 +236,19 @@ def internal_promote_by_code(task_code: str, db: Session = Depends(get_db)):
     return success_response(result, "已转为模型版本")
 
 
+@router.delete("/tasks/{task_id}")
+def delete_training_task(
+    task_id: int,
+    db: Session = Depends(get_db),
+    _user=Depends(get_current_user),
+):
+    """Delete a training task (any status)."""
+    ok = training_service.delete_task(db, task_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="训练任务不存在")
+    return success_response(message="训练任务已删除")
+
+
 # ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------

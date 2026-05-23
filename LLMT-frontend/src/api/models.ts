@@ -1,4 +1,4 @@
-import { get, post, put, type ApiMessage, type PageResult, unwrap } from '@/api/http'
+import { del, get, post, put, type ApiMessage, type PageResult, unwrap } from '@/api/http'
 
 export interface BackendModel {
   id: number
@@ -90,3 +90,6 @@ export const getModelRateLimit = async (modelCode: string) =>
 
 export const updateModelRateLimit = async (modelCode: string, payload: Partial<ModelRateLimit['limits']> & { enabled?: boolean }) =>
   unwrap(await put<ApiMessage<ModelRateLimit>>(`/models/${modelCode}/rate-limit`, payload))
+
+export const deleteModel = async (modelCode: string) =>
+  unwrap(await del<ApiMessage<{ deleted: number }>>(`/models/${modelCode}`))

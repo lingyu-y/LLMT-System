@@ -83,7 +83,7 @@ class DeepSpeedTrainer(BaseTrainer):
 
         # Write ds_config to temp file (required by deepspeed.initialize in some cases)
         ds_config_path = os.path.join(
-            self.config.get("checkpoint", {}).get("checkpoint_dir", "./checkpoints"),
+            self.config.get("checkpoint", {}).get("checkpoint_dir", "/tmp/llmt_checkpoints"),
             "ds_config.json",
         )
         os.makedirs(os.path.dirname(ds_config_path), exist_ok=True)
@@ -151,9 +151,9 @@ class DeepSpeedTrainer(BaseTrainer):
         hp = self.config.get("hyperparams", {})
         max_epochs = hp.get("max_epochs", 10)
         max_steps = hp.get("max_steps")
+        total_steps = max_steps or (max_epochs * 1000)  # matches scheduler fallback
         grad_accum = hp.get("gradient_accumulation_steps", 1)
         max_grad_norm = hp.get("max_grad_norm", 1.0)
-        _precision = hp.get("precision", "fp16")
 
         start_time = time.time()
 
@@ -168,32 +168,16 @@ class DeepSpeedTrainer(BaseTrainer):
                 for step, batch in enumerate(self.train_dataloader):
                     if self._should_stop():
                         break
+                    if total_steps and self.state.global_step >= total_steps:
+                        break
 
                     # Move batch to device
                     batch = {k: v.to(model_engine.device) if isinstance(v, torch.Tensor) else v
                              for k, v in batch.items()}
 
-                    # Ensure integer tensors stay Long (DeepSpeed engine
-                    # __call__ casts them, corrupting token IDs >2048 in fp16)
-                    batch["input_ids"] = batch["input_ids"].long()
-                    batch["labels"] = batch["labels"].long()
-                    if "attention_mask" in batch:
-                        batch["attention_mask"] = batch["attention_mask"].long()
-
-                    # Forward via raw module to avoid DeepSpeed's dtype casting.
-                    # PyTorch autocast correctly leaves integer tensors alone.
-                    use_amp = _precision == "fp16" and model_engine.device.type == "cuda"
-                    if use_amp:
-                        with torch.cuda.amp.autocast():
-                            outputs = model_engine.module(
-                                input_ids=batch["input_ids"],
-                                attention_mask=batch.get("attention_mask"),
-                            )
-                    else:
-                        outputs = model_engine.module(
-                            input_ids=batch["input_ids"],
-                            attention_mask=batch.get("attention_mask"),
-                        )
+                    # Forward
+                    outputs = model_engine(**{k: v for k, v in batch.items()
+                                              if k in ("input_ids", "attention_mask")})
 
                     loss = self.loss_fn(
                         outputs.logits.view(-1, outputs.logits.size(-1)),
@@ -219,15 +203,18 @@ class DeepSpeedTrainer(BaseTrainer):
                     ckpt_cfg = self.config.get("checkpoint", {})
                     save_interval = ckpt_cfg.get("save_interval", 500)
                     if self.state.global_step % save_interval == 0:
-                        ckpt_dir = ckpt_cfg.get("checkpoint_dir", "./checkpoints")
+                        ckpt_dir = ckpt_cfg.get("checkpoint_dir", "/tmp/llmt_checkpoints")
                         self.save_checkpoint(ckpt_dir)
 
                 self.callbacks.on_epoch_end(self.state)
 
-                if max_steps and self.state.global_step >= max_steps:
+                if self._should_stop():
+                    break
+                if total_steps and self.state.global_step >= total_steps:
                     break
 
-            self.state.status = "completed"
+            if self.state.status not in ("cancelled", "failed", "paused"):
+                self.state.status = "completed"
 
         except Exception as e:
             self.state.status = "failed"
@@ -250,12 +237,8 @@ class DeepSpeedTrainer(BaseTrainer):
             for batch in self.eval_dataloader:
                 batch = {k: v.to(self._ds_engine.device) if isinstance(v, torch.Tensor) else v
                          for k, v in batch.items()}
-                if "input_ids" in batch:
-                    batch["input_ids"] = batch["input_ids"].long()
-                outputs = self._ds_engine.module(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch.get("attention_mask"),
-                )
+                outputs = self._ds_engine(**{k: v for k, v in batch.items()
+                                             if k in ("input_ids", "attention_mask")})
                 loss = self.loss_fn(
                     outputs.logits.view(-1, outputs.logits.size(-1)),
                     batch["labels"].view(-1),
@@ -267,13 +250,19 @@ class DeepSpeedTrainer(BaseTrainer):
         return {"eval_loss": total_loss / max(total_steps, 1)}
 
     def save_checkpoint(self, path: str) -> str:
-        """Save DeepSpeed checkpoint."""
+        """Save DeepSpeed checkpoint — overwrites previous one."""
         if self._ds_engine is None:
             return ""
         os.makedirs(path, exist_ok=True)
-        tag = f"step-{self.state.global_step}"
-        self._ds_engine.save_checkpoint(path, tag=tag)
+        tag = "ckpt"
         ckpt_path = os.path.join(path, tag)
+        if os.path.exists(ckpt_path):
+            import shutil
+            if os.path.isdir(ckpt_path):
+                shutil.rmtree(ckpt_path)
+            else:
+                os.remove(ckpt_path)
+        self._ds_engine.save_checkpoint(path, tag=tag)
         self.callbacks.on_checkpoint(self.state, checkpoint_path=ckpt_path)
         return ckpt_path
 

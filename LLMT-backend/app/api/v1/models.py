@@ -44,6 +44,7 @@ def _build_model_out(model) -> dict:
         framework=model.framework,
         metrics=ModelMetrics(**metrics_dict) if isinstance(metrics_dict, dict) else ModelMetrics(),
         training_metadata=TrainingMetadata(**meta_dict) if isinstance(meta_dict, dict) else TrainingMetadata(),
+        hyperparams_json=meta_dict if isinstance(meta_dict, dict) else {},
         storage_path=model.storage_path,
         is_current=model.is_current,
         created_at=model.created_at,
@@ -442,6 +443,18 @@ def update_rate_limit(
         "limits": limits,
         "updated_at": model.updated_at.isoformat() if model.updated_at else None,
     }, "限流策略已更新")
+
+
+@router.delete("/{model_code}")
+def delete_model(
+    model_code: str,
+    version: str = Query("", description="版本号，空则删除全部版本"),
+    db: Session = Depends(get_db),
+):
+    deleted = model_repository.delete_model(db, model_code, version or None)
+    if deleted == 0:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型不存在")
+    return success_response(message=f"已删除 {deleted} 个模型版本")
 
 
 @router.get("/{model_code}")
