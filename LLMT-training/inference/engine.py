@@ -144,6 +144,32 @@ def _find_tokenizer_vocab(model_code: str = "", version: str = "") -> str | None
 
     Returns a local file path, or None if not found.
     """
+    # Prefer the model-version artifact in MinIO. Local checkpoint directories
+    # are shared across training runs and can contain a stale vocabulary from a
+    # different model version, which makes decoded inference output look corrupt.
+    if model_code and version:
+        minio = _get_minio_client()
+        if minio is not None:
+            try:
+                from app.core.config import get_settings
+                bucket = get_settings().MINIO_BUCKET_MODELS
+            except Exception:
+                bucket = "models"
+            prefix = f"models/{model_code}/{version}/"
+            try:
+                for obj in minio.list_objects(bucket, prefix=prefix, recursive=True):
+                    if obj.object_name.endswith("tokenizer_vocab.json"):
+                        response = minio.get_object(bucket, obj.object_name)
+                        data = response.read()
+                        response.close()
+                        response.release_conn()
+                        tmp_path = os.path.join(tempfile.gettempdir(), f"tokenizer_vocab_{model_code}_{version}.json")
+                        with open(tmp_path, "wb") as f:
+                            f.write(data)
+                        return tmp_path
+            except Exception as exc:
+                _log.debug("Failed to download tokenizer vocab from MinIO: %s", exc)
+
     # Check same locations as _download_checkpoint
     local_dirs = [
         os.path.join("/tmp/llmt_checkpoints", "ckpt"),
@@ -170,31 +196,6 @@ def _find_tokenizer_vocab(model_code: str = "", version: str = "") -> str | None
         candidate = os.path.join(d, "tokenizer_vocab.json")
         if os.path.isfile(candidate):
             return candidate
-
-    # Try downloading from MinIO
-    if model_code and version:
-        minio = _get_minio_client()
-        if minio is not None:
-            try:
-                from app.core.config import get_settings
-                bucket = get_settings().MINIO_BUCKET_MODELS
-            except Exception:
-                bucket = "models"
-            prefix = f"models/{model_code}/{version}/"
-            try:
-                for obj in minio.list_objects(bucket, prefix=prefix, recursive=True):
-                    if obj.object_name.endswith("tokenizer_vocab.json"):
-                        response = minio.get_object(bucket, obj.object_name)
-                        data = response.read()
-                        response.close()
-                        response.release_conn()
-                        # Write to local cache so subsequent loads are instant
-                        tmp_path = os.path.join(tempfile.gettempdir(), f"tokenizer_vocab_{model_code}_{version}.json")
-                        with open(tmp_path, "wb") as f:
-                            f.write(data)
-                        return tmp_path
-            except Exception as exc:
-                _log.debug("Failed to download tokenizer vocab from MinIO: %s", exc)
 
     return None
 

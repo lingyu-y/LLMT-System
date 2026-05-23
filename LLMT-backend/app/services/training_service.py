@@ -445,6 +445,26 @@ def promote_to_model(db: Session, task_id: int) -> dict | None:
     storage_path = f"models/{model_code}/{version}"
     ckpt_uploaded = False
 
+    def _upload_local_tokenizer_vocab(minio, model_bucket: str) -> None:
+        import os as _os
+
+        candidates = [
+            "/tmp/llmt_checkpoints/ckpt/tokenizer_vocab.json",
+            "/tmp/llmt_checkpoints/latest/tokenizer_vocab.json",
+            "/tmp/llmt_checkpoints/tokenizer_vocab.json",
+            "./checkpoints/ckpt/tokenizer_vocab.json",
+            "./checkpoints/tokenizer_vocab.json",
+        ]
+        for vocab_path in candidates:
+            if _os.path.isfile(vocab_path):
+                minio.fput_object(
+                    model_bucket,
+                    f"{storage_path}/tokenizer_vocab.json",
+                    vocab_path,
+                )
+                logger.info("Uploaded tokenizer vocab %s -> %s/%s", vocab_path, model_bucket, storage_path)
+                return
+
     try:
         from minio.commonconfig import CopySource
         minio = get_minio_client()
@@ -479,19 +499,23 @@ def promote_to_model(db: Session, task_id: int) -> dict | None:
                 minio.copy_object(model_bucket, target_name, CopySource(ckpt_bucket, obj.object_name))
             if selected_files:
                 ckpt_uploaded = True
+                _upload_local_tokenizer_vocab(minio, model_bucket)
                 logger.info("Promoted latest checkpoint (%d files) for task %s to model %s", len(selected_files), task_code, model_code)
-                for obj in ckpt_files:
-                    try:
-                        minio.remove_object(ckpt_bucket, obj.object_name)
-                    except Exception:
-                        pass
-                logger.info("Removed %d source checkpoint files for task %s", len(ckpt_files), task_code)
+                if not settings.KEEP_TRAINING_CHECKPOINTS:
+                    for obj in ckpt_files:
+                        try:
+                            minio.remove_object(ckpt_bucket, obj.object_name)
+                        except Exception:
+                            pass
+                    logger.info("Removed %d source checkpoint files for task %s", len(ckpt_files), task_code)
+                else:
+                    logger.info("Kept %d source checkpoint files for task %s", len(ckpt_files), task_code)
     except Exception as exc:
         logger.warning("MinIO checkpoint copy failed: %s", exc)
 
     if not ckpt_uploaded:
         import os as _os
-        local_dirs = ["/tmp/llmt_checkpoints", "/tmp/llmt_checkpoints/ckpt", "/tmp/llmt_checkpoints/latest"]
+        local_dirs = ["/tmp/llmt_checkpoints/ckpt", "/tmp/llmt_checkpoints/latest", "/tmp/llmt_checkpoints"]
         try:
             minio = get_minio_client()
             model_bucket = settings.MINIO_BUCKET_MODELS
@@ -504,6 +528,7 @@ def promote_to_model(db: Session, task_id: int) -> dict | None:
                         rel = _os.path.relpath(local_path, ld)
                         object_name = f"{storage_path}/{rel}".replace("\\", "/")
                         minio.fput_object(model_bucket, object_name, local_path)
+                _upload_local_tokenizer_vocab(minio, model_bucket)
                 ckpt_uploaded = True
                 logger.info("Uploaded local checkpoint %s -> %s/%s", ld, model_bucket, storage_path)
                 break
