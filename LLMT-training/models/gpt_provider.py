@@ -159,7 +159,10 @@ class GPTModelProvider(BaseModelProvider):
         vocab_size = config.get("vocab_size", 50257)
         try:
             from transformers import GPT2Tokenizer
-            return GPT2Tokenizer.from_pretrained("gpt2", local_files_only=True)
+            tokenizer = GPT2Tokenizer.from_pretrained("gpt2", local_files_only=True)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            return tokenizer
         except Exception:
             return SimpleTokenizer(vocab_size=vocab_size)
 
