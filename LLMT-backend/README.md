@@ -14,6 +14,7 @@ docker compose --env-file .env up -d
 
 ```bash
 conda activate llmt-backend
+python scripts/setup_llmt_training_link.py
 python scripts/init_datastores.py
 ```
 
@@ -23,6 +24,14 @@ python scripts/init_datastores.py
 - 检查并创建 InfluxDB bucket
 - 检查并创建 MinIO buckets
 - 检查并创建 Elasticsearch 日志 index
+
+`setup_llmt_training_link.py` 会在仓库根目录创建/修复 `llmt_training -> LLMT-training`，
+用于让后端、DataLoader 子进程和训练任务都能 import `llmt_training`。也可以改用
+editable 安装：
+
+```bash
+pip install -e ../LLMT-training
+```
 
 如果只想跳过其中某一步，也可以使用可选参数：
 
