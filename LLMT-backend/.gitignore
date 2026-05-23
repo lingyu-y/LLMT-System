@@ -1,3 +1,5 @@
 .env
 __pycache__/
 *.py[cod]
+tokenizer_vocab.json
+checkpoints/tokenizer_vocab.json
