@@ -59,11 +59,16 @@ def predict_sync(
 
     # Look up model metadata from DB
     from app.models.model_version import ModelVersion
-    query = db.query(ModelVersion).filter(ModelVersion.is_current == True)
     if model_ref.isdigit():
-        mv = query.filter(ModelVersion.id == int(model_ref)).first()
+        # Numeric refs come from older frontend builds that used the DB id.
+        # Treat it as an exact model-version id, even if that version is not
+        # currently marked as the latest for its model_code.
+        mv = db.query(ModelVersion).filter(ModelVersion.id == int(model_ref)).first()
     else:
-        mv = query.filter(ModelVersion.model_code == model_ref).first()
+        mv = db.query(ModelVersion).filter(
+            ModelVersion.model_code == model_ref,
+            ModelVersion.is_current == True,
+        ).first()
     if mv is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型不存在或不可用")
 
