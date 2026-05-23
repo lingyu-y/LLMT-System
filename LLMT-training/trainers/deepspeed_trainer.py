@@ -175,14 +175,21 @@ class DeepSpeedTrainer(BaseTrainer):
         os.environ.setdefault("RANK", "0")
         os.environ.setdefault("WORLD_SIZE", "1")
 
-        # Initialize torch.distributed before DeepSpeed to avoid MPI detection
-        if not torch.distributed.is_initialized():
-            backend = "nccl" if use_cuda else "gloo"
-            torch.distributed.init_process_group(
-                backend=backend,
-                rank=0,
-                world_size=1,
-            )
+        # In-process backend tasks run sequentially inside the same Python
+        # process. A failed/previous DeepSpeed run can leave a stale default
+        # group, so reset it before creating the single-rank group for this job.
+        if torch.distributed.is_initialized():
+            try:
+                torch.distributed.destroy_process_group()
+            except Exception:
+                pass
+
+        backend = "nccl" if use_cuda else "gloo"
+        torch.distributed.init_process_group(
+            backend=backend,
+            rank=0,
+            world_size=1,
+        )
 
         # Save original sampler before training starts.
         _train_sampler = getattr(self.train_dataloader, "sampler", None) if self.train_dataloader is not None else None
