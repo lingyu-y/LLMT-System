@@ -91,9 +91,10 @@ class ReportingCallbackBridge(TrainingCallback):
                     step=state.global_step,
                 )
             else:
+                total_steps = state.max_steps or self._read_total_steps_from_db()
                 self.postgres_updater.append_log(
                     self.task_code, "INFO",
-                    f"训练开始 — 总 epoch: {state.max_epochs}, 总 step: {state.max_steps or '不限'}",
+                    f"训练开始 — 总 epoch: {state.max_epochs}, 总 step: {total_steps or '不限'}",
                 )
 
     def on_epoch_begin(self, state: TrainingState, **kwargs: Any) -> None:
@@ -248,6 +249,29 @@ class ReportingCallbackBridge(TrainingCallback):
                 f"训练出错 — Step {state.global_step}: {state.error_message}",
                 step=state.global_step,
             )
+
+    def _read_total_steps_from_db(self) -> int | None:
+        """Read _total_steps from the task's config_json stored at training start."""
+        import json as _json
+        try:
+            from sqlalchemy import create_engine, text
+            from sqlalchemy.orm import Session
+            url = self.postgres_updater.db_url if self.postgres_updater else None
+            if not url:
+                return None
+            engine = create_engine(url)
+            with Session(engine) as session:
+                row = session.execute(
+                    text("SELECT config_json FROM training_tasks WHERE task_code = :tc"),
+                    {"tc": self.task_code},
+                ).fetchone()
+                if row is None:
+                    return None
+                raw = row[0]
+                cfg = _json.loads(raw) if isinstance(raw, str) else (raw if isinstance(raw, dict) else {})
+                return cfg.get("_total_steps")
+        except Exception:
+            return None
 
     @staticmethod
     def _collect_gpu_metrics(state: TrainingState) -> None:

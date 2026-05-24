@@ -145,10 +145,12 @@ def delete_task(db: Session, task_id: int) -> bool:
         task.error_message = "任务已被删除"
         db.flush()
 
-    # 2. Try Celery revoke
+    # 2. Try Celery revoke with the real Celery task ID
     try:
         from app.core.celery_app import celery_app
-        celery_app.control.revoke(task_code, terminate=True)
+        celery_id = task.celery_task_id
+        if celery_id:
+            celery_app.control.revoke(celery_id, terminate=True)
     except Exception:
         pass
 
@@ -637,46 +639,33 @@ def _to_task_out(task: TrainingTask) -> TrainingTaskOut:
     return TrainingTaskOut.model_validate(task)
 
 
-def _extract_max_steps_from_config(cfg: dict) -> int | None:
-    """Extract max_steps from either nested TrainingConfig or flat config."""
+def _extract_total_steps(cfg: dict) -> int | None:
+    """Extract total_steps from config_json (set at training start)."""
+    total = cfg.get("_total_steps")
+    if total and int(total) > 0:
+        return int(total)
+    # Fallback: use max_steps if explicitly configured
     hp = cfg.get("hyperparams", {})
     if isinstance(hp, dict) and hp.get("max_steps"):
-        return hp["max_steps"]
+        return int(hp["max_steps"])
     flat = cfg.get("max_steps")
     if flat:
-        return flat
-    # Fallback: estimate from max_epochs * approximate steps per epoch
+        return int(flat)
     return None
 
 
 def _to_list_out(task: TrainingTask) -> TrainingTaskListOut:
     cfg = task.config_json or {}
-    hp = cfg.get("hyperparams", {})
-    max_steps = hp.get("max_steps") or _extract_max_steps_from_config(cfg)
-    max_epoch = task.max_epoch or hp.get("max_epochs", 10)
 
     if task.status in ("completed",):
         progress = 100
-    elif max_steps and max_steps > 0:
-        # Step-limited training: progress driven by step count
-        progress = min(round(task.current_step / max_steps * 100), 100)
-    elif max_epoch and max_epoch > 0:
-        # Epoch-limited training: progress driven by epoch primarily,
-        # with fine-grained step contribution estimated from saved state
-        epoch_progress = min(task.current_epoch, max_epoch) / max_epoch
-        interval_steps = max(1, hp.get("save_interval", 500))
-        # estimate steps per epoch from stride of current_step vs epoch
-        est_steps_per_epoch = max(
-            task.current_step // max(task.current_epoch, 1),
-            interval_steps * 5,  # floor estimate
-        )
-        if est_steps_per_epoch > 0 and task.current_epoch < max_epoch:
-            step_frac = (task.current_step % max(est_steps_per_epoch, 1)) / est_steps_per_epoch
-        else:
-            step_frac = 0.0
-        progress = min(round((epoch_progress + step_frac / max_epoch) * 100), 100)
     else:
-        progress = 0
+        total_steps = _extract_total_steps(cfg)
+        if total_steps and total_steps > 0:
+            progress = min(round(task.current_step / total_steps * 100), 100)
+        else:
+            progress = 0
+
     gpu_count = cfg.get("num_gpus", 1)
     gpu_display = f"{gpu_count}x A100"
 

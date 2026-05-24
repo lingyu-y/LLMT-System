@@ -49,12 +49,12 @@ class TrainingTask(IdMixin, TimestampMixin, Base):
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     checkpoint_path: Mapped[str | None] = mapped_column(String(512))
     error_message: Mapped[str | None] = mapped_column(Text)
-    # celery_task_id: Mapped[str | None] = mapped_column(  # TODO: run migration
-    #     String(128),
-    #     index=True,
-    #     nullable=True,
-    #     comment="Celery AsyncResult.id returned by delay()/apply_async()",
-    # )
+    celery_task_id: Mapped[str | None] = mapped_column(
+        String(128),
+        index=True,
+        nullable=True,
+        comment="Celery AsyncResult.id returned by delay()/apply_async()",
+    )
 
     creator: Mapped["User"] = relationship(
         "User",
