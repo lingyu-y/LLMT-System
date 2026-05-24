@@ -53,7 +53,8 @@ class DeepSpeedTrainer(BaseTrainer):
         except Exception:
             # Fallback: minimal config
             hp = self.config.get("hyperparams", {})
-            return {
+            num_gpus = self.config.get("num_gpus", 1)
+            ds_cfg: dict[str, Any] = {
                 "train_batch_size": "auto",
                 "train_micro_batch_size_per_gpu": "auto",
                 "gradient_accumulation_steps": "auto",
@@ -70,8 +71,12 @@ class DeepSpeedTrainer(BaseTrainer):
                         "torch_adam": True,
                     },
                 },
-                "zero_optimization": {"stage": 2},
             }
+            # For single-GPU, skip ZeRO to avoid dist.new_group([0]) failures
+            # that occur in some PyTorch + DeepSpeed combinations.
+            if num_gpus > 1:
+                ds_cfg["zero_optimization"] = {"stage": 2}
+            return ds_cfg
 
     @staticmethod
     def _estimate_total_steps(
@@ -177,30 +182,18 @@ class DeepSpeedTrainer(BaseTrainer):
         os.environ.setdefault("RANK", "0")
         os.environ.setdefault("WORLD_SIZE", "1")
 
-        # In-process backend tasks run sequentially inside the same Python
-        # process. A failed/previous DeepSpeed run can leave a stale default
-        # group, so reset it before DeepSpeed creates the single-rank group.
-        if dist.is_initialized():
-            try:
-                dist.destroy_process_group()
-            except Exception:
-                pass
-
-        backend = "nccl" if use_cuda else "gloo"
-        deepspeed.init_distributed(
-            dist_backend=backend,
-            auto_mpi_discovery=False,
-            distributed_port=int(os.environ.get("MASTER_PORT", "29500")),
-            rank=int(os.environ.get("RANK", "0")),
-            world_size=int(os.environ.get("WORLD_SIZE", "1")),
-        )
-
         # Save original sampler before training starts.
         _train_sampler = getattr(self.train_dataloader, "sampler", None) if self.train_dataloader is not None else None
 
-        # Keep the caller-built DataLoader. Passing training_data to DeepSpeed
-        # makes DeepSpeed rebuild a loader internally, which can re-enable
-        # multiprocessing workers and lose the package path prepared by backend.
+        # Initialize torch.distributed before DeepSpeed to avoid MPI detection
+        if not torch.distributed.is_initialized():
+            backend = "nccl" if use_cuda else "gloo"
+            torch.distributed.init_process_group(
+                backend=backend,
+                rank=0,
+                world_size=1,
+            )
+
         model_engine, optimizer, train_dataloader, scheduler = deepspeed.initialize(
             model=self.model,
             model_parameters=[p for p in self.model.parameters() if p.requires_grad],
@@ -301,11 +294,6 @@ class DeepSpeedTrainer(BaseTrainer):
             self.callbacks.on_error(self.state, error=e)
 
         self.callbacks.on_train_end(self.state)
-        if dist.is_initialized():
-            try:
-                dist.destroy_process_group()
-            except Exception:
-                pass
         return self.state
 
     def evaluate(self) -> dict[str, float]:

@@ -300,12 +300,23 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
 
         cancel_cb.set_trainer(trainer)
 
-        # On resume, load the last checkpoint so training continues from there
-        if resume_step > 0 and resume_ckpt:
-            try:
-                trainer.load_checkpoint(resume_ckpt)
-            except Exception:
-                pass  # Best-effort; training proceeds from saved step
+        # On resume, load the last checkpoint so training continues from there.
+        if resume_step > 0:
+            ckpt_candidates = [
+                resume_ckpt,
+                # Pause callback saves to these fixed paths
+                "/tmp/llmt_checkpoints/checkpoint.pt",
+                "/tmp/llmt_checkpoints/ckpt/checkpoint.pt",
+                "./checkpoints/checkpoint.pt",
+            ]
+            for ckpt in ckpt_candidates:
+                if ckpt and os.path.isfile(ckpt):
+                    try:
+                        trainer.load_checkpoint(ckpt)
+                        print(f"[TrainingTask] resumed from checkpoint {ckpt}", flush=True)
+                        break
+                    except Exception:
+                        pass
 
         # For in-process training (pytorch/deepspeed single-node)
         if framework in ("pytorch", "deepspeed") and _should_run_in_process(config_dict):
@@ -343,6 +354,14 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
         _save_tokenizer_vocab(dataset, config_dict)
         if final_state.status == "completed":
             _promote_to_model(task_code)
+
+        # Explicitly update DB status so completion is reflected even if the
+        # callback bridge's PostgreSQL updater is unavailable.
+        _update_task_status(
+            task_code,
+            status=final_state.status,
+            error_message=final_state.error_message,
+        )
 
         return {
             "task_code": task_code,
@@ -473,13 +492,13 @@ def _prepopulate_tokenizer_vocab(dataset) -> None:
 # ---------------------------------------------------------------------------
 
 class _CancellationCheckCallback:
-    """Callback that polls the DB for cancellation / pause status.
+    """Callback that polls the DB for cancellation / pause / pausing status.
 
     On ``cancelled`` — propagates to ``state.status`` so the trainer's
     ``_should_stop()`` exits the loop cleanly.
 
-    On ``paused`` — saves a checkpoint immediately (so we can resume from
-    it), then propagates ``paused`` to ``state.status``.
+    On ``pausing`` — saves a checkpoint, then transitions status to
+    ``paused`` so the frontend sees the true paused state.
     """
 
     def __init__(self, task_code: str, poll_every: int = 10):
@@ -518,14 +537,20 @@ class _CancellationCheckCallback:
                     return
                 if row.status == "cancelled":
                     state.status = "cancelled"
-                elif row.status == "paused":
-                    # Save checkpoint so we can resume from here
+                elif row.status == "pausing":
+                    # Save checkpoint so we can resume from here, then mark paused
                     if self._trainer_ref is not None:
                         try:
                             ckpt_dir = "/tmp/llmt_checkpoints"
                             self._trainer_ref.save_checkpoint(ckpt_dir)
                         except Exception:
                             pass
+                    # Transition DB from 'pausing' → 'paused' atomically
+                    try:
+                        row.status = "paused"
+                        db.commit()
+                    except Exception:
+                        pass
                     state.status = "paused"
         except Exception:
             pass
@@ -874,14 +899,31 @@ def _promote_to_model(task_code: str) -> dict | None:
             ckpt_uploaded = False
 
             def _upload_local_tokenizer_vocab(minio, model_bucket: str) -> None:
-                vocab_candidates = [
+                candidates = [
                     "/tmp/llmt_checkpoints/ckpt/tokenizer_vocab.json",
-                    "/tmp/llmt_checkpoints/latest/tokenizer_vocab.json",
                     "/tmp/llmt_checkpoints/tokenizer_vocab.json",
                     "./checkpoints/ckpt/tokenizer_vocab.json",
                     "./checkpoints/tokenizer_vocab.json",
                 ]
-                for vocab_path in vocab_candidates:
+                # DeepSpeed convention: latest file points to step-N directory
+                for base in ("/tmp/llmt_checkpoints", "./checkpoints"):
+                    latest_file = os.path.join(base, "latest")
+                    if os.path.isfile(latest_file):
+                        with open(latest_file, "r") as f:
+                            latest_dir = f.read().strip()
+                        candidates.append(
+                            os.path.join(base, latest_dir, "tokenizer_vocab.json"),
+                        )
+                # Also scan checkpoints/ for any step subdirectory
+                for ckpt_root in ("./checkpoints", "/tmp/llmt_checkpoints"):
+                    if os.path.isdir(ckpt_root):
+                        for entry in sorted(os.listdir(ckpt_root), reverse=True):
+                            entry_path = os.path.join(ckpt_root, entry)
+                            if os.path.isdir(entry_path) and entry.startswith("step-"):
+                                candidates.append(
+                                    os.path.join(entry_path, "tokenizer_vocab.json"),
+                                )
+                for vocab_path in candidates:
                     if os.path.isfile(vocab_path):
                         minio.fput_object(
                             model_bucket,

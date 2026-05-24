@@ -5,50 +5,80 @@
         <h1 class="page-title">对话式文档生成</h1>
         <p class="page-description">选择文档模型后，通过多轮对话生成提纲、段落草稿和修订建议</p>
       </div>
-      <el-button :icon="Management" @click="modelDrawerVisible = true">
-        当前模型：{{ selectedModel.name }}
-      </el-button>
+      <div class="header-actions">
+        <el-button :icon="Management" @click="modelDrawerVisible = true">
+          当前模型：{{ selectedModel.name }}
+        </el-button>
+        <el-badge :value="drafts.length" :hidden="drafts.length === 0">
+          <el-button @click="draftDrawerVisible = true">草稿箱</el-button>
+        </el-badge>
+      </div>
     </div>
 
-    <div class="chat-container">
-      <div ref="messageBox" class="chat-messages">
-        <div v-for="message in messages" :key="message.id" class="chat-message" :class="message.role">
-          <div class="chat-avatar">{{ message.role === 'ai' ? 'AI' : '我' }}</div>
-          <div class="chat-bubble">
-            <p>{{ message.content }}</p>
-            <div v-if="message.quick" class="quick-actions">
-              <el-button v-for="item in quickActions" :key="item.type" @click="selectQuick(item.prompt)">{{ item.label }}</el-button>
-            </div>
-            <div v-if="message.preview" class="doc-preview">
-              <div class="preview-head">
-                <h3>{{ message.preview.title }}</h3>
-                <span>{{ message.preview.model }}</span>
-              </div>
-              <div v-for="section in message.preview.sections" :key="section.title" class="document-section">
-                <strong>{{ section.title }}</strong>
-                <p>{{ section.content }}</p>
-              </div>
-              <div class="preview-actions">
-                <el-button type="primary" :icon="Download" @click="saveDraft(message.preview)">保存草稿</el-button>
-                <el-button :icon="Edit" @click="ElMessage.info('可继续通过对话修改草稿')">继续修改</el-button>
-              </div>
-            </div>
+    <div class="doc-layout">
+      <!-- 历史对话侧边栏 -->
+      <div class="conversation-sidebar">
+        <el-button type="primary" style="width:100%;margin-bottom:12px" @click="newConversation">
+          新建对话
+        </el-button>
+        <div class="conversation-list">
+          <div
+            v-for="conv in conversations"
+            :key="conv.id"
+            class="conv-item"
+            :class="{ active: conv.id === activeConvId }"
+            @click="switchConversation(conv.id)"
+          >
+            <span class="conv-title">{{ conv.title }}</span>
+            <span class="conv-time">{{ formatTime(conv.updatedAt) }}</span>
+            <el-button class="conv-delete" size="small" text type="danger" @click.stop="deleteConversation(conv.id)">
+              删除
+            </el-button>
+          </div>
+          <div v-if="conversations.length === 0" class="conv-empty">
+            暂无历史对话
           </div>
         </div>
       </div>
 
-      <div class="chat-input-container">
-        <el-input
-          v-model="input"
-          type="textarea"
-          :autosize="{ minRows: 1, maxRows: 4 }"
-          placeholder="输入文档生成需求，例如：帮我补写模型训练模块的需求描述..."
-          @keydown.enter.exact.prevent="send"
-        />
-        <el-button type="primary" :icon="Promotion" circle @click="send" />
+      <!-- 对话主区域 -->
+      <div class="chat-container">
+        <div ref="messageBox" class="chat-messages">
+          <div v-if="messages.length === 0" class="chat-empty">
+            <p>开始新的对话，输入文档需求后发送</p>
+            <div class="quick-actions">
+              <el-button v-for="item in quickActions" :key="item.type" @click="selectQuick(item.prompt)">{{ item.label }}</el-button>
+            </div>
+          </div>
+          <div v-for="message in messages" :key="message.id" class="chat-message" :class="message.role">
+            <div class="chat-avatar">{{ message.role === 'ai' ? 'AI' : '我' }}</div>
+            <div class="chat-bubble">
+              <div class="chat-content" v-html="renderContent(message.content)" />
+              <div v-if="message.quick" class="quick-actions">
+                <el-button v-for="item in quickActions" :key="item.type" @click="selectQuick(item.prompt)">{{ item.label }}</el-button>
+              </div>
+              <div v-if="message.role === 'ai' && message.id !== 1" class="preview-actions">
+                <el-button type="primary" size="small" :icon="Download" @click="saveDraftMsg(message)">保存草稿</el-button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="chat-input-container">
+          <el-input
+            v-model="input"
+            type="textarea"
+            :autosize="{ minRows: 1, maxRows: 4 }"
+            placeholder="输入文档生成需求，例如：帮我补写模型训练模块的需求描述..."
+            :disabled="sending"
+            @keydown.enter.exact.prevent="send"
+          />
+          <el-button type="primary" :icon="Promotion" circle :loading="sending" :disabled="sending" @click="send" />
+        </div>
       </div>
     </div>
 
+    <!-- 模型选择抽屉 -->
     <el-drawer v-model="modelDrawerVisible" title="选择文档生成模型" size="520px">
       <div class="model-drawer">
         <button
@@ -67,21 +97,56 @@
         </button>
       </div>
     </el-drawer>
+
+    <!-- 草稿箱抽屉 -->
+    <el-drawer v-model="draftDrawerVisible" title="草稿箱" size="600px">
+      <div v-if="drafts.length === 0" class="draft-empty">
+        <p>暂无保存的草稿</p>
+      </div>
+      <div v-else class="draft-list">
+        <div v-for="draft in drafts" :key="draft.id" class="draft-item">
+          <div class="draft-info" @click="viewDraft(draft)">
+            <span class="draft-title">{{ draft.title }}</span>
+            <span class="draft-meta">{{ draft.doc_type }} · {{ draft.word_count }} 字 · {{ formatTime(draft.updated_at) }}</span>
+          </div>
+          <div class="draft-actions">
+            <el-button size="small" text @click="downloadDraft(draft)">下载</el-button>
+            <el-button size="small" text type="danger" @click="removeDraft(draft.id)">删除</el-button>
+          </div>
+        </div>
+      </div>
+    </el-drawer>
+
+    <!-- 草稿详情弹窗 -->
+    <el-dialog v-model="draftDetailVisible" :title="viewingDraft?.title ?? '草稿详情'" width="700px">
+      <div v-if="viewingDraft" class="draft-detail">
+        <div class="draft-detail-meta">
+          <span>{{ viewingDraft.doc_type }}</span>
+          <span>{{ viewingDraft.word_count ?? 0 }} 字</span>
+          <span>{{ viewingDraft.updated_at }}</span>
+        </div>
+        <div class="draft-detail-content" v-html="renderContent(viewingDraft.content ?? '')" />
+      </div>
+      <template #footer>
+        <el-button @click="draftDetailVisible = false">关闭</el-button>
+        <el-button v-if="viewingDraft" type="primary" @click="downloadDraft(viewingDraft)">下载</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup lang="ts">
-import { nextTick, onMounted, ref } from 'vue'
-import { ElMessage } from 'element-plus'
-import { Download, Edit, Management, Promotion } from '@element-plus/icons-vue'
-import { chatGenerate, createDraft, listDocumentModels } from '@/api/documents'
+import { nextTick, onMounted, ref, watch } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { Download, Management, Promotion } from '@element-plus/icons-vue'
+import { chatGenerate, createDraft, deleteDraft, getDraft, listDocumentModels, listDrafts } from '@/api/documents'
+import type { Draft } from '@/api/documents'
 
 interface Message {
   id: number
   role: 'ai' | 'user'
   content: string
   quick?: boolean
-  preview?: { title: string; model: string; sections: { title: string; content: string }[] }
 }
 
 interface DocModel {
@@ -93,6 +158,47 @@ interface DocModel {
   tags: string[]
 }
 
+interface Conversation {
+  id: string
+  title: string
+  modelId: string
+  messages: Message[]
+  updatedAt: string
+}
+
+const STORAGE_KEY = 'docgen_conversations'
+const ACTIVE_KEY = 'docgen_active_conv'
+
+function loadConversations(): Conversation[] {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (raw) return JSON.parse(raw)
+  } catch { /* ignore */ }
+  return []
+}
+
+function saveConversations(convs: Conversation[]) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(convs))
+  } catch { /* ignore */ }
+}
+
+function loadActiveId(): string | null {
+  try {
+    return localStorage.getItem(ACTIVE_KEY)
+  } catch { return null }
+}
+
+function saveActiveId(id: string) {
+  try {
+    localStorage.setItem(ACTIVE_KEY, id)
+  } catch { /* ignore */ }
+}
+
+function makeWelcomeMsg(): Message[] {
+  return [{ id: Date.now(), role: 'ai', content: '您好！我是对话式文档助手。请先确认右上角选择的模型，然后通过对话生成提纲、段落草稿、润色建议或测试要点。', quick: true }]
+}
+
 const quickActions = [
   { type: 'outline', label: '生成文档提纲', prompt: '请帮我生成离线大数据训练与应用系统的需求文档提纲' },
   { type: 'section', label: '补写模块段落', prompt: '请帮我补写模型训练模块的功能需求段落' },
@@ -102,71 +208,128 @@ const quickActions = [
 
 const defaultDocModels: DocModel[] = [
   {
-    id: 'gpt-doc',
-    name: 'GPT-Generator v1.5',
-    provider: '文本生成模型',
-    context: '32K 上下文',
-    desc: '适合生成需求描述、概要设计段落和测试说明，输出更偏通用文档草稿。',
-    tags: ['需求段落', '测试要点', '润色'],
-  },
-  {
-    id: 'layout-doc',
-    name: 'LayoutLMv3-Doc v2.0',
-    provider: '文档理解模型',
-    context: '16K 上下文',
-    desc: '适合基于已有文档内容进行结构整理、章节补全和格式化改写。',
-    tags: ['结构整理', '章节补全', '格式规范'],
-  },
-  {
-    id: 'llmt-assistant',
-    name: 'LLMT-Assistant',
-    provider: '项目定制模型',
-    context: '8K 上下文',
-    desc: '适合围绕本系统需求进行对话式补写，强调功能范围收敛和术语一致。',
-    tags: ['项目需求', '范围收敛', '术语一致'],
+    id: 'default',
+    name: '默认文档模型',
+    provider: '规则模板',
+    context: '基础',
+    desc: '尚未训练任何模型时使用的内置模板引擎，生成结构化文档草稿。',
+    tags: ['需求段落', '测试要点', '润色', '提纲'],
   },
 ]
 
+// ---- state ----
 const input = ref('')
+const sending = ref(false)
 const messageBox = ref<HTMLDivElement>()
 const modelDrawerVisible = ref(false)
+const draftDrawerVisible = ref(false)
+const draftDetailVisible = ref(false)
 const docModels = ref<DocModel[]>(defaultDocModels)
 const selectedModel = ref<DocModel>(defaultDocModels[0]!)
-const messages = ref<Message[]>([
-  {
-    id: 1,
-    role: 'ai',
-    content: '您好！我是对话式文档助手。请先确认右上角选择的模型，然后通过对话生成提纲、段落草稿、润色建议或测试要点。',
-    quick: true,
-  },
-])
+const messages = ref<Message[]>(makeWelcomeMsg())
+const drafts = ref<Draft[]>([])
+const viewingDraft = ref<Draft | null>(null)
+const conversations = ref<Conversation[]>(loadConversations())
+const activeConvId = ref<string>(loadActiveId() ?? '')
 
-const scrollBottom = () => nextTick(() => messageBox.value?.scrollTo({ top: messageBox.value.scrollHeight, behavior: 'smooth' }))
+// Persist current conversation to history whenever messages change
+watch(messages, () => {
+  const idx = conversations.value.findIndex(c => c.id === activeConvId.value)
+  if (idx === -1) return
+  const title = buildConvTitle()
+  const existing = conversations.value[idx]!
+  conversations.value[idx] = {
+    id: existing.id,
+    modelId: existing.modelId,
+    title,
+    messages: messages.value,
+    updatedAt: new Date().toISOString(),
+  }
+  saveConversations(conversations.value)
+}, { deep: true })
 
-const buildPreview = (prompt: string, content?: string) => ({
-  title: prompt.includes('测试') ? '模型训练模块测试要点草稿' : '离线大数据训练与应用系统文档片段草稿',
-  model: selectedModel.value.name,
-  sections: [
-    { title: '1. 建议写入位置', content: '可作为需求规格说明书中对应模块的小节草稿，后续需要人工确认后再纳入正式文档。' },
-    { title: '2. 草稿内容', content: content ?? '系统支持通过对话方式生成文档提纲、模块描述、验收测试点和修订建议，生成内容以片段形式保存。' },
-    { title: '3. 后续确认项', content: '需确认术语是否与需求文档一致、功能范围是否过度承诺、是否需要补充接口字段或截图。' },
-  ],
+// When activeConvId changes, persist it
+watch(activeConvId, (id) => { if (id) saveActiveId(id) })
+
+// ---- helpers ----
+const scrollBottom = () => nextTick(() => {
+  messageBox.value?.scrollTo({ top: messageBox.value.scrollHeight, behavior: 'smooth' })
 })
 
-const saveDraft = async (preview: Message['preview']) => {
-  if (!preview) return
-  await createDraft({
-    model_code: selectedModel.value.id,
-    doc_type: '对话草稿',
-    title: preview.title,
-    content: preview.sections.map((section) => `## ${section.title}\n\n${section.content}`).join('\n\n'),
-  })
-  ElMessage.success('已保存到草稿箱')
+const buildConvTitle = () => {
+  const userMsg = messages.value.find(m => m.role === 'user')
+  if (userMsg) {
+    const text = userMsg.content.slice(0, 30).replace(/\n/g, ' ').trim()
+    return text.length > 25 ? text + '...' : text
+  }
+  return '新对话'
 }
 
-const selectQuick = (prompt: string) => {
-  input.value = prompt
-  send()
+const renderContent = (text: string) => {
+  return text
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/\n/g, '<br>')
+    .replace(/^### (.+)$/gm, '<h4>$1</h4>')
+    .replace(/^## (.+)$/gm, '<h3>$1</h3>')
+    .replace(/^# (.+)$/gm, '<h2>$1</h2>')
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/- (.+)/g, '· $1')
+}
+
+const formatTime = (iso: string) => {
+  try {
+    const d = new Date(iso)
+    return d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+  } catch { return iso }
+}
+
+// ---- conversation management ----
+const newConversation = () => {
+  // save current conversation if it has user messages
+  const hasContent = messages.value.some(m => m.role === 'user')
+  if (hasContent && activeConvId.value) {
+    // already persisted via watch, just snapshot the list
+  }
+  // create new
+  const id = 'conv_' + Date.now()
+  conversations.value.unshift({
+    id,
+    title: '新对话',
+    modelId: selectedModel.value.id,
+    messages: [],
+    updatedAt: new Date().toISOString(),
+  })
+  saveConversations(conversations.value)
+  activeConvId.value = id
+  messages.value = makeWelcomeMsg()
+  scrollBottom()
+}
+
+const switchConversation = (convId: string) => {
+  if (convId === activeConvId.value) return
+  const conv = conversations.value.find(c => c.id === convId)
+  if (!conv) return
+  activeConvId.value = convId
+  messages.value = conv.messages.length > 0 ? conv.messages : makeWelcomeMsg()
+  // restore model selection
+  const model = docModels.value.find(m => m.id === conv.modelId)
+  if (model) selectedModel.value = model
+  scrollBottom()
+}
+
+const deleteConversation = (convId: string) => {
+  conversations.value = conversations.value.filter(c => c.id !== convId)
+  saveConversations(conversations.value)
+  if (convId === activeConvId.value) {
+    // switch to the most recent or create new
+    const latest = conversations.value[0]
+    if (latest) {
+      switchConversation(latest.id)
+    } else {
+      activeConvId.value = ''
+      messages.value = makeWelcomeMsg()
+    }
+  }
 }
 
 const selectModel = (model: DocModel) => {
@@ -175,41 +338,140 @@ const selectModel = (model: DocModel) => {
   ElMessage.success(`已切换到 ${model.name}`)
 }
 
-const send = () => {
+const selectQuick = (prompt: string) => {
+  input.value = prompt
+  send()
+}
+
+const send = async () => {
   const content = input.value.trim()
-  if (!content) return
+  if (!content || sending.value) return
   messages.value.push({ id: Date.now(), role: 'user', content })
   input.value = ''
-  chatGenerate({ message: content, model_code: selectedModel.value.id })
-    .then((result) => {
-    messages.value.push({
-      id: Date.now() + 1,
-      role: 'ai',
-      content: result.content,
-      preview: buildPreview(content, result.content),
-    })
-    scrollBottom()
-    })
-    .catch((error) => {
-      ElMessage.error(error instanceof Error ? error.message : '文档生成失败')
-    })
+  sending.value = true
+  try {
+    const result = await chatGenerate({ message: content, model_code: selectedModel.value.id })
+    messages.value.push({ id: Date.now() + 1, role: 'ai', content: result.content })
+  } catch (error) {
+    const errMsg = error instanceof Error ? error.message : '文档生成失败'
+    messages.value.push({ id: Date.now() + 1, role: 'ai', content: `请求失败：${errMsg}` })
+    ElMessage.error(errMsg)
+  } finally {
+    sending.value = false
+  }
   scrollBottom()
 }
 
-onMounted(async () => {
+const buildDocTitle = (msg: Message) => {
+  const words = msg.content.slice(0, 40).replace(/\n/g, ' ').trim()
+  return words ? `文档草稿：${words}...` : '文档草稿'
+}
+
+const saveDraftMsg = async (msg: Message) => {
+  const title = buildDocTitle(msg)
+  const content = msg.content.startsWith('#') ? msg.content : `# ${title}\n\n${msg.content}`
+  await createDraft({
+    model_code: selectedModel.value.id,
+    doc_type: '对话草稿',
+    title,
+    content,
+  })
+  ElMessage.success('已保存到草稿箱')
+  loadDrafts()
+}
+
+const loadDrafts = async () => {
   try {
-    const models = await listDocumentModels()
-    docModels.value = models.map((model) => ({
+    const res = await listDrafts()
+    drafts.value = res ?? []
+  } catch { /* drafts unavailable */ }
+}
+
+const viewDraft = async (draft: Draft) => {
+  try {
+    const detail = await getDraft(draft.id)
+    viewingDraft.value = detail
+    draftDetailVisible.value = true
+  } catch {
+    ElMessage.error('无法加载草稿详情')
+  }
+}
+
+const removeDraft = async (draftId: string) => {
+  try {
+    await ElMessageBox.confirm('确定删除该草稿？', '删除确认', { type: 'warning' })
+  } catch {
+    return // user cancelled
+  }
+  try {
+    await deleteDraft(draftId)
+    drafts.value = drafts.value.filter(d => d.id !== draftId)
+    ElMessage.success('草稿已删除')
+  } catch {
+    ElMessage.error('删除草稿失败')
+  }
+}
+
+const downloadDraft = async (draft: Draft) => {
+  let content = draft.content
+  if (!content) {
+    try {
+      const detail = await getDraft(draft.id)
+      content = detail.content ?? ''
+    } catch {
+      ElMessage.error('无法获取草稿内容')
+      return
+    }
+  }
+  const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `${draft.title ?? 'draft'}.md`
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+onMounted(async () => {
+  // Init active conversation
+  if (!activeConvId.value || !conversations.value.find(c => c.id === activeConvId.value)) {
+    if (conversations.value.length > 0) {
+      switchConversation(conversations.value[0]!.id)
+    } else {
+      const id = 'conv_' + Date.now()
+      conversations.value = [{
+        id,
+        title: '新对话',
+        modelId: selectedModel.value.id,
+        messages: messages.value,
+        updatedAt: new Date().toISOString(),
+      }]
+      activeConvId.value = id
+      saveConversations(conversations.value)
+    }
+  } else {
+    // restore messages from the active conversation
+    const conv = conversations.value.find(c => c.id === activeConvId.value)
+    if (conv) messages.value = conv.messages.length > 0 ? conv.messages : makeWelcomeMsg()
+  }
+
+  // Load models and drafts
+  const [models] = await Promise.allSettled([
+    listDocumentModels().catch(() => null),
+    loadDrafts(),
+  ])
+  if (models.status === 'fulfilled' && models.value && models.value.length > 0) {
+    docModels.value = models.value.map((model) => ({
       id: model.value,
       name: model.label,
-      provider: '后端文档模型',
-      context: '项目配置',
+      provider: `${model.framework ?? '训练模型'} · ${model.model_type ?? 'gpt2'}`,
+      context: `v${model.version}`,
       desc: `支持 ${model.types.join('、')} 类型文档生成`,
       tags: model.types,
     }))
-    selectedModel.value = docModels.value[0] ?? defaultDocModels[0]!
-  } catch {
-    docModels.value = defaultDocModels
+    // keep existing selection if still valid
+    const stillExists = docModels.value.find(m => m.id === selectedModel.value.id)
+    if (!stillExists) selectedModel.value = docModels.value[0]!
   }
 })
 </script>
@@ -220,12 +482,99 @@ onMounted(async () => {
   align-items: flex-start;
   justify-content: space-between;
   gap: 16px;
+  flex-wrap: wrap;
 }
 
-.chat-container {
+.header-actions {
   display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+/* layout */
+.doc-layout {
+  display: flex;
+  gap: 16px;
   height: calc(100vh - 176px);
   min-height: 560px;
+}
+
+/* conversation sidebar */
+.conversation-sidebar {
+  width: 220px;
+  flex-shrink: 0;
+  padding: 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  background: #fff;
+  overflow-y: auto;
+}
+
+.conversation-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.conv-item {
+  position: relative;
+  padding: 10px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+
+.conv-item:hover {
+  background: var(--bg-color);
+}
+
+.conv-item.active {
+  border-color: var(--primary-color);
+  background: rgb(37 99 235 / 6%);
+}
+
+.conv-title {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding-right: 28px;
+}
+
+.conv-time {
+  display: block;
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+
+.conv-delete {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  opacity: 0;
+  transition: opacity .15s;
+}
+
+.conv-item:hover .conv-delete {
+  opacity: 1;
+}
+
+.conv-empty {
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 13px;
+  padding: 20px 0;
+}
+
+/* chat area */
+.chat-container {
+  flex: 1;
+  display: flex;
+  min-width: 0;
   flex-direction: column;
   overflow: hidden;
   border: 1px solid var(--border-color);
@@ -237,6 +586,20 @@ onMounted(async () => {
   flex: 1;
   overflow-y: auto;
   padding: 24px;
+}
+
+.chat-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--text-muted);
+  gap: 16px;
+}
+
+.chat-empty p {
+  font-size: 15px;
 }
 
 .chat-message {
@@ -282,8 +645,18 @@ onMounted(async () => {
   color: #fff;
 }
 
-.chat-bubble p {
-  margin: 0;
+.chat-content :deep(h2) { margin: 0 0 8px; font-size: 17px; }
+.chat-content :deep(h3) { margin: 0 0 6px; font-size: 15px; }
+.chat-content :deep(h4) { margin: 0 0 4px; font-size: 14px; }
+.chat-content :deep(p) { margin: 0; }
+.chat-content :deep(strong) { font-weight: 700; }
+
+.chat-message.user .chat-content :deep(h2),
+.chat-message.user .chat-content :deep(h3),
+.chat-message.user .chat-content :deep(h4),
+.chat-message.user .chat-content :deep(p),
+.chat-message.user .chat-content :deep(strong) {
+  color: #fff;
 }
 
 .quick-actions,
@@ -292,39 +665,6 @@ onMounted(async () => {
   flex-wrap: wrap;
   gap: 10px;
   margin-top: 14px;
-}
-
-.doc-preview {
-  margin-top: 14px;
-}
-
-.doc-preview h3 {
-  margin: 0;
-}
-
-.preview-head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 12px;
-}
-
-.preview-head span {
-  color: var(--text-muted);
-  font-size: 12px;
-}
-
-.document-section {
-  margin-top: 10px;
-  padding: 12px;
-  border-radius: 8px;
-  background: #fff;
-}
-
-.document-section p {
-  margin-top: 6px;
-  color: var(--text-secondary);
 }
 
 .chat-input-container {
@@ -336,6 +676,7 @@ onMounted(async () => {
   background: #fff;
 }
 
+/* model drawer */
 .model-drawer {
   display: flex;
   flex-direction: column;
@@ -360,21 +701,9 @@ onMounted(async () => {
   background: rgb(37 99 235 / 5%);
 }
 
-.model-name {
-  font-size: 16px;
-  font-weight: 700;
-}
-
-.model-meta,
-.doc-model-card p {
-  color: var(--text-secondary);
-  font-size: 13px;
-}
-
-.doc-model-card p {
-  margin: 0;
-  line-height: 1.6;
-}
+.model-name { font-size: 16px; font-weight: 700; }
+.model-meta, .doc-model-card p { color: var(--text-secondary); font-size: 13px; }
+.doc-model-card p { margin: 0; line-height: 1.6; }
 
 .model-tags {
   display: flex;
@@ -391,13 +720,77 @@ onMounted(async () => {
   font-size: 12px;
 }
 
-@media (max-width: 700px) {
-  .doc-header {
-    flex-direction: column;
-  }
+/* drafts */
+.draft-empty {
+  text-align: center;
+  color: var(--text-muted);
+  padding: 40px 0;
+}
 
-  .chat-bubble {
-    max-width: 86%;
-  }
+.draft-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.draft-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+}
+
+.draft-info {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  cursor: pointer;
+}
+
+.draft-title {
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.draft-meta {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.draft-actions {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.draft-detail-meta {
+  display: flex;
+  gap: 16px;
+  color: var(--text-muted);
+  font-size: 13px;
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.draft-detail-content {
+  max-height: 50vh;
+  overflow-y: auto;
+  line-height: 1.8;
+}
+
+.draft-detail-content :deep(h2) { font-size: 18px; margin: 16px 0 8px; }
+.draft-detail-content :deep(h3) { font-size: 16px; margin: 12px 0 6px; }
+.draft-detail-content :deep(h4) { font-size: 14px; margin: 10px 0 4px; }
+
+@media (max-width: 700px) {
+  .doc-header { flex-direction: column; }
+  .doc-layout { flex-direction: column; height: auto; }
+  .conversation-sidebar { width: 100%; max-height: 200px; }
+  .chat-container { height: calc(100vh - 420px); min-height: 400px; }
+  .chat-bubble { max-width: 86%; }
 }
 </style>

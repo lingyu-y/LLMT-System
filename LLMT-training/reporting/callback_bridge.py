@@ -78,9 +78,38 @@ class ReportingCallbackBridge(TrainingCallback):
     def on_train_begin(self, state: TrainingState, **kwargs: Any) -> None:
         """Mark task as running in PostgreSQL."""
         if self.postgres_updater:
+            is_resume = state.global_step > 0 or state.epoch > 0
             self.postgres_updater.update_progress(
                 self.task_code, status="running",
-                current_epoch=0, current_step=0,
+                current_epoch=state.epoch,
+                current_step=state.global_step,
+            )
+            if is_resume:
+                self.postgres_updater.append_log(
+                    self.task_code, "INFO",
+                    f"训练已恢复 — 从 Epoch {state.epoch + 1}, Step {state.global_step} 继续",
+                    step=state.global_step,
+                )
+            else:
+                self.postgres_updater.append_log(
+                    self.task_code, "INFO",
+                    f"训练开始 — 总 epoch: {state.max_epochs}, 总 step: {state.max_steps or '不限'}",
+                )
+
+    def on_epoch_begin(self, state: TrainingState, **kwargs: Any) -> None:
+        if self.postgres_updater:
+            self.postgres_updater.append_log(
+                self.task_code, "INFO",
+                f"Epoch {state.epoch + 1} 开始",
+                step=state.global_step,
+            )
+
+    def on_epoch_end(self, state: TrainingState, **kwargs: Any) -> None:
+        if self.postgres_updater:
+            self.postgres_updater.append_log(
+                self.task_code, "INFO",
+                f"Epoch {state.epoch + 1} 完成 — loss: {state.loss:.4f}",
+                step=state.global_step,
             )
 
     def on_train_end(self, state: TrainingState, **kwargs: Any) -> None:
@@ -109,6 +138,28 @@ class ReportingCallbackBridge(TrainingCallback):
                 current_step=state.global_step,
                 error_message=state.error_message,
             )
+            if state.status == "paused":
+                self.postgres_updater.append_log(
+                    self.task_code, "WARN",
+                    f"训练已暂停 — 在 Epoch {state.epoch + 1}, Step {state.global_step} 处暂停",
+                    step=state.global_step,
+                )
+            elif state.status == "cancelled":
+                self.postgres_updater.append_log(
+                    self.task_code, "WARN",
+                    f"训练已取消 — 在 Epoch {state.epoch + 1}, Step {state.global_step} 处取消",
+                    step=state.global_step,
+                )
+            else:
+                level = "ERROR" if state.status == "failed" else "INFO"
+                self.postgres_updater.append_log(
+                    self.task_code, level,
+                    f"训练{'失败' if state.status == 'failed' else '完成'} — "
+                    f"epoch: {state.epoch + 1}, step: {state.global_step}, "
+                    f"final_loss: {state.loss:.4f}"
+                    + (f", error: {state.error_message}" if state.error_message else ""),
+                    step=state.global_step,
+                )
 
     def on_step_end(self, state: TrainingState, **kwargs: Any) -> None:
         """Report step metrics at configured intervals."""
@@ -152,6 +203,12 @@ class ReportingCallbackBridge(TrainingCallback):
                 current_epoch=state.epoch,
                 current_step=state.global_step,
             )
+            self.postgres_updater.append_log(
+                self.task_code, "INFO",
+                f"Epoch {state.epoch + 1} — Step {state.global_step} — "
+                f"loss: {state.loss:.4f} — lr: {state.learning_rate:.2e}",
+                step=state.global_step,
+            )
 
     def on_checkpoint(self, state: TrainingState, **kwargs: Any) -> None:
         """Upload checkpoint to MinIO."""
@@ -166,6 +223,12 @@ class ReportingCallbackBridge(TrainingCallback):
                 task_code=self.task_code,
                 keep=self.max_checkpoints,
             )
+        if self.postgres_updater:
+            self.postgres_updater.append_log(
+                self.task_code, "INFO",
+                f"Checkpoint 已保存 — Step {state.global_step}",
+                step=state.global_step,
+            )
 
     def on_error(self, state: TrainingState, **kwargs: Any) -> None:
         """Flush metrics and update status on error."""
@@ -179,6 +242,11 @@ class ReportingCallbackBridge(TrainingCallback):
                 current_epoch=state.epoch,
                 current_step=state.global_step,
                 error_message=state.error_message,
+            )
+            self.postgres_updater.append_log(
+                self.task_code, "ERROR",
+                f"训练出错 — Step {state.global_step}: {state.error_message}",
+                step=state.global_step,
             )
 
     @staticmethod
