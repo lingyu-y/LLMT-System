@@ -5,3 +5,7 @@ tokenizer_vocab.json
 **/tokenizer_vocab.json
 LLMT-backend/checkpoints/
 LLMT-training/checkpoints/
+*.pyc
+*.pyo
+*.pyd
+.Python

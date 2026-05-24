@@ -1,76 +1,255 @@
-"""Document API endpoints."""
+"""Document generation API — powered by trained models via the inference engine."""
+
+import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
 
 from app.core.responses import success_response
 from app.dependencies.auth import get_current_user
+from app.dependencies.db import get_db
+from app.models.model_version import ModelVersion
 from app.models.user import User
-from app.schemas.document import DocumentChatRequest, DocumentGenerateRequest, DraftSaveRequest, DraftUpdateRequest, QualityCheckRequest
+from app.schemas.document import (
+    DocumentChatRequest,
+    DocumentGenerateRequest,
+    DraftSaveRequest,
+    DraftUpdateRequest,
+    QualityCheckRequest,
+)
 
 router = APIRouter(prefix="/documents", tags=["文档生成"])
 
-DOCUMENT_MODELS = [
-    {"value": "llama-7b-ft", "label": "LLaMA-7B Fine-tuned", "types": ["report", "summary", "manual"]},
-    {"value": "bert-base", "label": "BERT-base-chinese", "types": ["classification", "extraction"]},
-    {"value": "qwen-7b", "label": "Qwen-7B v2", "types": ["report", "article", "qa"]},
-    {"value": "gpt2-distil", "label": "GPT-2 Distil Chinese", "types": ["article", "summary"]},
-]
+# ---------------------------------------------------------------------------
+# In-memory draft store
+# ---------------------------------------------------------------------------
+_drafts: dict[str, dict] = {}
+
+
+def _build_model_entry(mv: ModelVersion) -> dict:
+    """Convert a ModelVersion row into a document-model entry for the frontend."""
+    hp = mv.hyperparams_json or {}
+    return {
+        "value": mv.model_code,
+        "label": mv.model_name,
+        "version": mv.version,
+        "framework": mv.framework,
+        "model_type": hp.get("model_type", "gpt2"),
+        "types": ["report", "article", "summary", "manual", "qa"],
+    }
 
 
 @router.get("/models")
-def get_document_models():
-    return success_response(DOCUMENT_MODELS)
+def get_document_models(db: Session = Depends(get_db)):
+    """Return trained models available for document generation."""
+    trained = (
+        db.query(ModelVersion)
+        .filter(ModelVersion.is_current == True)  # noqa: E712
+        .order_by(ModelVersion.model_code)
+        .all()
+    )
+    models = [_build_model_entry(m) for m in trained]
+    return success_response(models)
 
+
+# ---------------------------------------------------------------------------
+# Shared helper — call the real inference engine
+# ---------------------------------------------------------------------------
+
+def _infer(model_code: str, prompt: str, max_tokens: int = 256, db: Session | None = None) -> str:
+    """Run inference via the dedicated inference service when available,
+    falling back to in-process model loading.
+    """
+    import logging
+    _log = logging.getLogger(__name__)
+
+    # -- Resolve model metadata from DB --
+    hp: dict = {}
+    version = "v1.0.0"
+    model_type = "gpt2"
+    if db is not None:
+        mv = (
+            db.query(ModelVersion)
+            .filter(
+                ModelVersion.model_code == model_code,
+                ModelVersion.is_current == True,  # noqa: E712
+            )
+            .first()
+        )
+        if mv is None:
+            _log.warning("_infer: model_code=%r not found in model_versions (is_current=True)", model_code)
+            return (
+                f"未找到可用的文档生成模型 `{model_code}`。\n\n"
+                "请确认：\n"
+                "1. 已完成模型训练\n"
+                "2. 训练任务已执行 promote 操作\n"
+                "3. 模型在模型管理页面中状态为「当前版本」"
+            )
+        hp = mv.hyperparams_json or {}
+        model_type = hp.get("model_type", "gpt2")
+        version = mv.version or "v1.0.0"
+
+    # -- Try inference service first (same as online test panel) --
+    try:
+        from app.core.config import get_settings
+        settings = get_settings()
+        svc_url = getattr(settings, "LLMT_INFERENCE_SERVICE_URL", None) or ""
+        if svc_url:
+            import httpx
+            base_url = svc_url.rstrip("/")
+            _log.info("_infer: delegating to inference service at %s", base_url)
+            with httpx.Client(timeout=300.0, trust_env=False) as client:
+                resp = client.post(
+                    f"{base_url}/predict",
+                    json={
+                        "model_code": model_code,
+                        "version": version,
+                        "model_type": model_type,
+                        "model_config": hp,
+                        "input": prompt,
+                        "parameters": {"max_new_tokens": max_tokens, "temperature": 0.7, "top_p": 0.9, "top_k": 50},
+                    },
+                )
+            if resp.status_code < 400:
+                result = resp.json()
+                return result.get("output", result.get("detail", str(result)))
+            _log.warning("_infer: inference service returned %d: %s", resp.status_code, resp.text[:300])
+    except Exception as exc:
+        _log.warning("_infer: inference service unavailable (%s), trying direct load", exc)
+
+    # -- Fallback: direct in-process inference --
+    try:
+        from llmt_training.inference.engine import load_model, run_inference
+
+        _log.info("_infer: loading model directly %s v%s type=%s", model_code, version, model_type)
+        result = load_model(model_code, version, model_type=model_type, model_config=hp or None)
+        if result is None:
+            _log.warning("_infer: checkpoint not found for %s v%s", model_code, version)
+            return (
+                f"模型 `{model_code}` (v{version}) 的 checkpoint 文件未找到。\n\n"
+                "可能原因：\n"
+                "1. 训练完成后 checkpoint 未成功上传到 MinIO\n"
+                "2. MinIO 服务未运行或连接失败\n"
+                "3. 本地 checkpoint 目录已被清理\n\n"
+                "请检查 MinIO 控制台 (http://localhost:9001) 的 models bucket 中是否存在对应文件。"
+            )
+
+        model, tokenizer = result
+        output, _latency = run_inference(
+            model, tokenizer, prompt,
+            max_new_tokens=max_tokens,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=50,
+        )
+        return output
+
+    except ImportError:
+        _log.warning("_infer: inference engine not available (import failed)")
+        return (
+            f"[{model_code}] 推理引擎未安装，无法调用真实模型。\n\n"
+            f"提示内容：{prompt[:200]}..."
+        )
+    except Exception as exc:
+        _log.exception("_infer: direct inference failed for %s", model_code)
+        return (
+            f"[{model_code}] 推理过程出错：{exc}\n\n"
+            f"请检查后端日志获取详细错误信息。"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Chat
+# ---------------------------------------------------------------------------
 
 @router.post("/chat")
 def document_chat(
     body: DocumentChatRequest,
+    db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    valid_models = {m["value"] for m in DOCUMENT_MODELS}
-    if body.model_code not in valid_models:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="不支持的文档生成模型")
+    model_code = body.model_code
+    prompt = _build_chat_prompt(body.message)
+    content = _infer(model_code, prompt, max_tokens=256, db=db)
 
     return success_response({
         "role": "assistant",
-        "content": f"已收到您的消息：「{body.message}」。基于 {body.model_code} 模型，我将为您生成文档内容。请继续描述您的需求，或使用 /generate 直接生成。",
-        "model_code": body.model_code,
+        "content": content,
+        "model_code": model_code,
     })
 
 
-GENERATED_CONTENT = {
-    "report": "# {title}\n\n## 摘要\n本文基于需求分析，系统阐述了{title}的核心架构与实现方案。\n\n## 背景\n随着业务规模的增长...\n\n## 方案设计\n### 架构概览\n采用微服务架构...\n\n## 总结\n本文档覆盖了{title}的完整设计方案。",
-    "article": "# {title}\n\n## 引言\n{title}是当前技术领域的热门话题...\n\n## 核心内容\n经过深入分析...\n\n## 结论\n综上所述，{title}在未来将持续发展。",
-    "manual": "# {title} 用户手册\n\n## 概述\n本文档为{title}的使用指南。\n\n## 快速开始\n### 环境准备\n...\n\n### 安装步骤\n...\n\n## 常见问题\n...",
-    "summary": "# {title} 摘要\n\n## 核心要点\n- 要点一\n- 要点二\n\n## 详细总结\n...\n\n## 建议\n...",
-    "qa": "# {title} Q&A\n\n## 常见问题\n**Q1:** ...\n**A1:** ...\n\n**Q2:** ...\n**A2:** ...",
-}
+def _build_chat_prompt(message: str) -> str:
+    return (
+        "你是一个技术文档写作助手，服务于「离线大数据训练与应用系统」。\n"
+        "请根据用户的需求，生成专业、结构清晰的文档内容。\n"
+        "使用 Markdown 格式组织回答。\n\n"
+        f"用户需求：{message}\n\n"
+        "文档内容："
+    )
 
+
+# ---------------------------------------------------------------------------
+# Generate
+# ---------------------------------------------------------------------------
 
 @router.post("/generate")
 def document_generate(
     body: DocumentGenerateRequest,
+    db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    valid_models = {m["value"] for m in DOCUMENT_MODELS}
-    if body.model_code not in valid_models:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="不支持的文档生成模型")
-
-    model = next((m for m in DOCUMENT_MODELS if m["value"] == body.model_code), None)
-    if body.doc_type not in model["types"]:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"该模型不支持 {body.doc_type} 类型")
-
-    template = GENERATED_CONTENT.get(body.doc_type, GENERATED_CONTENT["report"])
-    content = template.format(title=body.title)
+    model_code = body.model_code
+    prompt = _build_generate_prompt(
+        doc_type=body.doc_type,
+        title=body.title,
+        outline=body.outline,
+        requirements=body.requirements,
+    )
+    content = _infer(model_code, prompt, max_tokens=512, db=db)
 
     return success_response({
-        "model_code": body.model_code,
+        "model_code": model_code,
         "doc_type": body.doc_type,
         "title": body.title,
         "content": content,
         "word_count": len(content),
     }, "文档生成成功")
 
+
+def _build_generate_prompt(
+    doc_type: str,
+    title: str,
+    outline: str | None,
+    requirements: str | None,
+) -> str:
+    type_hints = {
+        "report": "技术报告，包含摘要、背景、方案设计、总结",
+        "article": "技术文章，包含引言、核心内容、结论",
+        "manual": "用户手册，包含概述、快速开始、安装步骤、常见问题",
+        "summary": "摘要总结，包含核心要点、详细总结、建议",
+        "qa": "Q&A 文档，以问答形式组织",
+    }
+    hint = type_hints.get(doc_type, type_hints["report"])
+
+    prompt = (
+        "你是一个技术文档写作助手，服务于「离线大数据训练与应用系统」。\n"
+        f"请生成一份完整的{doc_type}类型文档。\n"
+        f"文档结构应为：{hint}。\n"
+        f"文档标题：{title}\n"
+    )
+    if outline:
+        prompt += f"大纲要求：{outline}\n"
+    if requirements:
+        prompt += f"补充需求：{requirements}\n"
+    prompt += "\n请直接输出完整的 Markdown 格式文档内容："
+    return prompt
+
+
+# ---------------------------------------------------------------------------
+# Quality check
+# ---------------------------------------------------------------------------
 
 @router.post("/quality-check")
 def document_quality_check(
@@ -90,7 +269,8 @@ def document_quality_check(
     if len([c for c in text if '一' <= c <= '鿿']) < 30:
         issues.append({"level": "info", "item": "中文内容", "detail": "中文字符较少，请确认内容完整性"})
 
-    score = max(60, 100 - len([i for i in issues if i["level"] == "warn"]) * 10 - len([i for i in issues if i["level"] == "info"]) * 3)
+    score = max(60, 100 - len([i for i in issues if i["level"] == "warn"]) * 10
+                - len([i for i in issues if i["level"] == "info"]) * 3)
 
     return success_response({
         "score": min(score, 100),
@@ -100,12 +280,9 @@ def document_quality_check(
     })
 
 
-# --- Drafts (in-memory storage) ---
-import uuid
-from datetime import datetime, timezone
-
-_drafts: dict[str, dict] = {}
-
+# ---------------------------------------------------------------------------
+# Drafts CRUD
+# ---------------------------------------------------------------------------
 
 @router.get("/drafts")
 def list_drafts(current_user: User = Depends(get_current_user)):

@@ -251,7 +251,25 @@ def _load_tokenizer(model_type: str, model_config: dict[str, Any] | None,
         try:
             from llmt_training.core.simple_tokenizer import SimpleTokenizer
             _log.info("Loading tokenizer from %s", vocab_path)
-            return SimpleTokenizer.load_vocab(vocab_path)
+            tokenizer = SimpleTokenizer.load_vocab(vocab_path)
+            # Ensure vocab_size matches the model's embedding size so that
+            # hash-based encoding never produces out-of-range token IDs.
+            if tokenizer.vocab_size != vocab_size:
+                _log.warning(
+                    "Tokenizer vocab_size %d != model vocab_size %d, syncing to model",
+                    tokenizer.vocab_size, vocab_size,
+                )
+                tokenizer.vocab_size = vocab_size
+                # Drop word_to_id entries that exceed the model's embedding
+                tokenizer.word_to_id = {
+                    w: i for w, i in tokenizer.word_to_id.items()
+                    if 0 <= i < vocab_size
+                }
+                tokenizer.id_to_word = {
+                    i: w for i, w in tokenizer.id_to_word.items()
+                    if 0 <= i < vocab_size
+                }
+            return tokenizer
         except Exception as exc:
             _log.warning("Failed to load saved tokenizer vocab: %s", exc)
 
@@ -379,6 +397,21 @@ def run_inference(
     if attention_mask is not None:
         attention_mask = attention_mask.to(device)
 
+    # Safety: clamp token IDs to the model's actual embedding size
+    # Try standard HuggingFace API first, then custom model attribute
+    try:
+        wte_weight = model.get_input_embeddings().weight
+    except (AttributeError, NotImplementedError):
+        wte_weight = model.wte.weight
+    vocab_size = wte_weight.shape[0]
+    if input_ids.max() >= vocab_size:
+        overflow_count = (input_ids >= vocab_size).sum().item()
+        _log.warning(
+            "run_inference: %d token IDs exceed model vocab_size %d, clamping",
+            overflow_count, vocab_size,
+        )
+        input_ids = input_ids.clamp(0, vocab_size - 1)
+
     # Generate
     with torch.no_grad():
         generated_ids = _generate(
@@ -416,7 +449,16 @@ def _generate(
     """Simple autoregressive generation loop."""
     generated = input_ids.clone()
 
+    # Get vocab size for safety clamping inside the loop
+    try:
+        _vocab_size = model.get_input_embeddings().weight.shape[0]
+    except (AttributeError, NotImplementedError):
+        _vocab_size = model.wte.weight.shape[0]
+
     for _ in range(max_new_tokens):
+        # Safety: clamp before every forward pass
+        generated = generated.clamp(0, _vocab_size - 1)
+
         # Truncate to max model context length if needed
         seq_len = generated.shape[1]
         pos_ids = torch.arange(0, seq_len, device=generated.device).unsqueeze(0)

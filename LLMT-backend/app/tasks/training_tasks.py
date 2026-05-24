@@ -851,11 +851,28 @@ def _promote_to_model(task_code: str) -> dict | None:
             def _upload_local_tokenizer_vocab(minio, model_bucket: str) -> None:
                 candidates = [
                     "/tmp/llmt_checkpoints/ckpt/tokenizer_vocab.json",
-                    "/tmp/llmt_checkpoints/latest/tokenizer_vocab.json",
                     "/tmp/llmt_checkpoints/tokenizer_vocab.json",
                     "./checkpoints/ckpt/tokenizer_vocab.json",
                     "./checkpoints/tokenizer_vocab.json",
                 ]
+                # DeepSpeed convention: latest file points to step-N directory
+                for base in ("/tmp/llmt_checkpoints", "./checkpoints"):
+                    latest_file = os.path.join(base, "latest")
+                    if os.path.isfile(latest_file):
+                        with open(latest_file, "r") as f:
+                            latest_dir = f.read().strip()
+                        candidates.append(
+                            os.path.join(base, latest_dir, "tokenizer_vocab.json"),
+                        )
+                # Also scan checkpoints/ for any step subdirectory
+                for ckpt_root in ("./checkpoints", "/tmp/llmt_checkpoints"):
+                    if os.path.isdir(ckpt_root):
+                        for entry in sorted(os.listdir(ckpt_root), reverse=True):
+                            entry_path = os.path.join(ckpt_root, entry)
+                            if os.path.isdir(entry_path) and entry.startswith("step-"):
+                                candidates.append(
+                                    os.path.join(entry_path, "tokenizer_vocab.json"),
+                                )
                 for vocab_path in candidates:
                     if os.path.isfile(vocab_path):
                         minio.fput_object(
