@@ -3,6 +3,9 @@ import { del, get, post, put, type ApiMessage, type PageResult, unwrap } from '@
 export interface DocumentModel {
   value: string
   label: string
+  version: string
+  framework: string
+  model_type: string
   types: string[]
 }
 
@@ -14,12 +17,14 @@ export interface ChatResult {
 
 export interface Draft {
   id: string
-  user_id: number
+  user_id?: number
   doc_type: string
   title: string
-  content: string
-  created_at: string
+  content?: string
+  created_at?: string
   updated_at: string
+  model_code?: string
+  word_count?: number
 }
 
 export interface GenerateResult {
@@ -51,13 +56,15 @@ export const checkDocumentQuality = async (content: string) =>
 export const createDraft = async (payload: { model_code: string; doc_type: string; title: string; content: string }) =>
   unwrap(await post<ApiMessage<Draft>>('/documents/drafts', payload))
 
-export const listDrafts = (params?: { page?: number; page_size?: number }) => get<PageResult<Draft>>('/documents/drafts', params)
+export const listDrafts = async () => unwrap(await get<ApiMessage<Draft[]>>('/documents/drafts'))
 
 export const getDraft = async (draftId: string) => unwrap(await get<ApiMessage<Draft>>(`/documents/drafts/${draftId}`))
 
 export const updateDraft = async (draftId: string, payload: { title?: string; content?: string }) =>
   unwrap(await put<ApiMessage<Draft>>(`/documents/drafts/${draftId}`, payload))
 
-export const deleteDraft = async (draftId: string) => await del<ApiMessage>(`/documents/drafts/${draftId}`)
+export const deleteDraft = async (draftId: string) => {
+  await del(`/documents/drafts/${draftId}`)
+}
 
 export const getDocumentDownloadUrl = (docId: string) => `/api/v1/documents/${docId}/download`
