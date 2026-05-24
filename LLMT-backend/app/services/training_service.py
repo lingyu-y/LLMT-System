@@ -120,26 +120,88 @@ def cancel_task(db: Session, task_id: int) -> TrainingTaskOut | None:
 
 
 def delete_task(db: Session, task_id: int) -> bool:
-    """Delete a training task (any status). Revokes Celery if running."""
+    """Delete a training task and its artifacts.
+
+    Cleans up:
+    - Database record
+    - MinIO checkpoints (checkpoints bucket, prefix=task_code/)
+    - Local checkpoint directories
+    - Stops background thread via status="cancelled"
+    """
+    import logging
+    import os
+    import shutil
+    logger = logging.getLogger(__name__)
+
     task = repo.get_by_id(db, task_id)
     if task is None:
         return False
+
+    task_code = task.task_code
+
+    # 1. Cancel active tasks so background threads stop
+    if task.status in ("running", "paused", "queued", "pausing", "resuming"):
+        task.status = "cancelled"
+        task.error_message = "任务已被删除"
+        db.flush()
+
+    # 2. Try Celery revoke
     try:
         from app.core.celery_app import celery_app
-        celery_app.control.revoke(task.task_code, terminate=True)
+        celery_app.control.revoke(task_code, terminate=True)
     except Exception:
         pass
+
+    # 3. Clean MinIO checkpoints
+    try:
+        from app.core.database import get_minio_client
+        from app.core.config import get_settings
+        settings = get_settings()
+        minio = get_minio_client()
+        ckpt_bucket = settings.MINIO_BUCKET_CHECKPOINTS
+        prefix = f"{task_code}/"
+        if minio.bucket_exists(ckpt_bucket):
+            objects = list(minio.list_objects(ckpt_bucket, prefix=prefix, recursive=True))
+            for obj in objects:
+                try:
+                    minio.remove_object(ckpt_bucket, obj.object_name)
+                except Exception:
+                    pass
+            removed = len(objects)
+            if removed:
+                logger.info("Deleted %d checkpoint objects from MinIO %s/%s", removed, ckpt_bucket, prefix)
+    except Exception as exc:
+        logger.warning("MinIO checkpoint cleanup failed: %s", exc)
+
+    # 4. Clean local checkpoint directories
+    local_dirs = [
+        os.path.join("/tmp/llmt_checkpoints", task_code),
+        os.path.join("./checkpoints", task_code),
+    ]
+    for d in local_dirs:
+        if os.path.isdir(d):
+            try:
+                shutil.rmtree(d)
+                logger.info("Deleted local checkpoint dir %s", d)
+            except Exception as exc:
+                logger.warning("Failed to remove %s: %s", d, exc)
+
+    # 5. Delete DB record (ModelVersion.task_id is SET NULL via FK)
     db.delete(task)
     db.commit()
     return True
 
 
 def pause_task(db: Session, task_id: int) -> TrainingTaskOut | None:
-    """Pause a running training task."""
+    """Request pause of a running training task.
+
+    Sets status to 'pausing' — the training loop's _CancellationCheckCallback
+    will detect this, save a checkpoint, and transition to 'paused'.
+    """
     task = repo.get_by_id(db, task_id)
     if task is None or task.status != "running":
         return None
-    task.status = "paused"
+    task.status = "pausing"
     db.commit()
     db.refresh(task)
     return _to_task_out(task)
@@ -148,20 +210,18 @@ def pause_task(db: Session, task_id: int) -> TrainingTaskOut | None:
 def resume_task(db: Session, task_id: int) -> TrainingTaskOut | None:
     """Resume a paused training task.
 
-    Re-submits the Celery task so the training loop restarts from the
-    last checkpoint using the saved current_epoch / current_step.
+    Sets status to 'resuming', then launches a background thread.  The
+    callback bridge's on_train_begin transitions to 'running' once the
+    training loop actually starts.
     """
     task = repo.get_by_id(db, task_id)
     if task is None or task.status != "paused":
         return None
-    task.status = "running"
+    task.status = "resuming"
     db.commit()
     db.refresh(task)
 
-    # Re-submit Celery task — run_training_task detects resume_step > 0
-    # and loads the checkpoint automatically
-    from app.tasks.training_tasks import run_training_task
-    run_training_task.delay(task.task_code)
+    _run_task_in_background(task.task_code, task.id)
 
     return _to_task_out(task)
 
@@ -264,14 +324,12 @@ def get_logs(
     keyword: str = "",
     lines: int = 50,
 ) -> dict[str, Any]:
-    """Get training logs for a task. Falls back to simulated logs if not available."""
+    """Get training logs from task config_json._training_log."""
     task = repo.get_by_id(db, task_id)
     if task is None:
         return {"task_id": task_id, "logs": [], "total": 0}
 
     logs = task.config_json.get("_training_log", []) if task.config_json else []
-    if not logs:
-        logs = _generate_simulated_logs(task)
 
     # Filter
     if level:
@@ -574,16 +632,30 @@ def _extract_max_steps_from_config(cfg: dict) -> int | None:
 
 def _to_list_out(task: TrainingTask) -> TrainingTaskListOut:
     cfg = task.config_json or {}
-    # Prefer step-based progress (training stays in epoch 0 for most runs)
     hp = cfg.get("hyperparams", {})
     max_steps = hp.get("max_steps") or _extract_max_steps_from_config(cfg)
-    max_epoch = task.max_epoch
-    if max_steps and max_steps > 0:
+    max_epoch = task.max_epoch or hp.get("max_epochs", 10)
+
+    if task.status in ("completed",):
+        progress = 100
+    elif max_steps and max_steps > 0:
+        # Step-limited training: progress driven by step count
         progress = min(round(task.current_step / max_steps * 100), 100)
     elif max_epoch and max_epoch > 0:
-        # Fallback: estimate total steps (matches ConfigMerger default)
-        total_steps = max_epoch * 1000
-        progress = min(round(task.current_step / total_steps * 100), 100)
+        # Epoch-limited training: progress driven by epoch primarily,
+        # with fine-grained step contribution estimated from saved state
+        epoch_progress = min(task.current_epoch, max_epoch) / max_epoch
+        interval_steps = max(1, hp.get("save_interval", 500))
+        # estimate steps per epoch from stride of current_step vs epoch
+        est_steps_per_epoch = max(
+            task.current_step // max(task.current_epoch, 1),
+            interval_steps * 5,  # floor estimate
+        )
+        if est_steps_per_epoch > 0 and task.current_epoch < max_epoch:
+            step_frac = (task.current_step % max(est_steps_per_epoch, 1)) / est_steps_per_epoch
+        else:
+            step_frac = 0.0
+        progress = min(round((epoch_progress + step_frac / max_epoch) * 100), 100)
     else:
         progress = 0
     gpu_count = cfg.get("num_gpus", 1)
@@ -610,18 +682,52 @@ def _to_list_out(task: TrainingTask) -> TrainingTaskListOut:
 
 def _run_task_in_background(task_code: str, task_id: int) -> None:
     """Run training task in a daemon thread when no Celery worker is available."""
+    import json
     import threading
+
+    def _ensure_status_in_db(target_status: str, error_msg: str = "") -> None:
+        """Make sure the DB record reflects the true status, even if the
+        internal _update_task_status calls were skipped or failed."""
+        try:
+            from app.core.database import SessionLocal
+            from datetime import datetime, timezone as tz
+            db = SessionLocal()
+            try:
+                task = repo.get_by_id(db, task_id)
+                if task is None:
+                    return
+                # Don't overwrite a terminal status that was already set
+                if task.status in ("completed", "cancelled"):
+                    return
+                if task.status != target_status:
+                    task.status = target_status
+                    if error_msg:
+                        task.error_message = error_msg
+                    if target_status in ("completed", "failed", "cancelled"):
+                        task.ended_at = datetime.now(tz.utc)
+                    # Also append a log entry so the frontend shows what happened
+                    cfg = dict(task.config_json or {})
+                    logs = list(cfg.get("_training_log", []))
+                    logs.append({
+                        "timestamp": datetime.now(tz.utc).isoformat(),
+                        "level": "ERROR" if target_status == "failed" else "INFO",
+                        "message": f"任务{target_status}：{error_msg}" if error_msg else f"任务状态变更：{target_status}",
+                    })
+                    if len(logs) > 200:
+                        logs = logs[-200:]
+                    cfg["_training_log"] = logs
+                    task.config_json = cfg
+                    db.commit()
+            finally:
+                db.close()
+        except Exception:
+            pass
 
     def _worker():
         try:
-            # Execute the actual training task function directly.
-            # run_training_task() handles all DB status updates internally
-            # via _update_task_status(), so we only need to handle the case
-            # where it crashes without returning a proper result.
             from app.tasks.training_tasks import run_training_task
             result = run_training_task.run(task_code)
 
-            # Log the result for debugging
             status = result.get("status", "unknown") if isinstance(result, dict) else "unknown"
             error = result.get("error_message", "") if isinstance(result, dict) else ""
             if status == "completed":
@@ -629,55 +735,17 @@ def _run_task_in_background(task_code: str, task_id: int) -> None:
             else:
                 logger.warning("Background training task %s ended with status=%s error=%s", task_code, status, error)
 
+            # Belt-and-suspenders: make sure the DB reflects what run_training_task
+            # returned, even if its internal _update_task_status calls failed.
+            if status in ("completed", "failed", "cancelled"):
+                _ensure_status_in_db(status, error)
+
         except Exception as e:
             logger.exception("Background training task %s crashed: %s", task_code, e)
-            # run_training_task crashed without handling the error itself.
-            # Update DB as a fallback.
-            try:
-                from app.core.database import SessionLocal
-                from datetime import datetime, timezone as tz
-                db = SessionLocal()
-                try:
-                    task = repo.get_by_id(db, task_id)
-                    if task and task.status not in ("completed", "cancelled", "failed"):
-                        task.status = "failed"
-                        task.error_message = str(e)
-                        task.ended_at = datetime.now(tz.utc)
-                        db.commit()
-                finally:
-                    db.close()
-            except Exception:
-                pass
+            _ensure_status_in_db("failed", str(e))
 
     t = threading.Thread(target=_worker, daemon=True, name=f"training-{task_code}")
     t.start()
     logger.info("Started background thread for training task %s", task_code)
 
 
-def _generate_simulated_logs(task: TrainingTask) -> list[dict[str, Any]]:
-    """Generate simulated training logs when real logs are not available."""
-    from datetime import datetime, timedelta, timezone
-    now = datetime.now(timezone.utc)
-    samples = [
-        ("INFO", "TrainingTask initialized"),
-        ("INFO", f"Loading dataset (id={task.dataset_id})"),
-        ("INFO", f"Model {task.task_code} loaded"),
-        ("INFO", "Starting training loop"),
-        ("INFO", f"Epoch 1/{task.max_epoch or '?'} — Step 0 — loss: 2.50"),
-        ("INFO", f"Epoch 1/{task.max_epoch or '?'} — Step 100 — loss: 2.35"),
-        ("WARN", "GPU memory usage exceeds 80%"),
-        ("INFO", f"Epoch 1/{task.max_epoch or '?'} — Step 200 — loss: 2.18"),
-        ("INFO", "Saving checkpoint"),
-        ("INFO", f"Epoch 2/{task.max_epoch or '?'} — Step 0 — loss: 1.92"),
-        ("INFO", f"Epoch 2/{task.max_epoch or '?'} — Step 300 — loss: 1.75"),
-        ("INFO", "Saving checkpoint"),
-    ]
-    logs = []
-    for i, (lvl, msg) in enumerate(samples):
-        logs.append({
-            "timestamp": (now - timedelta(hours=len(samples) - i)).isoformat(),
-            "level": lvl,
-            "message": msg,
-            "step": i * 100,
-        })
-    return logs

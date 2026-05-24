@@ -41,7 +41,7 @@ services:
       - "9000:9000"
       - "9001:9001"
     volumes:
-      - llmt_minio_data:/data
+      - /mnt/d/minio-data:/data
 
   # 日志检索：系统日志、操作日志、训练日志、异常告警日志
   elasticsearch:
@@ -80,6 +80,5 @@ volumes:
   llmt_postgres_data:
   llmt_influxdb_data:
   llmt_influxdb_config:
-  llmt_minio_data:
   llmt_elasticsearch_data:
   llmt_redis_data:
