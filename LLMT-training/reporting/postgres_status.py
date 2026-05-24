@@ -124,6 +124,61 @@ class PostgresStatusUpdater:
         except Exception:
             pass  # Best-effort; user can promote manually from the UI
 
+    def append_log(
+        self, task_code: str, level: str, message: str, step: int | None = None,
+    ) -> bool:
+        """Append a training log entry to the task's config_json._training_log array."""
+        import json
+        from datetime import datetime, timezone
+
+        try:
+            from sqlalchemy import create_engine, text
+            from sqlalchemy.orm import Session
+
+            url = self.db_url or os.environ.get("POSTGRES_DATABASE_URL", "")
+            if not url:
+                return False
+
+            engine = create_engine(url)
+            entry = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "level": level,
+                "message": message,
+            }
+            if step is not None:
+                entry["step"] = step
+
+            with Session(engine) as session:
+                # Read current config_json — may be a dict or a JSON string
+                # depending on the DB driver and column type.
+                row = session.execute(
+                    text("SELECT config_json FROM training_tasks WHERE task_code = :tc"),
+                    {"tc": task_code},
+                ).fetchone()
+                if row is None:
+                    return False
+                raw = row[0]
+                if isinstance(raw, str):
+                    cfg = json.loads(raw) if raw else {}
+                elif isinstance(raw, dict):
+                    cfg = raw
+                else:
+                    cfg = {}
+                logs = list(cfg.get("_training_log", []))
+                logs.append(entry)
+                # Keep last 200 entries to avoid unbounded growth
+                if len(logs) > 200:
+                    logs = logs[-200:]
+                cfg["_training_log"] = logs
+                session.execute(
+                    text("UPDATE training_tasks SET config_json = :cfg WHERE task_code = :tc"),
+                    {"cfg": json.dumps(cfg, ensure_ascii=False), "tc": task_code},
+                )
+                session.commit()
+            return True
+        except Exception:
+            return False
+
     def _update_via_api(self, task_code: str, **kwargs: Any) -> bool:
         """Update via HTTP API call (for separate training processes)."""
         import httpx

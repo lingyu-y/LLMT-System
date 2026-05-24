@@ -300,12 +300,23 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
 
         cancel_cb.set_trainer(trainer)
 
-        # On resume, load the last checkpoint so training continues from there
-        if resume_step > 0 and resume_ckpt:
-            try:
-                trainer.load_checkpoint(resume_ckpt)
-            except Exception:
-                pass  # Best-effort; training proceeds from saved step
+        # On resume, load the last checkpoint so training continues from there.
+        if resume_step > 0:
+            ckpt_candidates = [
+                resume_ckpt,
+                # Pause callback saves to these fixed paths
+                "/tmp/llmt_checkpoints/checkpoint.pt",
+                "/tmp/llmt_checkpoints/ckpt/checkpoint.pt",
+                "./checkpoints/checkpoint.pt",
+            ]
+            for ckpt in ckpt_candidates:
+                if ckpt and os.path.isfile(ckpt):
+                    try:
+                        trainer.load_checkpoint(ckpt)
+                        print(f"[TrainingTask] resumed from checkpoint {ckpt}", flush=True)
+                        break
+                    except Exception:
+                        pass
 
         # For in-process training (pytorch/deepspeed single-node)
         if framework in ("pytorch", "deepspeed") and _should_run_in_process(config_dict):
@@ -341,6 +352,14 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
 
         # Save tokenizer vocab alongside checkpoint for inference
         _save_tokenizer_vocab(dataset, config_dict)
+
+        # Explicitly update DB status so completion is reflected even if the
+        # callback bridge's PostgreSQL updater is unavailable.
+        _update_task_status(
+            task_code,
+            status=final_state.status,
+            error_message=final_state.error_message,
+        )
 
         return {
             "task_code": task_code,
@@ -446,13 +465,13 @@ def _prepopulate_tokenizer_vocab(dataset) -> None:
 # ---------------------------------------------------------------------------
 
 class _CancellationCheckCallback:
-    """Callback that polls the DB for cancellation / pause status.
+    """Callback that polls the DB for cancellation / pause / pausing status.
 
     On ``cancelled`` — propagates to ``state.status`` so the trainer's
     ``_should_stop()`` exits the loop cleanly.
 
-    On ``paused`` — saves a checkpoint immediately (so we can resume from
-    it), then propagates ``paused`` to ``state.status``.
+    On ``pausing`` — saves a checkpoint, then transitions status to
+    ``paused`` so the frontend sees the true paused state.
     """
 
     def __init__(self, task_code: str, poll_every: int = 10):
@@ -491,14 +510,20 @@ class _CancellationCheckCallback:
                     return
                 if row.status == "cancelled":
                     state.status = "cancelled"
-                elif row.status == "paused":
-                    # Save checkpoint so we can resume from here
+                elif row.status == "pausing":
+                    # Save checkpoint so we can resume from here, then mark paused
                     if self._trainer_ref is not None:
                         try:
                             ckpt_dir = "/tmp/llmt_checkpoints"
                             self._trainer_ref.save_checkpoint(ckpt_dir)
                         except Exception:
                             pass
+                    # Transition DB from 'pausing' → 'paused' atomically
+                    try:
+                        row.status = "paused"
+                        db.commit()
+                    except Exception:
+                        pass
                     state.status = "paused"
         except Exception:
             pass
