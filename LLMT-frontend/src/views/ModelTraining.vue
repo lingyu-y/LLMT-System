@@ -317,7 +317,7 @@ const options = reactive<TrainingOptions>({
   ],
 })
 
-const gpuOptionValue = ref('4')
+const gpuOptionValue = ref('1')
 
 const form = reactive({
   task_name: '',

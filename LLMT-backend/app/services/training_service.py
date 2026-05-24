@@ -25,6 +25,109 @@ from app.schemas.training import (
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
+# ---------------------------------------------------------------------------
+# GPU detection (lazy, cached – only queries hardware once)
+# ---------------------------------------------------------------------------
+
+_gpu_name_cache: str | None = None
+
+
+def get_gpu_name() -> str:
+    """Detect the real GPU model name from the local machine.
+
+    Tries ``torch.cuda.get_device_name()`` first, falls back to
+    ``nvidia-smi``, and returns ``"GPU"`` when nothing is available.
+    """
+    global _gpu_name_cache
+    if _gpu_name_cache is not None:
+        return _gpu_name_cache
+
+    # 1. PyTorch with CUDA (most reliable)
+    try:
+        import torch
+        if torch.cuda.is_available():
+            name = torch.cuda.get_device_name(0)
+            if name:
+                # Shorten common long names for display
+                _gpu_name_cache = _shorten_gpu_name(name)
+                return _gpu_name_cache
+    except Exception:
+        pass
+
+    # 2. nvidia-smi CLI fallback
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            name = result.stdout.strip().split("\n")[0].strip()
+            _gpu_name_cache = _shorten_gpu_name(name)
+            return _gpu_name_cache
+    except Exception:
+        pass
+
+    _gpu_name_cache = "GPU"
+    return _gpu_name_cache
+
+
+def _shorten_gpu_name(name: str) -> str:
+    """Keep the most recognizable part of the GPU name for display."""
+    # Remove common vendor prefixes and excessive detail
+    for prefix in ("NVIDIA ", "nvidia "):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+    # Keep it reasonably short
+    if len(name) > 40:
+        # e.g. "Tesla V100-SXM2-32GB" -> "Tesla V100"
+        parts = name.split("-")
+        name = parts[0] if len(parts) > 1 else name[:40]
+    return name
+
+
+_gpu_count_cache: int | None = None
+
+
+def get_gpu_count() -> int:
+    """Detect the number of GPUs available on the local machine.
+
+    Tries ``torch.cuda.device_count()`` first, falls back to counting
+    lines from ``nvidia-smi``, and returns ``1`` when nothing is available.
+    """
+    global _gpu_count_cache
+    if _gpu_count_cache is not None:
+        return _gpu_count_cache
+
+    # 1. PyTorch with CUDA
+    try:
+        import torch
+        if torch.cuda.is_available():
+            count = torch.cuda.device_count()
+            if count > 0:
+                _gpu_count_cache = count
+                return _gpu_count_cache
+    except Exception:
+        pass
+
+    # 2. nvidia-smi fallback
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            count = len([l for l in result.stdout.strip().split("\n") if l.strip()])
+            if count > 0:
+                _gpu_count_cache = count
+                return _gpu_count_cache
+    except Exception:
+        pass
+
+    _gpu_count_cache = 1
+    return _gpu_count_cache
+
 
 # ---------------------------------------------------------------------------
 # CRUD helpers
@@ -379,11 +482,11 @@ def get_options(db: Session) -> dict[str, Any]:
         {"value": "megatron", "label": "Megatron-LM"},
     ]
 
+    gpu_name = get_gpu_name()
+    local_count = max(get_gpu_count(), 1)
     gpu_options = [
-        {"value": "1", "label": "1 × A100"},
-        {"value": "2", "label": "2 × A100"},
-        {"value": "4", "label": "4 × A100"},
-        {"value": "8", "label": "8 × A100"},
+        {"value": str(n), "label": f"{n} × {gpu_name}"}
+        for n in range(1, local_count + 1)
     ]
 
     parallel_strategies = [
@@ -667,7 +770,7 @@ def _to_list_out(task: TrainingTask) -> TrainingTaskListOut:
             progress = 0
 
     gpu_count = cfg.get("num_gpus", 1)
-    gpu_display = f"{gpu_count}x A100"
+    gpu_display = f"{gpu_count}x {get_gpu_name()}"
 
     return TrainingTaskListOut(
         id=task.id,
