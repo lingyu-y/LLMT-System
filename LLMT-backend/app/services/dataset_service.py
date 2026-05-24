@@ -20,7 +20,7 @@ from fastapi import UploadFile
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.core.database import get_minio_client
+from app.core.database import SessionLocal, get_minio_client
 from app.models.dataset import Dataset
 from app.models.model_version import ModelVersion
 from app.models.training_task import TrainingTask
@@ -426,6 +426,8 @@ def _upload_single(
             file_count=(dataset.file_count or 0) + 1,
             total_size=(dataset.total_size or 0) + size,
             data_type=detected if not dataset.data_type or dataset.data_type == "other" else dataset.data_type,
+            quality_status="unchecked",
+            processing_status="pending",
             lineage_status="tracked",
             source=dataset.source or f"upload:{filename}",
         )
@@ -490,6 +492,8 @@ def _upload_single(
         file_count=(dataset.file_count or 0) + 1,
         total_size=(dataset.total_size or 0) + size,
         data_type=detected if not dataset.data_type or dataset.data_type == "other" else dataset.data_type,
+        quality_status="unchecked",
+        processing_status="pending",
         lineage_status="tracked",
         source=dataset.source or f"upload:{filename}",
     )
@@ -850,7 +854,24 @@ def _preprocess_dataset_to_jsonl(dataset: Dataset, shard_size_mb: int = 0) -> di
 def start_preprocess(db: Session, dataset: Dataset, shard_size_mb: int = 0) -> dict:
     dataset_repository.update_dataset(db, dataset, quality_status="checking", processing_status="processing")
     job = dataset_repository.create_processing_job(db, dataset, "preprocess")
+    job["shard_size_mb"] = shard_size_mb
+    return job
+
+
+def run_preprocess_job(dataset_id: int, job_id: str, shard_size_mb: int = 0) -> None:
+    db = SessionLocal()
     try:
+        dataset = dataset_repository.get_dataset_by_id(db, dataset_id)
+        if dataset is None:
+            dataset_repository.update_processing_job(
+                job_id,
+                status="failed",
+                progress=100,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                error="数据集不存在",
+            )
+            return
+
         preprocess_result = _preprocess_dataset_to_jsonl(dataset, shard_size_mb=shard_size_mb)
         report = check_quality(db, dataset)
         # Mark dataset as preprocessed so training can find processed/data.jsonl
@@ -859,8 +880,8 @@ def start_preprocess(db: Session, dataset: Dataset, shard_size_mb: int = 0) -> d
             quality_status="passed" if report["passed"] else "failed",
             processing_status="completed",
         )
-        return dataset_repository.update_processing_job(
-            job["job_id"],
+        dataset_repository.update_processing_job(
+            job_id,
             status="completed" if report["passed"] else "failed",
             progress=100,
             finished_at=datetime.now(timezone.utc).isoformat(),
@@ -868,16 +889,20 @@ def start_preprocess(db: Session, dataset: Dataset, shard_size_mb: int = 0) -> d
             record_count=preprocess_result["record_count"],
             processed_size=preprocess_result["size"],
             source_file_count=preprocess_result["source_file_count"],
-        ) or job
+        )
     except Exception as exc:
-        dataset_repository.update_dataset(db, dataset, quality_status="failed", processing_status="failed")
-        return dataset_repository.update_processing_job(
-            job["job_id"],
+        dataset = dataset_repository.get_dataset_by_id(db, dataset_id)
+        if dataset is not None:
+            dataset_repository.update_dataset(db, dataset, quality_status="failed", processing_status="failed")
+        dataset_repository.update_processing_job(
+            job_id,
             status="failed",
             progress=100,
             finished_at=datetime.now(timezone.utc).isoformat(),
             error=str(exc),
-        ) or job
+        )
+    finally:
+        db.close()
 
 
 # ============================================================================
@@ -1445,10 +1470,55 @@ def get_lineage(db: Session, dataset: Dataset) -> dict:
 
     # ---- R2: 转换过程 ----
     transformations: list[dict] = []
-    if dataset.file_count and dataset.file_count > 0:
+    upload_logs = []
+    try:
+        from app.models.system_log import SystemLog
+        upload_logs = (
+            db.query(SystemLog)
+            .filter(SystemLog.resource == "dataset", SystemLog.resource_id == dataset.id)
+            .filter(SystemLog.action.in_(["upload", "upload_batch", "import", "preprocess"]))
+            .order_by(SystemLog.created_at.asc())
+            .all()
+        )
+    except Exception:
+        upload_logs = []
+
+    for lg in upload_logs:
+        detail = lg.detail or ""
+        description = detail
+        if lg.action == "upload":
+            description = detail or "上传文件"
+        elif lg.action == "upload_batch":
+            try:
+                payload = json.loads(detail)
+                files = payload.get("files", [])
+                filenames = [
+                    str(item.get("stored_filename") or item.get("filename"))
+                    for item in files
+                    if item.get("success") and (item.get("stored_filename") or item.get("filename"))
+                ]
+                message = payload.get("message") or "批量上传文件"
+                description = f"{message}：{', '.join(filenames)}" if filenames else message
+            except Exception:
+                description = detail or "批量上传文件"
+        elif lg.action == "import":
+            description = detail or "导入外部数据"
+        elif lg.action == "preprocess":
+            description = detail or "启动预处理"
+
+        transformations.append({
+            "rule": lg.action,
+            "description": description,
+            "timestamp": lg.created_at.isoformat() if lg.created_at else None,
+            "version_before": None,
+            "version_after": dataset.version,
+            "operator": lg.username,
+        })
+
+    if not upload_logs and dataset.file_count and dataset.file_count > 0:
         transformations.append({
             "rule": "data_loaded",
-            "description": f"从 {dataset.source or 'unknown'} 加载 {dataset.file_count} 个文件",
+            "description": f"由 {dataset.owner.username if dataset.owner else 'unknown'} 上传 {dataset.file_count} 个文件",
             "timestamp": dataset.created_at.isoformat() if dataset.created_at else None,
             "version_before": None,
             "version_after": dataset.version,

@@ -23,6 +23,7 @@ export interface DashboardMetrics {
   loss: DashboardMetricPoint[]
   accuracy: DashboardMetricPoint[]
   gpu_utilization: DashboardMetricPoint[]
+  gpu_memory: DashboardMetricPoint[]
   latency: DashboardMetricPoint[]
 }
 

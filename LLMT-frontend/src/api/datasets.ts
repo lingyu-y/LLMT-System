@@ -96,6 +96,7 @@ export interface LineageTransformation {
   timestamp?: string | null
   version_before?: string | null
   version_after?: string | null
+  operator?: string | null
 }
 
 export interface LineageImpact {

@@ -1,12 +1,20 @@
 <template>
-  <div>
+  <div class="dashboard-page">
     <div class="page-header dashboard-header">
       <div>
         <h1 class="page-title">训练监控仪表盘</h1>
         <p class="page-description">实时监控离线训练资源、通信链路和任务状态</p>
       </div>
-      <StatusBadge label="训练中" type="success" />
+      <StatusBadge :label="dashboardStatus.label" :type="dashboardStatus.type" />
     </div>
+    <el-alert
+      v-if="dashboardError"
+      class="dashboard-alert"
+      :title="dashboardError"
+      type="error"
+      show-icon
+      :closable="false"
+    />
 
     <div class="dashboard-grid">
       <section class="dashboard-main">
@@ -26,7 +34,7 @@
         </div>
 
         <ChartCard title="实时训练损失曲线" :icon="TrendCharts" :option="lossOption" height="260px">
-          <template #extra><StatusBadge label="训练中" type="success" /></template>
+          <template #extra><StatusBadge :label="dashboardStatus.label" :type="dashboardStatus.type" /></template>
         </ChartCard>
 
         <div class="grid-2">
@@ -40,8 +48,9 @@
           <h3 class="card-title">当前训练任务</h3>
         </div>
         <div class="card-body">
-          <div class="task-list">
-            <div v-for="task in trainingTasks" :key="task.name" class="task-item">
+          <div class="side-section task-list">
+            <el-empty v-if="!trainingTasks.length" description="暂无训练任务" />
+            <div v-for="task in trainingTasks" v-else :key="task.name" class="task-item">
               <div class="task-icon"><el-icon><DataAnalysis /></el-icon></div>
               <div class="task-content">
                 <div class="task-name">{{ task.name }}</div>
@@ -55,8 +64,9 @@
           </div>
 
           <h4 class="activity-title">最近活动</h4>
-          <div class="activity-list">
-            <div v-for="item in recentActivities" :key="item.text" class="activity-item">
+          <div class="side-section activity-list">
+            <el-empty v-if="!recentActivities.length" description="暂无活动记录" />
+            <div v-for="item in recentActivities" v-else :key="item.text" class="activity-item">
               <span class="activity-dot" :style="{ background: item.color }"></span>
               <span class="activity-text">{{ item.text }}</span>
               <span class="activity-time">{{ item.time }}</span>
@@ -64,8 +74,9 @@
           </div>
 
           <h4 class="activity-title">告警事件</h4>
-          <div class="activity-list">
-            <div v-for="item in alerts" :key="item.text" class="activity-item">
+          <div class="side-section activity-list">
+            <el-empty v-if="!alerts.length" description="暂无告警事件" />
+            <div v-for="item in alerts" v-else :key="item.text" class="activity-item">
               <span class="activity-dot" :style="{ background: item.color }"></span>
               <span class="activity-text">{{ item.text }}</span>
               <span class="activity-time">{{ item.time }}</span>
@@ -93,17 +104,8 @@ import {
   type DashboardSummary,
   type DashboardTrainingTask,
 } from '@/api/dashboard'
-import { getGpuStatus, type GpuStatus } from '@/api/resources'
 import ChartCard from '@/components/ChartCard.vue'
 import StatusBadge from '@/components/StatusBadge.vue'
-import {
-  dashboardMetrics as mockDashboardMetrics,
-  gpuSeries as mockGpuSeries,
-  latencySeries as mockLatencySeries,
-  lossSeries as mockLossSeries,
-  recentActivities as mockRecentActivities,
-  trainingTasks as mockTrainingTasks,
-} from '@/mock/dashboard'
 
 interface ResourceMetric {
   title: string
@@ -127,39 +129,76 @@ interface ActivityItem {
   color: string
 }
 
-const ticks = ref(['10:01', '10:02', '10:03', '10:04', '10:05', '10:06', '10:07', '10:08', '10:09', '10:10'])
-const losses = ref([...mockLossSeries])
-const gpu = ref([...mockGpuSeries])
-const latency = ref([...mockLatencySeries])
-const dashboardMetrics = ref<ResourceMetric[]>([...mockDashboardMetrics])
-const trainingTasks = ref<TaskItem[]>(mockTrainingTasks.map((task) => ({ ...task, statusLabel: task.type === 'warning' ? '排队' : '训练中' })))
-const recentActivities = ref<ActivityItem[]>([...mockRecentActivities])
+interface DashboardStatus {
+  label: string
+  type: 'success' | 'warning' | 'danger' | 'info'
+}
+
+const lossTicks = ref<string[]>([])
+const gpuTicks = ref<string[]>([])
+const latencyTicks = ref<string[]>([])
+const losses = ref<number[]>([])
+const gpu = ref<number[]>([])
+const latency = ref<number[]>([])
+const summaryGpuSeries = ref<{ timestamp: string; value: number }[]>([])
+const dashboardMetrics = ref<ResourceMetric[]>([
+  { title: 'GPU显存', value: '0.0%', progress: 0, color: '#f59e0b', bg: '#fed7aa' },
+  { title: '通信延迟', value: '0.0ms', progress: 0, color: '#10b981', bg: '#d1fae5' },
+  { title: '训练进度', value: '0.0%', progress: 0, color: '#2563eb', bg: '#dbeafe' },
+  { title: '运行任务', value: '0', progress: 0, color: '#8b5cf6', bg: '#e9d5ff' },
+])
+const trainingTasks = ref<TaskItem[]>([])
+const recentActivities = ref<ActivityItem[]>([])
 const alerts = ref<ActivityItem[]>([])
 const stream = ref<WebSocket>()
+let refreshTimer: number | undefined
+const dashboardError = ref('')
+const dashboardStatus = ref<DashboardStatus>({ label: '未运行', type: 'info' })
 
 const baseGrid = { top: 24, right: 20, bottom: 28, left: 42 }
 const lineStyle = { width: 3 }
 
+const emptyChartOption = (text: string): EChartsOption => ({
+  grid: baseGrid,
+  xAxis: { type: 'category', data: [], axisLine: { show: false }, axisTick: { show: false } },
+  yAxis: { type: 'value', axisLine: { show: false }, axisTick: { show: false }, splitLine: { show: false } },
+  series: [],
+  graphic: {
+    type: 'text',
+    left: 'center',
+    top: 'middle',
+    style: {
+      text,
+      fill: '#94a3b8',
+      fontSize: 13,
+      fontWeight: 500,
+    },
+  },
+})
+
 const lossOption = computed<EChartsOption>(() => ({
+  ...(losses.value.length ? {} : emptyChartOption('暂无训练损失数据')),
   tooltip: { trigger: 'axis' },
   grid: baseGrid,
-  xAxis: { type: 'category', data: ticks.value, boundaryGap: false },
+  xAxis: { type: 'category', data: lossTicks.value, boundaryGap: false },
   yAxis: { type: 'value', min: 0 },
   series: [{ type: 'line', data: losses.value, smooth: true, lineStyle, areaStyle: { opacity: 0.12 }, color: '#2563eb' }],
 }))
 
 const gpuOption = computed<EChartsOption>(() => ({
+  ...(gpu.value.length ? {} : emptyChartOption('暂无显存趋势数据')),
   tooltip: { trigger: 'axis' },
   grid: baseGrid,
-  xAxis: { type: 'category', data: ticks.value, boundaryGap: false },
-  yAxis: { type: 'value', min: 40, max: 100 },
-  series: [{ type: 'line', data: gpu.value, smooth: true, lineStyle, color: '#f59e0b', areaStyle: { opacity: 0.12 } }],
+  xAxis: { type: 'category', data: gpuTicks.value, boundaryGap: false },
+  yAxis: { type: 'value', min: 0, max: 100 },
+  series: [{ type: 'line', data: gpu.value, smooth: true, showSymbol: true, lineStyle, color: '#f59e0b', areaStyle: { opacity: 0.12 } }],
 }))
 
 const latencyOption = computed<EChartsOption>(() => ({
+  ...(latency.value.length ? {} : emptyChartOption('暂无延迟分布数据')),
   tooltip: { trigger: 'axis' },
   grid: baseGrid,
-  xAxis: { type: 'category', data: ticks.value },
+  xAxis: { type: 'category', data: latencyTicks.value },
   yAxis: { type: 'value' },
   series: [{ type: 'bar', data: latency.value, color: '#06b6d4', barWidth: 18 }],
 }))
@@ -201,32 +240,18 @@ const statusLabel = (status: string) => {
 const buildMetrics = (summary: DashboardSummary): ResourceMetric[] => {
   const memoryPercent = summary.gpu_memory_total > 0 ? (summary.gpu_memory_used / summary.gpu_memory_total) * 100 : 0
   return [
-    { title: 'GPU显存', value: `${memoryPercent.toFixed(1)}%`, progress: memoryPercent, color: '#f59e0b', bg: '#fed7aa' },
+    { title: 'GPU显存', value: summary.gpu_memory_total > 0 ? `${memoryPercent.toFixed(1)}%` : '暂无数据', progress: memoryPercent, color: '#f59e0b', bg: '#fed7aa' },
     { title: '通信延迟', value: `${summary.communication_latency_ms.toFixed(1)}ms`, progress: Math.min(100, summary.communication_latency_ms), color: '#10b981', bg: '#d1fae5' },
     { title: '训练进度', value: `${summary.training_progress.toFixed(1)}%`, progress: summary.training_progress, color: '#2563eb', bg: '#dbeafe' },
     { title: '运行任务', value: String(summary.running_tasks), progress: Math.min(100, summary.running_tasks * 20), color: '#8b5cf6', bg: '#e9d5ff' },
   ]
 }
 
-const buildMetricsWithGpu = (summary: DashboardSummary, gpuStatus?: GpuStatus): ResourceMetric[] => {
-  const metrics = buildMetrics(summary)
-  if (!gpuStatus) return metrics
-  const memoryPercent = gpuStatus.summary.total_memory_mb > 0 ? (gpuStatus.summary.used_memory_mb / gpuStatus.summary.total_memory_mb) * 100 : 0
-  metrics[0] = {
-    title: 'GPU显存',
-    value: `${memoryPercent.toFixed(1)}%`,
-    progress: memoryPercent,
-    color: '#f59e0b',
-    bg: '#fed7aa',
-  }
-  metrics[3] = {
-    title: '可用 GPU',
-    value: `${gpuStatus.summary.available_gpus}/${gpuStatus.summary.total_gpus}`,
-    progress: gpuStatus.summary.total_gpus ? (gpuStatus.summary.used_gpus / gpuStatus.summary.total_gpus) * 100 : 0,
-    color: '#8b5cf6',
-    bg: '#e9d5ff',
-  }
-  return metrics
+const buildDashboardStatus = (summary: DashboardSummary): DashboardStatus => {
+  if (summary.alert_count > 0) return { label: '有告警', type: 'warning' }
+  if (summary.running_tasks > 0) return { label: '训练中', type: 'success' }
+  if (summary.paused_tasks > 0) return { label: '已暂停', type: 'info' }
+  return { label: '未运行', type: 'info' }
 }
 
 const buildTaskItem = (task: DashboardTrainingTask): TaskItem => ({
@@ -249,30 +274,62 @@ const buildAlertItem = (item: DashboardAlert): ActivityItem => ({
   color: item.level === 'critical' ? '#ef4444' : item.level === 'warning' ? '#f59e0b' : '#2563eb',
 })
 
+const appendGpuPoint = (point?: { timestamp: string; value: number }) => {
+  if (!point) return
+  const last = summaryGpuSeries.value.at(-1)
+  if (last?.timestamp === point.timestamp && last.value === point.value) return
+  summaryGpuSeries.value = [...summaryGpuSeries.value, point].slice(-10)
+}
+
+const buildSummaryGpuPoint = (summary?: DashboardSummary) => {
+  if (!summary || summary.gpu_memory_total <= 0) return undefined
+  return {
+    timestamp: summary.updated_at,
+    value: Number(((summary.gpu_memory_used / summary.gpu_memory_total) * 100).toFixed(2)),
+  }
+}
+
+const updateMetricSeries = (metrics: {
+  loss?: { timestamp: string; value: number }[]
+  gpu_utilization?: { timestamp: string; value: number }[]
+  gpu_memory?: { timestamp: string; value: number }[]
+  latency?: { timestamp: string; value: number }[]
+}, summary?: DashboardSummary) => {
+  if ((metrics.gpu_memory?.length ?? 0) <= 1) appendGpuPoint(metrics.gpu_memory?.[0] ?? buildSummaryGpuPoint(summary))
+  const gpuMemorySeries = (metrics.gpu_memory?.length ?? 0) > 1 ? metrics.gpu_memory! : summaryGpuSeries.value
+  const gpuSeries = gpuMemorySeries.length ? gpuMemorySeries : metrics.gpu_utilization ?? []
+  const latencySeries = metrics.latency ?? []
+
+  lossTicks.value = (metrics.loss ?? []).map((item) => formatTimeLabel(item.timestamp)).slice(-10)
+  losses.value = (metrics.loss ?? []).map((item) => item.value).slice(-10)
+  gpuTicks.value = gpuSeries.map((item) => formatTimeLabel(item.timestamp)).slice(-10)
+  gpu.value = gpuSeries.map((item) => item.value).slice(-10)
+  latencyTicks.value = latencySeries.map((item) => formatTimeLabel(item.timestamp)).slice(-10)
+  latency.value = latencySeries.map((item) => item.value).slice(-10)
+}
+
 const loadDashboard = async () => {
   try {
-    const [summary, metrics, tasks, activities, alertItems, gpuStatus] = await Promise.all([
+    dashboardError.value = ''
+    const [summary, metrics, tasks, activities, alertItems] = await Promise.all([
       getDashboardSummary(),
       getDashboardMetrics('1h'),
       getDashboardTrainingTasks(),
       getDashboardActivities(8),
       getDashboardAlerts(5),
-      getGpuStatus().catch(() => undefined),
     ])
 
-    dashboardMetrics.value = buildMetricsWithGpu(summary, gpuStatus)
+    dashboardMetrics.value = buildMetrics(summary)
+    dashboardStatus.value = buildDashboardStatus(summary)
     trainingTasks.value = tasks.map(buildTaskItem)
     recentActivities.value = activities.map(buildActivityItem)
     alerts.value = alertItems.map(buildAlertItem)
 
-    if (metrics.loss.length) {
-      ticks.value = metrics.loss.map((item) => formatTimeLabel(item.timestamp)).slice(-10)
-      losses.value = metrics.loss.map((item) => item.value).slice(-10)
-    }
-    if (metrics.gpu_utilization.length) gpu.value = metrics.gpu_utilization.map((item) => item.value).slice(-10)
-    if (metrics.latency.length) latency.value = metrics.latency.map((item) => item.value).slice(-10)
+    updateMetricSeries(metrics, summary)
   } catch (error) {
-    console.warn('加载仪表盘接口失败，使用本地演示数据', error)
+    dashboardError.value = error instanceof Error ? error.message : '加载仪表盘接口失败'
+    dashboardStatus.value = { label: '连接异常', type: 'danger' }
+    console.warn('加载仪表盘接口失败', error)
   }
 }
 
@@ -285,12 +342,12 @@ const connectDashboardStream = () => {
   socket.onmessage = (event) => {
     try {
       const payload = JSON.parse(event.data)
-      if (payload.summary) dashboardMetrics.value = buildMetrics(payload.summary)
-      if (payload.training_tasks) trainingTasks.value = payload.training_tasks.map(buildTaskItem)
-      if (payload.metrics?.loss?.length) {
-        ticks.value = payload.metrics.loss.map((item: { timestamp: string }) => formatTimeLabel(item.timestamp)).slice(-10)
-        losses.value = payload.metrics.loss.map((item: { value: number }) => item.value).slice(-10)
+      if (payload.summary) {
+        dashboardMetrics.value = buildMetrics(payload.summary)
+        dashboardStatus.value = buildDashboardStatus(payload.summary)
       }
+      if (payload.training_tasks) trainingTasks.value = payload.training_tasks.map(buildTaskItem)
+      if (payload.metrics) updateMetricSeries(payload.metrics, payload.summary)
     } catch (error) {
       console.warn('仪表盘流数据解析失败', error)
     }
@@ -298,46 +355,61 @@ const connectDashboardStream = () => {
   socket.onerror = () => socket.close()
 }
 
-const timer = window.setInterval(() => {
-  const next = new Date()
-  ticks.value = [...ticks.value.slice(1), `${String(next.getHours()).padStart(2, '0')}:${String(next.getMinutes()).padStart(2, '0')}`]
-  losses.value = [...losses.value.slice(1), Math.max(0.01, losses.value.at(-1)! * (0.88 + Math.random() * 0.18))]
-  gpu.value = [...gpu.value.slice(1), Math.round(70 + Math.random() * 18)]
-  latency.value = [...latency.value.slice(1), Number((1.8 + Math.random() * 1.2).toFixed(1))]
-}, 3000)
-
 onMounted(() => {
   void loadDashboard()
   connectDashboardStream()
+  refreshTimer = window.setInterval(() => {
+    void loadDashboard()
+  }, 5000)
 })
 onBeforeUnmount(() => {
-  window.clearInterval(timer)
+  if (refreshTimer) window.clearInterval(refreshTimer)
   stream.value?.close()
 })
 </script>
 
 <style scoped>
+.dashboard-page {
+  min-height: calc(100vh - 131px);
+}
+
 .dashboard-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
 }
 
+.dashboard-alert {
+  margin-bottom: 16px;
+}
+
 .dashboard-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 360px;
+  align-items: stretch;
   gap: 20px;
 }
 
 .dashboard-main {
+  display: flex;
   min-width: 0;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.dashboard-main :deep(.chart-card) {
+  margin-bottom: 0;
+}
+
+.dashboard-main .grid-2 {
+  align-items: stretch;
 }
 
 .resource-row {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 12px;
-  margin-bottom: 20px;
+  margin-bottom: 0;
 }
 
 .resource-compact,
@@ -381,11 +453,42 @@ onBeforeUnmount(() => {
 }
 
 .side-card {
-  align-self: start;
+  align-self: stretch;
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+  margin-bottom: 0;
+}
+
+.side-card .card-header {
+  flex: 0 0 auto;
+}
+
+.side-card .card-body {
+  display: flex;
+  flex: 1 1 0;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.side-card :deep(.el-empty) {
+  padding: 10px 0;
+}
+
+.side-card :deep(.el-empty__image) {
+  display: none;
+}
+
+.side-section {
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .task-list {
   display: flex;
+  flex: 1.25 1 0;
   flex-direction: column;
   gap: 12px;
 }
@@ -420,12 +523,14 @@ onBeforeUnmount(() => {
 }
 
 .activity-title {
-  margin: 18px 0 12px;
+  flex: 0 0 auto;
+  margin: 14px 0 10px;
   font-size: 13px;
 }
 
 .activity-list {
   display: flex;
+  flex: 1 1 0;
   flex-direction: column;
   gap: 8px;
 }
@@ -455,5 +560,16 @@ onBeforeUnmount(() => {
 .activity-time {
   color: var(--text-muted);
   font-size: 11px;
+}
+
+@media (max-width: 1180px) {
+  .dashboard-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .side-card {
+    height: auto;
+    max-height: none;
+  }
 }
 </style>

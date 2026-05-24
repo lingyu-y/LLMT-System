@@ -104,6 +104,19 @@ def create_training_task(
     user=Depends(get_current_user),
 ):
     """Create a new training task and queue it for execution."""
+    dataset = db.query(Dataset).filter(Dataset.id == body.dataset_id).first()
+    if dataset is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="数据集不存在")
+    if dataset.processing_status != "completed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="数据集尚未完成预处理，请先在数据处理页面启动预处理",
+        )
+    if dataset.quality_status != "passed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="数据集质量校验未通过，请先完成预处理和质量校验",
+        )
     result = training_service.create_task(db, body, creator_id=user.id)
     return success_response(result.model_dump(), "训练任务已创建")
 

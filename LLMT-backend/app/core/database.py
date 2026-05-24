@@ -52,6 +52,7 @@ def get_influx_client() -> InfluxDBClient:
         url=settings.INFLUXDB_URL,
         token=settings.INFLUXDB_TOKEN,
         org=settings.INFLUXDB_ORG,
+        timeout=settings.INFLUXDB_TIMEOUT_MS,
     )
 
 

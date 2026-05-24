@@ -9,83 +9,112 @@
       <MetricCard v-for="item in datasetStats" :key="item.title" :title="item.title" :value="item.value" />
     </div>
 
-    <div class="card dataset-workspace">
-      <div class="card-header">
-        <div>
-          <h3 class="card-title">数据处理工作台</h3>
-          <p class="section-note">选择数据集后查看加载信息、质量报告和血缘链路。</p>
+    <div class="data-workbench">
+      <div class="card dataset-list-panel">
+        <div class="card-header">
+          <div>
+            <h3 class="card-title">数据集</h3>
+            <p class="section-note">{{ datasets.length }} 个数据集 · {{ processingJobs.length }} 个处理任务</p>
+          </div>
+          <el-button type="primary" :icon="Upload" @click="openCreateDialog">数据加载</el-button>
         </div>
-        <el-select
-          v-model="selectedDatasetId"
-          class="dataset-select"
-          :disabled="datasets.length === 0"
-          placeholder="选择数据集"
-          @change="handleDatasetChange"
-        >
-          <el-option v-for="item in datasets" :key="item.id" :label="item.name" :value="item.id" />
-        </el-select>
+        <div class="card-body dataset-list-body">
+          <el-input
+            v-model="datasetKeyword"
+            class="dataset-search"
+            clearable
+            :prefix-icon="Search"
+            placeholder="搜索数据集"
+          />
+          <el-table
+            v-loading="loading"
+            :data="filteredDatasets"
+            class="dataset-list-table"
+            highlight-current-row
+            row-key="id"
+            stripe
+            :current-row-key="selectedDatasetId"
+            @row-click="handleRowClick"
+          >
+            <el-table-column prop="name" label="数据集" min-width="170">
+              <template #default="{ row }">
+                <div class="dataset-cell">
+                  <strong>{{ row.name }}</strong>
+                </div>
+              </template>
+            </el-table-column>
+            <el-table-column label="状态" width="92">
+              <template #default="{ row }"><StatusBadge :label="row.qualityLabel" :type="row.qualityType" /></template>
+            </el-table-column>
+            <el-table-column prop="sizeLabel" label="大小" width="92" />
+          </el-table>
+        </div>
       </div>
 
-      <div class="card-body">
-        <el-empty v-if="!selectedDataset" description="暂无数据集，请先通过数据加载创建或导入数据集" />
-
-        <template v-else>
-          <div class="dataset-context">
-            <div>
-              <span class="context-label">当前数据集</span>
-              <strong>{{ selectedDataset.name }}</strong>
-            </div>
-            <div>
-              <span class="context-label">类型</span>
-              <strong>{{ selectedDataset.typeLabel }}</strong>
-            </div>
-            <div>
-              <span class="context-label">大小</span>
-              <strong>{{ selectedDataset.sizeLabel }}</strong>
-            </div>
-            <div>
-              <span class="context-label">质量状态</span>
-              <StatusBadge :label="selectedDataset.qualityLabel" :type="selectedDataset.qualityType" />
-            </div>
+      <div class="card dataset-workspace">
+        <div class="card-header">
+          <div>
+            <h3 class="card-title">数据处理工作台</h3>
+            <p class="section-note">选择数据集后查看加载信息、质量报告和血缘链路。</p>
           </div>
+          <div class="workspace-actions">
+            <el-button v-if="selectedDataset" :icon="Delete" type="danger" plain @click="removeDataset(selectedDataset.id)">删除</el-button>
+          </div>
+        </div>
+
+        <div class="card-body">
+          <el-empty v-if="!selectedDataset" description="暂无数据集，请先通过数据加载创建或导入数据集" />
+
+          <template v-else>
+            <div class="dataset-context">
+              <div>
+                <span class="context-label">当前数据集</span>
+                <strong>{{ selectedDataset.name }}</strong>
+              </div>
+              <div>
+                <span class="context-label">类型</span>
+                <strong>{{ selectedDataset.typeLabel }}</strong>
+              </div>
+              <div>
+                <span class="context-label">大小</span>
+                <strong>{{ selectedDataset.sizeLabel }}</strong>
+              </div>
+              <div>
+                <span class="context-label">质量状态</span>
+                <StatusBadge :label="selectedDataset.qualityLabel" :type="selectedDataset.qualityType" />
+              </div>
+              <div>
+                <span class="context-label">血缘状态</span>
+                <StatusBadge :label="selectedDataset.lineageLabel" :type="selectedDataset.lineageType" />
+              </div>
+              <div>
+                <span class="context-label">上传者</span>
+                <strong>{{ selectedDataset.ownerLabel }}</strong>
+              </div>
+            </div>
 
           <el-tabs v-model="activeDataTab">
             <el-tab-pane label="数据加载" name="load">
               <div class="feature-grid">
-                <div class="feature-panel">
+                <div class="feature-panel load-actions-panel">
                   <div class="panel-copy">
-                    <h4>多模态数据加载</h4>
-                    <p>当前支持文本类数据集登记与文件上传。</p>
+                    <h4>数据加载操作</h4>
                   </div>
-                  <div class="format-tags">
-                    <el-tag v-for="format in supportedFormats" :key="format" effect="plain">{{ format }}</el-tag>
-                  </div>
-                  <div class="upload-summary">
-                    <div>
-                      <span class="context-label">来源</span>
-                      <strong>{{ selectedDataset.raw.source || '未记录' }}</strong>
-                    </div>
-                    <div>
-                      <span class="context-label">文件数</span>
-                      <strong>{{ selectedDataset.raw.file_count }}</strong>
-                    </div>
-                  </div>
-                  <div class="button-row">
+                  <div class="load-action-grid">
                     <el-button type="primary" :icon="Upload" @click="openAppendDialog">追加文件</el-button>
-                    <span style="display:inline-flex;align-items:center;gap:4px;margin:0 8px">
-                      <span style="white-space:nowrap;font-size:13px">分片大小</span>
+                    <span class="shard-control">
+                      <span>分片大小</span>
                       <el-input-number
                         v-model="shardSizeMb"
                         :min="0"
                         :max="10240"
                         :step="100"
                         size="small"
-                        style="width:110px"
                       />
-                      <span style="white-space:nowrap;font-size:13px">MB</span>
+                      <span>MB</span>
                     </span>
-                    <el-button :icon="VideoPlay" @click="startPreprocessJob">启动预处理</el-button>
-                    <el-button :icon="Clock" @click="refreshProcessingJobs">刷新处理任务</el-button>
+                    <el-button :icon="VideoPlay" :loading="preprocessing" @click="startPreprocessJob">启动预处理</el-button>
+                    <el-button :icon="Clock" :loading="refreshingJobs" @click="refreshProcessingJobs">刷新处理任务</el-button>
                   </div>
                 </div>
 
@@ -106,7 +135,7 @@
                       </div>
                     </div>
                   </div>
-                  <el-empty v-else description="尚未选择上传文件" :image-size="70" />
+                  <el-empty v-else class="upload-empty" description="尚未选择上传文件" />
                 </div>
               </div>
 
@@ -159,7 +188,7 @@
 
               <div class="issue-list">
                 <h4>问题清单与修复建议</h4>
-                <el-empty v-if="qualityIssues.length === 0" description="后端未返回质量问题" :image-size="70" />
+                <el-empty v-if="qualityIssues.length === 0" class="text-empty" description="后端未返回质量问题" />
                 <el-table v-else :data="qualityIssues" stripe>
                   <el-table-column prop="index" label="#" width="70" />
                   <el-table-column prop="description" label="问题描述" min-width="180" />
@@ -184,13 +213,13 @@
               <div class="lineage-flow">
                 <div class="lineage-node">
                   <span>来源</span>
-                  <strong>{{ lineageReport?.source || selectedDataset.raw.source || '未记录' }}</strong>
-                  <small>上传者：{{ selectedDataset.ownerLabel }} · {{ selectedDataset.createdAt }}</small>
+                  <strong>{{ selectedDataset.ownerLabel }}</strong>
+                  <small>上传时间：{{ selectedDataset.createdAt }}</small>
                 </div>
                 <div v-for="step in lineageSteps" :key="step.key" class="lineage-node">
                   <span>转换</span>
                   <strong>{{ step.description }}</strong>
-                  <small>{{ step.timeLabel }} · {{ step.versionLabel }}</small>
+                  <small>{{ step.timeLabel }} · {{ step.operatorLabel }}</small>
                 </div>
                 <div class="lineage-node">
                   <span>使用</span>
@@ -200,49 +229,8 @@
               </div>
             </el-tab-pane>
           </el-tabs>
-        </template>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="card-header">
-        <h3 class="card-title">数据集列表</h3>
-        <el-button type="primary" :icon="Upload" @click="openCreateDialog">数据加载</el-button>
-      </div>
-      <div class="card-body table-wrap">
-        <el-table v-loading="loading" :data="datasets" stripe @row-click="handleRowClick">
-          <el-table-column prop="name" label="数据集名称" min-width="180">
-            <template #default="{ row }"><strong>{{ row.name }}</strong></template>
-          </el-table-column>
-          <el-table-column prop="typeLabel" label="类型" width="100">
-            <template #default="{ row }"><StatusBadge :label="row.typeLabel" type="info" /></template>
-          </el-table-column>
-          <el-table-column label="格式" width="130">
-            <template #default="{ row }">{{ row.formatLabel }}</template>
-          </el-table-column>
-          <el-table-column prop="sizeLabel" label="大小" width="110" />
-          <el-table-column prop="ownerLabel" label="上传者" min-width="120" />
-          <el-table-column prop="createdAt" label="上传时间" width="120" />
-          <el-table-column label="质量评分" width="120">
-            <template #default="{ row }">{{ row.scoreLabel }}</template>
-          </el-table-column>
-          <el-table-column label="状态" width="120">
-            <template #default="{ row }"><StatusBadge :label="row.qualityLabel" :type="row.qualityType" /></template>
-          </el-table-column>
-          <el-table-column label="血缘状态" width="120">
-            <template #default="{ row }"><StatusBadge :label="row.lineageLabel" :type="row.lineageType" /></template>
-          </el-table-column>
-          <el-table-column label="操作" fixed="right" width="260">
-            <template #default="{ row }">
-              <div class="table-actions">
-                <el-button size="small" @click.stop="selectDataset(row.id, 'quality')">校验</el-button>
-                <el-button size="small" @click.stop="selectDataset(row.id, 'lineage')">血缘</el-button>
-                <el-button size="small" @click.stop="selectDataset(row.id, 'load')">加载</el-button>
-                <el-button size="small" type="danger" @click.stop="removeDataset(row.id)">删除</el-button>
-              </div>
-            </template>
-          </el-table-column>
-        </el-table>
+          </template>
+        </div>
       </div>
     </div>
 
@@ -323,7 +311,7 @@
 
     <el-drawer v-model="lineageDrawerVisible" title="数据血缘链路" size="560px">
       <el-descriptions v-if="selectedDataset" :column="1" border>
-        <el-descriptions-item label="数据来源">{{ lineageReport?.source || selectedDataset.raw.source || '未记录' }}</el-descriptions-item>
+        <el-descriptions-item label="数据来源">{{ selectedDataset.ownerLabel }}</el-descriptions-item>
         <el-descriptions-item label="上传者">{{ selectedDataset.ownerLabel }}</el-descriptions-item>
         <el-descriptions-item label="上传时间">{{ selectedDataset.createdAt }}</el-descriptions-item>
       </el-descriptions>
@@ -332,7 +320,7 @@
         <el-timeline>
           <el-timeline-item v-for="step in lineageSteps" :key="step.key" :timestamp="step.timeLabel">
             <strong>{{ step.description }}</strong>
-            <p class="timeline-meta">{{ step.versionLabel }} · {{ step.ruleLabel }}</p>
+            <p class="timeline-meta">{{ step.operatorLabel }} · {{ step.ruleLabel }} · {{ step.versionLabel }}</p>
           </el-timeline-item>
         </el-timeline>
         <el-empty v-if="lineageSteps.length === 0" description="暂无转换记录" :image-size="70" />
@@ -360,10 +348,10 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import type { UploadFile, UploadUserFile } from 'element-plus'
 import { ElMessage } from 'element-plus'
-import { Clock, Connection, Document, Share, Tools, Upload, UploadFilled, VideoPlay } from '@element-plus/icons-vue'
+import { Clock, Connection, Delete, Document, Search, Share, Tools, Upload, UploadFilled, VideoPlay } from '@element-plus/icons-vue'
 
 import MetricCard from '@/components/MetricCard.vue'
 import StatusBadge from '@/components/StatusBadge.vue'
@@ -458,12 +446,15 @@ const importing = ref(false)
 const checking = ref(false)
 const repairing = ref(false)
 const impactLoading = ref(false)
+const preprocessing = ref(false)
+const refreshingJobs = ref(false)
 const dialogVisible = ref(false)
 const qualityDrawerVisible = ref(false)
 const lineageDrawerVisible = ref(false)
 const impactDrawerVisible = ref(false)
 const activeDataTab = ref('load')
 const selectedDatasetId = ref<number>()
+const datasetKeyword = ref('')
 const datasets = ref<DatasetView[]>([])
 const stats = ref<DatasetStats>()
 const uploadFiles = ref<UploadUserFile[]>([])
@@ -472,6 +463,7 @@ const qualityReport = ref<QualityReport>()
 const lineageReport = ref<Lineage>()
 const lineageImpact = ref<LineageImpact>({ dataset_id: 0, affected_models: [], affected_tasks: [], affected_datasets: [] })
 const processingJobs = ref<ProcessingJob[]>([])
+let processingPollTimer: ReturnType<typeof window.setInterval> | undefined
 const resumeEnabled = ref(true)
 const shardSizeMb = ref(512)
 const uploadMode = ref<'create' | 'append'>('create')
@@ -522,6 +514,14 @@ const mapDataset = (item: BackendDataset): DatasetView => {
 }
 
 const selectedDataset = computed(() => datasets.value.find((item) => item.id === selectedDatasetId.value))
+const filteredDatasets = computed(() => {
+  const keyword = datasetKeyword.value.trim().toLowerCase()
+  if (!keyword) return datasets.value
+  return datasets.value.filter((item) =>
+    [item.name, item.typeLabel, item.formatLabel, item.ownerLabel, item.qualityLabel, item.lineageLabel]
+      .some((value) => value.toLowerCase().includes(keyword)),
+  )
+})
 
 const datasetStats = computed(() => {
   const total = stats.value?.total_datasets ?? 0
@@ -585,6 +585,7 @@ const lineageSteps = computed(() =>
     description: step.description || step.rule || '未命名转换',
     ruleLabel: step.rule || '未记录规则',
     timeLabel: formatDateTime(step.timestamp),
+    operatorLabel: step.operator || '系统',
     versionLabel:
       step.version_before || step.version_after
         ? `${step.version_before ?? '初始'} -> ${step.version_after ?? '未记录'}`
@@ -695,9 +696,45 @@ const loadDatasets = async () => {
   }
 }
 
-const refreshProcessingJobs = async () => {
-  const jobsPage = await listProcessingJobs({ page: 1, page_size: 20 })
-  processingJobs.value = jobsPage.data
+const refreshProcessingJobs = async (showLoading = true) => {
+  if (showLoading) refreshingJobs.value = true
+  try {
+    const jobsPage = await listProcessingJobs({ page: 1, page_size: 20 })
+    processingJobs.value = jobsPage.data
+  } finally {
+    if (showLoading) refreshingJobs.value = false
+  }
+}
+
+const hasRunningProcessingJob = (datasetId: number) =>
+  processingJobs.value.some((job) =>
+    job.dataset_id === datasetId && ['running', 'processing', 'pending'].includes(String(job.status).toLowerCase()),
+  )
+
+const stopProcessingJobPolling = () => {
+  if (processingPollTimer) {
+    window.clearInterval(processingPollTimer)
+    processingPollTimer = undefined
+  }
+}
+
+const startProcessingJobPolling = (datasetId: number) => {
+  stopProcessingJobPolling()
+  processingPollTimer = window.setInterval(() => {
+    refreshProcessingJobs(false)
+      .then(async () => {
+        if (!hasRunningProcessingJob(datasetId)) {
+          stopProcessingJobPolling()
+          preprocessing.value = false
+          await loadDatasets()
+          await loadDatasetDetails(datasetId)
+        }
+      })
+      .catch(() => {
+        stopProcessingJobPolling()
+        preprocessing.value = false
+      })
+  }, 2000)
 }
 
 const loadDatasetDetails = async (datasetId: number) => {
@@ -723,10 +760,6 @@ const selectDataset = async (datasetId: number, tab?: string) => {
   selectedDatasetId.value = datasetId
   if (tab) activeDataTab.value = tab
   await loadDatasetDetails(datasetId)
-}
-
-const handleDatasetChange = (datasetId: string | number | boolean | Record<string, unknown>) => {
-  if (typeof datasetId === 'number') void selectDataset(datasetId)
 }
 
 const handleRowClick = (row: DatasetView) => {
@@ -813,14 +846,16 @@ const startPreprocessJob = async () => {
     return
   }
   const datasetId = selectedDataset.value.id
+  preprocessing.value = true
   try {
     await startPreprocess(datasetId, shardSizeMb.value)
-    await refreshProcessingJobs()
+    await refreshProcessingJobs(false)
+    startProcessingJobPolling(datasetId)
     await loadDatasets()
-    await loadDatasetDetails(datasetId)
-    ElMessage.success('预处理已完成，质量状态已刷新')
+    ElMessage.success('预处理任务已启动')
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '预处理失败')
+    preprocessing.value = false
   }
 }
 
@@ -981,19 +1016,80 @@ onMounted(() => {
     ElMessage.error(error instanceof Error ? error.message : '数据集加载失败')
   })
 })
+
+onBeforeUnmount(() => {
+  stopProcessingJobPolling()
+})
 </script>
 
 <style scoped>
 .stats {
-  margin-bottom: 22px;
+  margin-bottom: 16px;
 }
 
 .full {
   width: 100%;
 }
 
+.data-workbench {
+  display: grid;
+  grid-template-columns: minmax(320px, 380px) minmax(0, 1fr);
+  gap: 16px;
+  align-items: stretch;
+}
+
+.dataset-list-panel,
+.dataset-workspace {
+  min-width: 0;
+}
+
+.dataset-list-panel {
+  display: flex;
+  height: clamp(560px, calc(100vh - 250px), 760px);
+  flex-direction: column;
+}
+
+.dataset-list-panel .card-header {
+  gap: 12px;
+}
+
+.dataset-list-body {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.dataset-search {
+  flex: 0 0 auto;
+}
+
+.dataset-list-table {
+  min-height: 0;
+  flex: 1;
+}
+
+.dataset-cell {
+  min-width: 0;
+}
+
+.dataset-cell strong {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .dataset-workspace .card-header {
   align-items: flex-start;
+}
+
+.workspace-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
 }
 
 .section-note {
@@ -1002,12 +1098,7 @@ onMounted(() => {
   font-size: 13px;
 }
 
-.dataset-select {
-  width: min(320px, 100%);
-}
-
 .dataset-context,
-.upload-summary,
 .form-grid {
   display: grid;
   gap: 14px;
@@ -1036,9 +1127,9 @@ onMounted(() => {
 }
 
 .dataset-context {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  margin-bottom: 18px;
-  padding: 14px;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  margin-bottom: 14px;
+  padding: 12px;
   border: 1px solid var(--border-color);
   border-radius: 8px;
   background: var(--bg-color);
@@ -1049,8 +1140,7 @@ onMounted(() => {
   display: block;
 }
 
-.dataset-context strong,
-.upload-summary strong {
+.dataset-context strong {
   margin-top: 5px;
   font-size: 15px;
 }
@@ -1063,7 +1153,7 @@ onMounted(() => {
 .feature-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 18px;
+  gap: 14px;
 }
 
 .feature-panel,
@@ -1077,13 +1167,17 @@ onMounted(() => {
 
 .feature-panel {
   display: flex;
-  min-height: 250px;
+  min-height: 220px;
   flex-direction: column;
-  gap: 16px;
+  gap: 14px;
+}
+
+.load-actions-panel {
+  min-height: 0;
 }
 
 .panel-copy {
-  padding-bottom: 14px;
+  padding-bottom: 12px;
   border-bottom: 1px solid var(--border-color);
 }
 
@@ -1105,7 +1199,6 @@ onMounted(() => {
   font-size: 13px;
 }
 
-.format-tags,
 .button-row,
 .upload-records,
 .dialog-file-list,
@@ -1115,28 +1208,56 @@ onMounted(() => {
   gap: 10px;
 }
 
-.format-tags,
-.upload-summary {
-  margin-top: 0;
-}
-
-.upload-summary {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
-}
-
-.upload-summary > div {
-  min-width: 0;
-  padding: 12px;
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  background: #fff;
-}
-
 .upload-records {
   flex-direction: column;
   margin-top: 14px;
+}
+
+.load-action-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.load-action-grid :deep(.el-button) {
+  width: 100%;
+  height: 36px;
+  margin-left: 0;
+  justify-content: center;
+}
+
+.shard-control {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-width: 0;
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--text-secondary);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.shard-control :deep(.el-input-number) {
+  width: 108px;
+}
+
+.shard-control :deep(.el-input__wrapper) {
+  box-shadow: none;
+}
+
+.upload-empty,
+.text-empty {
+  --el-empty-padding: 18px 0;
+}
+
+.upload-empty :deep(.el-empty__image),
+.text-empty :deep(.el-empty__image) {
+  display: none;
 }
 
 .upload-record,
@@ -1174,7 +1295,7 @@ onMounted(() => {
   align-items: flex-start;
   justify-content: space-between;
   gap: 16px;
-  margin-bottom: 16px;
+  margin-bottom: 14px;
 }
 
 .button-row {
@@ -1225,8 +1346,8 @@ onMounted(() => {
 .inline-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 14px;
-  margin-bottom: 16px;
+  gap: 12px;
+  margin-bottom: 14px;
 }
 
 .inline-card span {
@@ -1274,6 +1395,15 @@ onMounted(() => {
 
 .table-wrap {
   overflow-x: auto;
+}
+
+.job-list {
+  margin-top: 14px;
+}
+
+.job-list h4 {
+  margin: 0 0 10px;
+  font-size: 16px;
 }
 
 .table-actions {
@@ -1324,6 +1454,14 @@ onMounted(() => {
 }
 
 @media (max-width: 1100px) {
+  .data-workbench {
+    grid-template-columns: 1fr;
+  }
+
+  .dataset-list-panel {
+    height: auto;
+  }
+
   .feature-grid,
   .lineage-flow {
     grid-template-columns: 1fr;
@@ -1336,29 +1474,33 @@ onMounted(() => {
 
 @media (max-width: 900px) {
   .dataset-workspace .card-header,
+  .dataset-list-panel .card-header,
   .quality-toolbar {
     flex-direction: column;
   }
 
-  .dataset-select,
+  .workspace-actions,
   .button-row {
     width: 100%;
   }
 
+  .workspace-actions,
   .button-row {
     justify-content: flex-start;
   }
 
   .dataset-context,
-  .upload-summary,
   .form-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 
 @media (max-width: 640px) {
+  .load-action-grid {
+    grid-template-columns: 1fr;
+  }
+
   .dataset-context,
-  .upload-summary,
   .inline-grid,
   .form-grid,
   .upload-record,

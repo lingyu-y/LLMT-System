@@ -506,14 +506,14 @@ def promote_to_model(db: Session, task_id: int) -> dict | None:
     def _upload_local_tokenizer_vocab(minio, model_bucket: str) -> None:
         import os as _os
 
-        candidates = [
+        vocab_candidates = [
             "/tmp/llmt_checkpoints/ckpt/tokenizer_vocab.json",
             "/tmp/llmt_checkpoints/latest/tokenizer_vocab.json",
             "/tmp/llmt_checkpoints/tokenizer_vocab.json",
             "./checkpoints/ckpt/tokenizer_vocab.json",
             "./checkpoints/tokenizer_vocab.json",
         ]
-        for vocab_path in candidates:
+        for vocab_path in vocab_candidates:
             if _os.path.isfile(vocab_path):
                 minio.fput_object(
                     model_bucket,
@@ -521,7 +521,26 @@ def promote_to_model(db: Session, task_id: int) -> dict | None:
                     vocab_path,
                 )
                 logger.info("Uploaded tokenizer vocab %s -> %s/%s", vocab_path, model_bucket, storage_path)
-                return
+                break
+
+        tokenizer_dirs = [
+            "/tmp/llmt_checkpoints/ckpt/tokenizer",
+            "/tmp/llmt_checkpoints/latest/tokenizer",
+            "/tmp/llmt_checkpoints/tokenizer",
+            "./checkpoints/ckpt/tokenizer",
+            "./checkpoints/tokenizer",
+        ]
+        for tokenizer_dir in tokenizer_dirs:
+            if not _os.path.isdir(tokenizer_dir):
+                continue
+            for root, _dirs, files in _os.walk(tokenizer_dir):
+                for fn in files:
+                    local_path = _os.path.join(root, fn)
+                    rel = _os.path.relpath(local_path, tokenizer_dir)
+                    object_name = f"{storage_path}/tokenizer/{rel}".replace("\\", "/")
+                    minio.fput_object(model_bucket, object_name, local_path)
+            logger.info("Uploaded tokenizer directory %s -> %s/%s/tokenizer", tokenizer_dir, model_bucket, storage_path)
+            break
 
     try:
         from minio.commonconfig import CopySource
