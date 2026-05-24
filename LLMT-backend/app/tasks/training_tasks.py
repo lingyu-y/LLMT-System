@@ -341,6 +341,8 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
 
         # Save tokenizer vocab alongside checkpoint for inference
         _save_tokenizer_vocab(dataset, config_dict)
+        if final_state.status == "completed":
+            _promote_to_model(task_code)
 
         return {
             "task_code": task_code,
@@ -354,49 +356,74 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
 
 
 def _save_tokenizer_vocab(dataset, config_dict: dict) -> None:
-    """Save the tokenizer vocabulary alongside the checkpoint for inference.
+    """Save tokenizer artifacts alongside the checkpoint for inference.
 
-    Extracts the SimpleTokenizer from the dataset (if available) and
-    writes its reverse vocabulary so the inference engine can decode
-    model outputs into human-readable text.
+    SimpleTokenizer writes tokenizer_vocab.json. HuggingFace tokenizers write
+    a tokenizer/ directory via save_pretrained().
     """
     import logging
     logger = logging.getLogger(__name__)
 
     try:
         tokenizer = getattr(dataset, "tokenizer", None)
-        if tokenizer is None or not hasattr(tokenizer, "save_vocab"):
+        if tokenizer is None:
             if hasattr(dataset, "_loaded_samples") and hasattr(dataset, "tokenizer"):
                 tokenizer = dataset.tokenizer
-        if tokenizer is None or not hasattr(tokenizer, "save_vocab"):
+        can_save_simple = hasattr(tokenizer, "save_vocab")
+        can_save_pretrained = hasattr(tokenizer, "save_pretrained")
+        if tokenizer is None or not (can_save_simple or can_save_pretrained):
             logger.debug("No saveable tokenizer found on dataset, skipping vocab save")
             return
 
-        # Determine checkpoint directory
+        # Create known local targets instead of writing only when they already
+        # exist; otherwise short runs or different launchers can finish without
+        # a tokenizer artifact.
         ckpt_dir_cfg = config_dict.get("checkpoint", {}).get("checkpoint_dir", "/tmp/llmt_checkpoints")
         ckpt_root = os.path.join(ckpt_dir_cfg) if not os.path.isabs(ckpt_dir_cfg) else ckpt_dir_cfg
 
-        # Also save to ./checkpoints/ for local discovery
-        local_ckpt = "./checkpoints"
-        candidates = [ckpt_root, local_ckpt]
-        # DeepSpeed convention: find the latest step subdirectory
+        candidates = [
+            ckpt_root,
+            os.path.join(ckpt_root, "ckpt"),
+            "./checkpoints",
+            "./checkpoints/ckpt",
+        ]
+        written: set[str] = set()
         for base in candidates:
-            if not os.path.isdir(base):
-                continue
+            os.makedirs(base, exist_ok=True)
+            if can_save_simple:
+                vocab_path = os.path.join(base, "tokenizer_vocab.json")
+                if vocab_path not in written:
+                    tokenizer.save_vocab(vocab_path)
+                    written.add(vocab_path)
+                    logger.info("Saved tokenizer vocab (%d words) to %s", len(tokenizer.id_to_word), vocab_path)
+            if can_save_pretrained:
+                tokenizer_dir = os.path.join(base, "tokenizer")
+                if tokenizer_dir not in written:
+                    os.makedirs(tokenizer_dir, exist_ok=True)
+                    tokenizer.save_pretrained(tokenizer_dir)
+                    written.add(tokenizer_dir)
+                    logger.info("Saved tokenizer files to %s", tokenizer_dir)
+
+        # DeepSpeed convention: latest is a file containing the current tag.
+        for base in (ckpt_root, "./checkpoints"):
             latest_file = os.path.join(base, "latest")
             if os.path.isfile(latest_file):
                 with open(latest_file, "r") as f:
                     latest_dir = f.read().strip()
                 step_dir = os.path.join(base, latest_dir)
-                if os.path.isdir(step_dir):
+                if os.path.isdir(step_dir) and can_save_simple:
                     vocab_path = os.path.join(step_dir, "tokenizer_vocab.json")
-                    tokenizer.save_vocab(vocab_path)
-                    logger.info("Saved tokenizer vocab (%d words) to %s", len(tokenizer.id_to_word), vocab_path)
-                    continue
-            # Fallback: save directly in the base dir
-            vocab_path = os.path.join(base, "tokenizer_vocab.json")
-            tokenizer.save_vocab(vocab_path)
-            logger.info("Saved tokenizer vocab (%d words) to %s", len(tokenizer.id_to_word), vocab_path)
+                    if vocab_path not in written:
+                        tokenizer.save_vocab(vocab_path)
+                        written.add(vocab_path)
+                        logger.info("Saved tokenizer vocab (%d words) to %s", len(tokenizer.id_to_word), vocab_path)
+                if os.path.isdir(step_dir) and can_save_pretrained:
+                    tokenizer_dir = os.path.join(step_dir, "tokenizer")
+                    if tokenizer_dir not in written:
+                        os.makedirs(tokenizer_dir, exist_ok=True)
+                        tokenizer.save_pretrained(tokenizer_dir)
+                        written.add(tokenizer_dir)
+                        logger.info("Saved tokenizer files to %s", tokenizer_dir)
     except Exception as exc:
         logger.warning("Failed to save tokenizer vocab: %s", exc)
 
@@ -706,6 +733,7 @@ def _build_training_config(
             "influxdb_token": settings.INFLUXDB_TOKEN,
             "influxdb_org": settings.INFLUXDB_ORG,
             "influxdb_bucket": settings.INFLUXDB_BUCKET,
+            "influxdb_timeout_ms": settings.INFLUXDB_TIMEOUT_MS,
             # Ensure training subprocesses/threads can update Postgres progress
             "postgres_db_url": settings.postgres_database_url,
         },
@@ -775,9 +803,6 @@ def _update_task_status(
             db.execute(_upd(_TT).where(_TT.task_code == task_code).values(**values))
             db.commit()
 
-        # When training completes, promote checkpoints to a ModelVersion
-        if status == "completed":
-            _promote_to_model(task_code)
     except Exception:
         pass  # Best-effort status update
 
@@ -849,14 +874,14 @@ def _promote_to_model(task_code: str) -> dict | None:
             ckpt_uploaded = False
 
             def _upload_local_tokenizer_vocab(minio, model_bucket: str) -> None:
-                candidates = [
+                vocab_candidates = [
                     "/tmp/llmt_checkpoints/ckpt/tokenizer_vocab.json",
                     "/tmp/llmt_checkpoints/latest/tokenizer_vocab.json",
                     "/tmp/llmt_checkpoints/tokenizer_vocab.json",
                     "./checkpoints/ckpt/tokenizer_vocab.json",
                     "./checkpoints/tokenizer_vocab.json",
                 ]
-                for vocab_path in candidates:
+                for vocab_path in vocab_candidates:
                     if os.path.isfile(vocab_path):
                         minio.fput_object(
                             model_bucket,
@@ -864,7 +889,26 @@ def _promote_to_model(task_code: str) -> dict | None:
                             vocab_path,
                         )
                         logger.info("Uploaded tokenizer vocab %s -> %s/%s", vocab_path, model_bucket, storage_path)
-                        return
+                        break
+
+                tokenizer_dirs = [
+                    "/tmp/llmt_checkpoints/ckpt/tokenizer",
+                    "/tmp/llmt_checkpoints/latest/tokenizer",
+                    "/tmp/llmt_checkpoints/tokenizer",
+                    "./checkpoints/ckpt/tokenizer",
+                    "./checkpoints/tokenizer",
+                ]
+                for tokenizer_dir in tokenizer_dirs:
+                    if not os.path.isdir(tokenizer_dir):
+                        continue
+                    for root, _dirs, files in os.walk(tokenizer_dir):
+                        for fn in files:
+                            local_path = os.path.join(root, fn)
+                            rel = os.path.relpath(local_path, tokenizer_dir)
+                            object_name = f"{storage_path}/tokenizer/{rel}".replace("\\", "/")
+                            minio.fput_object(model_bucket, object_name, local_path)
+                    logger.info("Uploaded tokenizer directory %s -> %s/%s/tokenizer", tokenizer_dir, model_bucket, storage_path)
+                    break
 
             try:
                 from app.core.database import get_minio_client

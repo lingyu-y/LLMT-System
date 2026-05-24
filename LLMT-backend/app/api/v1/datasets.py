@@ -1,8 +1,9 @@
 """Dataset management endpoints -- 数据处理接口 (Part 3 of jiekou.md)."""
 
+import json
 from typing import List
 
-from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, HTTPException, Query, UploadFile, status
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -73,7 +74,21 @@ def upload_files_batch(
     log_service.create_log(
         db, user_id=current_user.id, username=current_user.username,
         action="upload_batch", resource="dataset", resource_id=ds.id,
-        detail=f"批量上传 {result.get('total', 0)} 个文件，成功 {result.get('uploaded', 0)}",
+        detail=json.dumps(
+            {
+                "message": f"批量上传 {result.get('total', 0)} 个文件，成功 {result.get('uploaded', 0)}",
+                "files": [
+                    {
+                        "filename": item.get("filename"),
+                        "stored_filename": item.get("stored_filename"),
+                        "success": item.get("success"),
+                        "error": item.get("error"),
+                    }
+                    for item in result.get("files", [])
+                ],
+            },
+            ensure_ascii=False,
+        ),
     )
     return success_response(result, "批量上传完成")
 
@@ -263,6 +278,7 @@ def delete_dataset(
 @router.post("/{dataset_id}/preprocess")
 def start_preprocess(
     dataset_id: int,
+    background_tasks: BackgroundTasks,
     shard_size_mb: int = Query(0, ge=0, description="分片大小（MB），0 表示单文件模式"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -271,6 +287,7 @@ def start_preprocess(
     if ds is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="数据集不存在")
     job = dataset_service.start_preprocess(db, ds, shard_size_mb=shard_size_mb)
+    background_tasks.add_task(dataset_service.run_preprocess_job, ds.id, job["job_id"], shard_size_mb)
     log_service.create_log(
         db, user_id=current_user.id, username=current_user.username,
         action="preprocess", resource="dataset", resource_id=ds.id,

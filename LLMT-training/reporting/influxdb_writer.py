@@ -25,6 +25,7 @@ class InfluxDBMetricsWriter:
         bucket: str = "training_metrics",
         batch_size: int = 50,
         flush_interval: float = 5.0,
+        timeout_ms: int = 3000,
     ):
         self.url = url
         self.token = token
@@ -32,6 +33,7 @@ class InfluxDBMetricsWriter:
         self.bucket = bucket
         self.batch_size = batch_size
         self.flush_interval = flush_interval
+        self.timeout_ms = timeout_ms
 
         self._client = None
         self._write_api = None
@@ -46,7 +48,7 @@ class InfluxDBMetricsWriter:
                 from influxdb_client.client.write_api import SYNCHRONOUS
 
                 self._client = InfluxDBClient(
-                    url=self.url, token=self.token, org=self.org,
+                    url=self.url, token=self.token, org=self.org, timeout=self.timeout_ms,
                 )
                 self._write_api = self._client.write_api(write_options=SYNCHRONOUS)
             except ImportError:
@@ -54,31 +56,40 @@ class InfluxDBMetricsWriter:
 
     def write_step_metrics(self, state: TrainingState, **kwargs: Any) -> None:
         """Queue a training step metric point."""
+        fields: dict[str, float | int] = {
+            "loss": float(state.loss),
+            "learning_rate": float(state.learning_rate),
+            "grad_norm": float(state.grad_norm),
+            "throughput": float(state.throughput),
+            "epoch": state.epoch,
+            "step": state.global_step,
+            "elapsed_seconds": state.elapsed_seconds,
+        }
+        accuracy = state.custom_metrics.get("accuracy")
+        if accuracy is not None:
+            fields["accuracy"] = float(accuracy)
+
         point = {
             "measurement": "training_step",
             "tags": {"task_code": state.task_code},
-            "fields": {
-                "loss": float(state.loss),
-                "learning_rate": float(state.learning_rate),
-                "grad_norm": float(state.grad_norm),
-                "throughput": float(state.throughput),
-                "epoch": state.epoch,
-                "step": state.global_step,
-                "elapsed_seconds": state.elapsed_seconds,
-            },
+            "fields": fields,
         }
         self._buffer.append(point)
         self._maybe_flush()
 
     def write_gpu_metrics(self, state: TrainingState, **kwargs: Any) -> None:
         """Queue a GPU metric point."""
+        utilization = state.gpu_utilization_pct
+        if utilization <= 0 and state.gpu_memory_total_mb > 0:
+            utilization = min(100.0, state.gpu_memory_used_mb / state.gpu_memory_total_mb * 100)
+
         point = {
             "measurement": "gpu_metrics",
             "tags": {"task_code": state.task_code},
             "fields": {
                 "memory_used_mb": float(state.gpu_memory_used_mb),
                 "memory_total_mb": float(state.gpu_memory_total_mb),
-                "utilization_pct": float(state.gpu_utilization_pct),
+                "utilization_pct": float(utilization),
                 "epoch": state.epoch,
                 "step": state.global_step,
             },

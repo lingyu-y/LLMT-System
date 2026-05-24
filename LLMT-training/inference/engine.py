@@ -51,6 +51,37 @@ def _load_checkpoint_file(path: str) -> Any:
         return torch.load(path, map_location="cpu")
 
 
+def _download_tokenizer_dir(model_code: str, version: str) -> str | None:
+    minio = _get_minio_client()
+    if minio is None:
+        return None
+    try:
+        from app.core.config import get_settings
+        bucket = get_settings().MINIO_BUCKET_MODELS
+    except Exception:
+        bucket = "models"
+
+    prefix = f"models/{model_code}/{version}/tokenizer/"
+    target_dir = os.path.join(tempfile.gettempdir(), f"tokenizer_{model_code}_{version}")
+    downloaded = 0
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+        for obj in minio.list_objects(bucket, prefix=prefix, recursive=True):
+            if obj.is_dir:
+                continue
+            rel = obj.object_name[len(prefix):]
+            if not rel:
+                continue
+            local_path = os.path.join(target_dir, rel)
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            minio.fget_object(bucket, obj.object_name, local_path)
+            downloaded += 1
+        return target_dir if downloaded else None
+    except Exception as exc:
+        _log.debug("Failed to download tokenizer dir from MinIO: %s", exc)
+        return None
+
+
 def _get_minio_client():
     """Lazy-import MinIO client to avoid hard dependency in training-only env."""
     try:
@@ -244,6 +275,18 @@ def _load_tokenizer(model_type: str, model_config: dict[str, Any] | None,
     """
     cfg = model_config or {}
     vocab_size = cfg.get("vocab_size", 50257)
+
+    tokenizer_dir = _download_tokenizer_dir(model_code, version) if model_code and version else None
+    if tokenizer_dir is not None:
+        try:
+            from transformers import AutoTokenizer
+            _log.info("Loading tokenizer from %s", tokenizer_dir)
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, local_files_only=True)
+            if getattr(tokenizer, "pad_token", None) is None and getattr(tokenizer, "eos_token", None) is not None:
+                tokenizer.pad_token = tokenizer.eos_token
+            return tokenizer
+        except Exception as exc:
+            _log.warning("Failed to load saved tokenizer directory: %s", exc)
 
     # Try saved tokenizer vocab from checkpoint
     vocab_path = _find_tokenizer_vocab(model_code, version)

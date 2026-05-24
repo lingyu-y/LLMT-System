@@ -84,6 +84,9 @@ async def dashboard_stream(websocket: WebSocket):
                 "metrics": {
                     "loss": metrics["loss"][-10:],
                     "accuracy": metrics["accuracy"][-10:],
+                    "gpu_utilization": metrics["gpu_utilization"][-10:],
+                    "gpu_memory": metrics["gpu_memory"][-10:],
+                    "latency": metrics["latency"][-10:],
                 },
                 "updated_at": datetime.now().isoformat(),
             }

@@ -39,6 +39,8 @@ class ReportingCallbackBridge(TrainingCallback):
         self.upload_to_minio = upload_to_minio
         self.max_checkpoints = max(1, max_checkpoints)
         self._step_count = 0
+        self._last_report_step = 0
+        self._last_report_elapsed = 0.0
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "ReportingCallbackBridge":
@@ -52,6 +54,7 @@ class ReportingCallbackBridge(TrainingCallback):
             token=reporting.get("influxdb_token", ""),
             org=reporting.get("influxdb_org", "llmt"),
             bucket=reporting.get("influxdb_bucket", "training_metrics"),
+            timeout_ms=reporting.get("influxdb_timeout_ms", 3000),
         )
 
         # Prefer an explicit DB URL passed in the backend-generated config;
@@ -83,6 +86,18 @@ class ReportingCallbackBridge(TrainingCallback):
     def on_train_end(self, state: TrainingState, **kwargs: Any) -> None:
         """Flush metrics and mark task as completed/failed."""
         if self.influxdb_writer:
+            self.influxdb_writer.write_step_metrics(state)
+            if self.report_gpu_metrics:
+                self._collect_gpu_metrics(state)
+                self.influxdb_writer.write_gpu_metrics(state)
+            if state.global_step > self._last_report_step:
+                step_delta = state.global_step - self._last_report_step
+                elapsed_delta = max(0.0, state.elapsed_seconds - self._last_report_elapsed)
+                if elapsed_delta > 0:
+                    self.influxdb_writer.write_communication_metrics(
+                        self.task_code,
+                        {"latency_ms": elapsed_delta / step_delta * 1000},
+                    )
             self.influxdb_writer.flush()
             self.influxdb_writer.close()
 
@@ -97,6 +112,17 @@ class ReportingCallbackBridge(TrainingCallback):
 
     def on_step_end(self, state: TrainingState, **kwargs: Any) -> None:
         """Report step metrics at configured intervals."""
+        if "loss" in kwargs:
+            state.loss = float(kwargs["loss"])
+        if "lr" in kwargs:
+            state.learning_rate = float(kwargs["lr"])
+        if "grad_norm" in kwargs:
+            state.grad_norm = float(kwargs["grad_norm"])
+        if "throughput" in kwargs:
+            state.throughput = float(kwargs["throughput"])
+        if "accuracy" in kwargs:
+            state.custom_metrics["accuracy"] = float(kwargs["accuracy"])
+
         self._step_count += 1
 
         interval = max(1, self.report_interval_steps)
@@ -109,6 +135,16 @@ class ReportingCallbackBridge(TrainingCallback):
             if self.report_gpu_metrics:
                 self._collect_gpu_metrics(state)
                 self.influxdb_writer.write_gpu_metrics(state)
+
+            step_delta = max(1, state.global_step - self._last_report_step)
+            elapsed_delta = max(0.0, state.elapsed_seconds - self._last_report_elapsed)
+            if elapsed_delta > 0:
+                self.influxdb_writer.write_communication_metrics(
+                    self.task_code,
+                    {"latency_ms": elapsed_delta / step_delta * 1000},
+                )
+            self._last_report_step = state.global_step
+            self._last_report_elapsed = state.elapsed_seconds
 
         if self.postgres_updater:
             self.postgres_updater.update_progress(

@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     INFLUXDB_TOKEN: str = "change-this-influxdb-token"
     INFLUXDB_ORG: str = "llmt"
     INFLUXDB_BUCKET: str = "training_metrics"
+    INFLUXDB_TIMEOUT_MS: int = 3000
 
     MINIO_ENDPOINT: str = "localhost:9000"
     MINIO_ACCESS_KEY: str = "minioadmin"
