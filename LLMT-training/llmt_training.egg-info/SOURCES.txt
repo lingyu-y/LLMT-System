@@ -13,6 +13,7 @@ core/base_dataset.py
 core/base_model.py
 core/base_trainer.py
 core/callbacks.py
+core/simple_tokenizer.py
 core/state.py
 data/__init__.py
 data/data_utils.py
@@ -50,6 +51,7 @@ reporting/postgres_status.py
 tests/test_config.py
 tests/test_core.py
 tests/test_data.py
+tests/test_training_flow.py
 trainers/__init__.py
 trainers/deepspeed_trainer.py
 trainers/factory.py
