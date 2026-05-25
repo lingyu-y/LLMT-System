@@ -79,7 +79,7 @@ def _count_gpu_processes(gpu_index: int) -> int:
 @router.get("/gpu/status")
 def get_gpu_status():
     gpu_list = _query_gpus()
-    total_processes = sum(_count_gpu_processes(g["index"]) for g in gpu_list)
+    total_processes = _count_gpu_processes(0)
 
     if not gpu_list:
         return success_response({
