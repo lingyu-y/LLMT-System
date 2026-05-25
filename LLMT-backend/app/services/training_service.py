@@ -334,7 +334,17 @@ def resume_task(db: Session, task_id: int) -> TrainingTaskOut | None:
 def scale_task(
     db: Session, task_id: int, body: ScaleTaskRequest,
 ) -> TrainingTaskOut | None:
-    """Scale GPU count / parallel strategy for a running or paused task."""
+    """Scale GPU count / parallel strategy for a running or paused task.
+
+    For **paused** tasks the config is updated in-place and will be picked
+    up on the next resume.
+
+    For **running** tasks we must restart the worker so the new config takes
+    effect.  The handler sets status to ``pausing`` — the training loop's
+    ``_CancellationCheckCallback`` will detect this, save a checkpoint, and
+    transition to ``paused``.  A background thread then resumes the task
+    with the updated config.
+    """
     task = repo.get_by_id(db, task_id)
     if task is None or task.status not in ("running", "paused"):
         return None
@@ -344,8 +354,16 @@ def scale_task(
     if body.parallel_strategy:
         task.parallel_strategy = body.parallel_strategy
     task.config_json = cfg
-    db.commit()
-    db.refresh(task)
+
+    if task.status == "running":
+        task.status = "pausing"
+        db.commit()
+        db.refresh(task)
+        _auto_resume_after_pause(task.task_code, task.id)
+    else:
+        db.commit()
+        db.refresh(task)
+
     return _to_task_out(task)
 
 
@@ -858,5 +876,47 @@ def _run_task_in_background(task_code: str, task_id: int) -> None:
     t = threading.Thread(target=_worker, daemon=True, name=f"training-{task_code}")
     t.start()
     logger.info("Started background thread for training task %s", task_code)
+
+
+def _auto_resume_after_pause(task_code: str, task_id: int, poll_seconds: float = 2.0,
+                             timeout_seconds: float = 120.0) -> None:
+    """Poll DB until a running task reaches 'paused', then resume it.
+
+    Used by ``scale_task`` so that the new GPU / parallel-strategy config
+    takes effect without manual intervention.
+    """
+    import threading
+    import time
+
+    def _poller():
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            try:
+                from app.core.database import SessionLocal
+                db = SessionLocal()
+                try:
+                    task = repo.get_by_id(db, task_id)
+                    if task is None:
+                        logger.warning("scale auto-resume: task %d not found", task_id)
+                        return
+                    if task.status == "paused":
+                        logger.info("scale auto-resume: task %s paused, starting resume", task_code)
+                        db.close()
+                        _run_task_in_background(task_code, task_id)
+                        return
+                    if task.status in ("failed", "cancelled", "completed"):
+                        logger.warning("scale auto-resume: task %s reached terminal status %s, aborting",
+                                       task_code, task.status)
+                        return
+                finally:
+                    db.close()
+            except Exception as exc:
+                logger.warning("scale auto-resume poll error: %s", exc)
+            time.sleep(poll_seconds)
+        logger.warning("scale auto-resume: timeout waiting for task %s to pause", task_code)
+
+    t = threading.Thread(target=_poller, daemon=True, name=f"scale-resume-{task_code}")
+    t.start()
+    logger.info("Started scale auto-resume watcher for task %s", task_code)
 
 

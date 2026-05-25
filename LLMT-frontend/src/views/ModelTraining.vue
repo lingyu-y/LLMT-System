@@ -323,7 +323,7 @@ const form = reactive({
   task_name: '',
   dataset_id: undefined as number | undefined,
   framework: 'pytorch' as 'pytorch' | 'deepspeed' | 'megatron',
-  parallel_strategy: 'zero2' as string,
+  parallel_strategy: 'ddp' as string,
   config: {
     model_type: 'gpt2', hidden_size: 384, num_layers: 6, num_gpus: 1,
     batch_size: 1, learning_rate: 2e-5,
@@ -338,7 +338,7 @@ const scaleSubmitting = ref(false)
 const canPause = (row: TrainingTaskListItem) => row.status === 'running'
 const canResume = (row: TrainingTaskListItem) => row.status === 'paused'
 const canScale = (row: TrainingTaskListItem) =>
-  row.status === 'running' || row.status === 'paused' || row.status === 'pausing'
+  row.status === 'running' || row.status === 'paused'
 
 const scaleGpuOptions = computed(() => {
   if (options.gpu_options.length > 0) return options.gpu_options.map(o => ({ value: Number(o.value), label: o.label }))
@@ -454,6 +454,12 @@ const resourceAdvice = computed(() => {
   const n = Number(gpuOptionValue.value)
   if (n <= 1) return '单卡适合小规模微调，建议使用 DDP。'
   return '当前资源满足混合并行训练，可在任务运行中发起扩缩容请求。'
+})
+
+// ── Align parallel_strategy with framework on change ──
+const strategyDefaults: Record<string, string> = { pytorch: 'ddp', deepspeed: 'zero2', megatron: 'tp' }
+watch(() => form.framework, (fw) => {
+  form.parallel_strategy = strategyDefaults[fw] ?? 'ddp'
 })
 
 // ── Auto-scroll logs ──
