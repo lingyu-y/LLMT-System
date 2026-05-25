@@ -24,34 +24,6 @@ from app.services import training_service
 
 router = APIRouter(prefix="/training", tags=["训练管理"])
 
-GPU_OPTIONS = [
-    {"value": "1", "label": "1 × A100"},
-    {"value": "2", "label": "2 × A100"},
-    {"value": "4", "label": "4 × A100"},
-    {"value": "8", "label": "8 × A100"},
-]
-
-FRAMEWORKS = [
-    {"value": "pytorch", "label": "PyTorch"},
-    {"value": "deepspeed", "label": "DeepSpeed"},
-    {"value": "megatron", "label": "Megatron-LM"},
-]
-
-PARALLEL_STRATEGIES = [
-    {"value": "ddp", "label": "分布式数据并行 (DDP)"},
-    {"value": "zero1", "label": "ZeRO Stage 1"},
-    {"value": "zero2", "label": "ZeRO Stage 2"},
-    {"value": "zero3", "label": "ZeRO Stage 3"},
-    {"value": "zero3_offload", "label": "ZeRO Stage 3 Offload"},
-    {"value": "tp", "label": "张量并行 (TP)"},
-    {"value": "pp", "label": "流水线并行 (PP)"},
-    {"value": "3d", "label": "3D 混合并行"},
-]
-
-
-def _task_out(task: TrainingTask) -> dict:
-    return TrainingTaskOut.model_validate(task).model_dump()
-
 
 def _get_task_or_404(db: Session, task_id: int) -> TrainingTask:
     task = training_repository.get_by_id(db, task_id)
@@ -62,22 +34,8 @@ def _get_task_or_404(db: Session, task_id: int) -> TrainingTask:
 
 @router.get("/options")
 def get_training_options(db: Session = Depends(get_db)):
-    models = model_repository.get_models(db, page=1, page_size=1000)[0]
-    datasets = db.query(Dataset).order_by(Dataset.id).all()
-
-    return success_response({
-        "models": [
-            {"value": model.model_code, "label": f"{model.model_name} ({model.version})"}
-            for model in models
-        ],
-        "datasets": [
-            {"value": dataset.id, "label": f"{dataset.name} ({dataset.data_type}, {dataset.version})"}
-            for dataset in datasets
-        ],
-        "frameworks": FRAMEWORKS,
-        "gpu_options": GPU_OPTIONS,
-        "parallel_strategies": PARALLEL_STRATEGIES,
-    })
+    """Get available options for training configuration."""
+    return success_response(training_service.get_options(db))
 
 
 @router.post("/privacy-config")
@@ -327,20 +285,6 @@ def get_training_logs(
     """Get training logs for a task."""
     result = training_service.get_logs(db, task_id, level=level, keyword=keyword, lines=lines)
     return success_response(result)
-
-
-# ---------------------------------------------------------------------------
-# Options
-# ---------------------------------------------------------------------------
-
-@router.get("/options")
-def get_training_options(
-    db: Session = Depends(get_db),
-    _user=Depends(get_current_user),
-):
-    """Get available options for training configuration."""
-    options = training_service.get_options(db)
-    return success_response(options)
 
 
 # ---------------------------------------------------------------------------

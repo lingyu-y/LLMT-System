@@ -436,9 +436,6 @@ def run_inference(
     # Tokenize
     encoding = tokenizer(text, return_tensors="pt")
     input_ids = encoding["input_ids"].to(device)
-    attention_mask = encoding.get("attention_mask")
-    if attention_mask is not None:
-        attention_mask = attention_mask.to(device)
 
     # Safety: clamp token IDs to the model's actual embedding size
     # Try standard HuggingFace API first, then custom model attribute
@@ -455,12 +452,11 @@ def run_inference(
         )
         input_ids = input_ids.clamp(0, vocab_size - 1)
 
-    # Generate
+    # Generate (no attention_mask needed — the model's causal mask handles it)
     with torch.no_grad():
         generated_ids = _generate(
             model,
             input_ids,
-            attention_mask=attention_mask,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             top_p=top_p,
@@ -482,14 +478,18 @@ def run_inference(
 def _generate(
     model: torch.nn.Module,
     input_ids: torch.Tensor,
-    attention_mask: torch.Tensor | None,
     max_new_tokens: int,
     temperature: float,
     top_p: float,
     top_k: int,
     pad_token_id: int,
 ) -> torch.Tensor:
-    """Simple autoregressive generation loop."""
+    """Simple autoregressive generation loop.
+
+    attention_mask is deliberately NOT passed — the model's built-in causal
+    (triangular) mask handles autoregressive generation. Passing a fixed-length
+    attention_mask would mismatch the growing sequence length on every step.
+    """
     generated = input_ids.clone()
 
     # Get vocab size for safety clamping inside the loop
@@ -502,11 +502,7 @@ def _generate(
         # Safety: clamp before every forward pass
         generated = generated.clamp(0, _vocab_size - 1)
 
-        # Truncate to max model context length if needed
-        seq_len = generated.shape[1]
-        pos_ids = torch.arange(0, seq_len, device=generated.device).unsqueeze(0)
-
-        outputs = model(input_ids=generated, attention_mask=attention_mask)
+        outputs = model(input_ids=generated)
 
         logits = outputs.logits[:, -1, :]  # last token
 

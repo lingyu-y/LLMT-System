@@ -294,7 +294,33 @@ class DeepSpeedTrainer(BaseTrainer):
             self.callbacks.on_error(self.state, error=e)
 
         self.callbacks.on_train_end(self.state)
+        # Free GPU memory so subsequent runs or resume don't OOM
+        self._cleanup_gpu()
         return self.state
+
+    def _cleanup_gpu(self):
+        """Release GPU memory held by the DeepSpeed engine and model."""
+        if self._ds_engine is not None:
+            try:
+                self._ds_engine.empty_partition_cache()
+            except Exception:
+                pass
+            self._ds_engine = None
+        self.model = None
+        self.train_dataloader = None
+        self.eval_dataloader = None
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            # Release the CUDA memory pool to give memory back to the OS
+            try:
+                torch.cuda.reset_peak_memory_stats()
+                if hasattr(torch.cuda, 'memory') and hasattr(torch.cuda.memory, 'caching_allocator_delete'):
+                    pass  # API not stable, worst case nothing happens
+            except Exception:
+                pass
 
     def evaluate(self) -> dict[str, float]:
         """Run evaluation with DeepSpeed engine."""

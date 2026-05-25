@@ -25,6 +25,109 @@ from app.schemas.training import (
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
+# ---------------------------------------------------------------------------
+# GPU detection (lazy, cached – only queries hardware once)
+# ---------------------------------------------------------------------------
+
+_gpu_name_cache: str | None = None
+
+
+def get_gpu_name() -> str:
+    """Detect the real GPU model name from the local machine.
+
+    Tries ``torch.cuda.get_device_name()`` first, falls back to
+    ``nvidia-smi``, and returns ``"GPU"`` when nothing is available.
+    """
+    global _gpu_name_cache
+    if _gpu_name_cache is not None:
+        return _gpu_name_cache
+
+    # 1. PyTorch with CUDA (most reliable)
+    try:
+        import torch
+        if torch.cuda.is_available():
+            name = torch.cuda.get_device_name(0)
+            if name:
+                # Shorten common long names for display
+                _gpu_name_cache = _shorten_gpu_name(name)
+                return _gpu_name_cache
+    except Exception:
+        pass
+
+    # 2. nvidia-smi CLI fallback
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            name = result.stdout.strip().split("\n")[0].strip()
+            _gpu_name_cache = _shorten_gpu_name(name)
+            return _gpu_name_cache
+    except Exception:
+        pass
+
+    _gpu_name_cache = "GPU"
+    return _gpu_name_cache
+
+
+def _shorten_gpu_name(name: str) -> str:
+    """Keep the most recognizable part of the GPU name for display."""
+    # Remove common vendor prefixes and excessive detail
+    for prefix in ("NVIDIA ", "nvidia "):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+    # Keep it reasonably short
+    if len(name) > 40:
+        # e.g. "Tesla V100-SXM2-32GB" -> "Tesla V100"
+        parts = name.split("-")
+        name = parts[0] if len(parts) > 1 else name[:40]
+    return name
+
+
+_gpu_count_cache: int | None = None
+
+
+def get_gpu_count() -> int:
+    """Detect the number of GPUs available on the local machine.
+
+    Tries ``torch.cuda.device_count()`` first, falls back to counting
+    lines from ``nvidia-smi``, and returns ``1`` when nothing is available.
+    """
+    global _gpu_count_cache
+    if _gpu_count_cache is not None:
+        return _gpu_count_cache
+
+    # 1. PyTorch with CUDA
+    try:
+        import torch
+        if torch.cuda.is_available():
+            count = torch.cuda.device_count()
+            if count > 0:
+                _gpu_count_cache = count
+                return _gpu_count_cache
+    except Exception:
+        pass
+
+    # 2. nvidia-smi fallback
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            count = len([l for l in result.stdout.strip().split("\n") if l.strip()])
+            if count > 0:
+                _gpu_count_cache = count
+                return _gpu_count_cache
+    except Exception:
+        pass
+
+    _gpu_count_cache = 1
+    return _gpu_count_cache
+
 
 # ---------------------------------------------------------------------------
 # CRUD helpers
@@ -145,10 +248,12 @@ def delete_task(db: Session, task_id: int) -> bool:
         task.error_message = "任务已被删除"
         db.flush()
 
-    # 2. Try Celery revoke
+    # 2. Try Celery revoke with the real Celery task ID
     try:
         from app.core.celery_app import celery_app
-        celery_app.control.revoke(task_code, terminate=True)
+        celery_id = task.celery_task_id
+        if celery_id:
+            celery_app.control.revoke(celery_id, terminate=True)
     except Exception:
         pass
 
@@ -229,7 +334,17 @@ def resume_task(db: Session, task_id: int) -> TrainingTaskOut | None:
 def scale_task(
     db: Session, task_id: int, body: ScaleTaskRequest,
 ) -> TrainingTaskOut | None:
-    """Scale GPU count / parallel strategy for a running or paused task."""
+    """Scale GPU count / parallel strategy for a running or paused task.
+
+    For **paused** tasks the config is updated in-place and will be picked
+    up on the next resume.
+
+    For **running** tasks we must restart the worker so the new config takes
+    effect.  The handler sets status to ``pausing`` — the training loop's
+    ``_CancellationCheckCallback`` will detect this, save a checkpoint, and
+    transition to ``paused``.  A background thread then resumes the task
+    with the updated config.
+    """
     task = repo.get_by_id(db, task_id)
     if task is None or task.status not in ("running", "paused"):
         return None
@@ -239,8 +354,16 @@ def scale_task(
     if body.parallel_strategy:
         task.parallel_strategy = body.parallel_strategy
     task.config_json = cfg
-    db.commit()
-    db.refresh(task)
+
+    if task.status == "running":
+        task.status = "pausing"
+        db.commit()
+        db.refresh(task)
+        _auto_resume_after_pause(task.task_code, task.id)
+    else:
+        db.commit()
+        db.refresh(task)
+
     return _to_task_out(task)
 
 
@@ -377,11 +500,11 @@ def get_options(db: Session) -> dict[str, Any]:
         {"value": "megatron", "label": "Megatron-LM"},
     ]
 
+    gpu_name = get_gpu_name()
+    local_count = max(get_gpu_count(), 1)
     gpu_options = [
-        {"value": "1", "label": "1 × A100"},
-        {"value": "2", "label": "2 × A100"},
-        {"value": "4", "label": "4 × A100"},
-        {"value": "8", "label": "8 × A100"},
+        {"value": str(n), "label": f"{n} × {gpu_name}"}
+        for n in range(1, local_count + 1)
     ]
 
     parallel_strategies = [
@@ -637,48 +760,35 @@ def _to_task_out(task: TrainingTask) -> TrainingTaskOut:
     return TrainingTaskOut.model_validate(task)
 
 
-def _extract_max_steps_from_config(cfg: dict) -> int | None:
-    """Extract max_steps from either nested TrainingConfig or flat config."""
+def _extract_total_steps(cfg: dict) -> int | None:
+    """Extract total_steps from config_json (set at training start)."""
+    total = cfg.get("_total_steps")
+    if total and int(total) > 0:
+        return int(total)
+    # Fallback: use max_steps if explicitly configured
     hp = cfg.get("hyperparams", {})
     if isinstance(hp, dict) and hp.get("max_steps"):
-        return hp["max_steps"]
+        return int(hp["max_steps"])
     flat = cfg.get("max_steps")
     if flat:
-        return flat
-    # Fallback: estimate from max_epochs * approximate steps per epoch
+        return int(flat)
     return None
 
 
 def _to_list_out(task: TrainingTask) -> TrainingTaskListOut:
     cfg = task.config_json or {}
-    hp = cfg.get("hyperparams", {})
-    max_steps = hp.get("max_steps") or _extract_max_steps_from_config(cfg)
-    max_epoch = task.max_epoch or hp.get("max_epochs", 10)
 
     if task.status in ("completed",):
         progress = 100
-    elif max_steps and max_steps > 0:
-        # Step-limited training: progress driven by step count
-        progress = min(round(task.current_step / max_steps * 100), 100)
-    elif max_epoch and max_epoch > 0:
-        # Epoch-limited training: progress driven by epoch primarily,
-        # with fine-grained step contribution estimated from saved state
-        epoch_progress = min(task.current_epoch, max_epoch) / max_epoch
-        interval_steps = max(1, hp.get("save_interval", 500))
-        # estimate steps per epoch from stride of current_step vs epoch
-        est_steps_per_epoch = max(
-            task.current_step // max(task.current_epoch, 1),
-            interval_steps * 5,  # floor estimate
-        )
-        if est_steps_per_epoch > 0 and task.current_epoch < max_epoch:
-            step_frac = (task.current_step % max(est_steps_per_epoch, 1)) / est_steps_per_epoch
-        else:
-            step_frac = 0.0
-        progress = min(round((epoch_progress + step_frac / max_epoch) * 100), 100)
     else:
-        progress = 0
+        total_steps = _extract_total_steps(cfg)
+        if total_steps and total_steps > 0:
+            progress = min(round(task.current_step / total_steps * 100), 100)
+        else:
+            progress = 0
+
     gpu_count = cfg.get("num_gpus", 1)
-    gpu_display = f"{gpu_count}x A100"
+    gpu_display = f"{gpu_count}x {get_gpu_name()}"
 
     return TrainingTaskListOut(
         id=task.id,
@@ -766,5 +876,47 @@ def _run_task_in_background(task_code: str, task_id: int) -> None:
     t = threading.Thread(target=_worker, daemon=True, name=f"training-{task_code}")
     t.start()
     logger.info("Started background thread for training task %s", task_code)
+
+
+def _auto_resume_after_pause(task_code: str, task_id: int, poll_seconds: float = 2.0,
+                             timeout_seconds: float = 120.0) -> None:
+    """Poll DB until a running task reaches 'paused', then resume it.
+
+    Used by ``scale_task`` so that the new GPU / parallel-strategy config
+    takes effect without manual intervention.
+    """
+    import threading
+    import time
+
+    def _poller():
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            try:
+                from app.core.database import SessionLocal
+                db = SessionLocal()
+                try:
+                    task = repo.get_by_id(db, task_id)
+                    if task is None:
+                        logger.warning("scale auto-resume: task %d not found", task_id)
+                        return
+                    if task.status == "paused":
+                        logger.info("scale auto-resume: task %s paused, starting resume", task_code)
+                        db.close()
+                        _run_task_in_background(task_code, task_id)
+                        return
+                    if task.status in ("failed", "cancelled", "completed"):
+                        logger.warning("scale auto-resume: task %s reached terminal status %s, aborting",
+                                       task_code, task.status)
+                        return
+                finally:
+                    db.close()
+            except Exception as exc:
+                logger.warning("scale auto-resume poll error: %s", exc)
+            time.sleep(poll_seconds)
+        logger.warning("scale auto-resume: timeout waiting for task %s to pause", task_code)
+
+    t = threading.Thread(target=_poller, daemon=True, name=f"scale-resume-{task_code}")
+    t.start()
+    logger.info("Started scale auto-resume watcher for task %s", task_code)
 
 

@@ -257,6 +257,18 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
             flush=True,
         )
 
+        # Compute and store total training steps for progress bar
+        steps_per_epoch = len(train_dataloader)
+        max_steps_cfg = config_dict.get("hyperparams", {}).get("max_steps")
+        max_epochs_cfg = config_dict.get("hyperparams", {}).get("max_epochs", 10)
+        total_steps = max_steps_cfg if (max_steps_cfg and max_steps_cfg > 0) else max_epochs_cfg * steps_per_epoch
+        _store_total_steps(task_code, total_steps, steps_per_epoch)
+        print(
+            f"[TrainingTask] total_steps={total_steps} (steps_per_epoch={steps_per_epoch}, "
+            f"max_epochs={max_epochs_cfg}, max_steps={max_steps_cfg})",
+            flush=True,
+        )
+
         # Build loss function from model provider
         loss_fn = model_provider.get_loss_fn(config_dict.get("model", {}))
 
@@ -304,13 +316,17 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
         if resume_step > 0:
             ckpt_candidates = [
                 resume_ckpt,
-                # Pause callback saves to these fixed paths
-                "/tmp/llmt_checkpoints/checkpoint.pt",
+                # New format: ckpt/ subdirectory (matching DeepSpeed structure)
+                "/tmp/llmt_checkpoints/ckpt",
                 "/tmp/llmt_checkpoints/ckpt/checkpoint.pt",
+                # Old format: single .pt file
+                "/tmp/llmt_checkpoints/checkpoint.pt",
+                "./checkpoints/ckpt",
+                "./checkpoints/ckpt/checkpoint.pt",
                 "./checkpoints/checkpoint.pt",
             ]
             for ckpt in ckpt_candidates:
-                if ckpt and os.path.isfile(ckpt):
+                if ckpt and os.path.exists(ckpt):
                     try:
                         trainer.load_checkpoint(ckpt)
                         print(f"[TrainingTask] resumed from checkpoint {ckpt}", flush=True)
@@ -534,6 +550,8 @@ class _CancellationCheckCallback:
             with _S(_engine) as db:
                 row = db.query(_TT).filter(_TT.task_code == self._task_code).first()
                 if row is None:
+                    # DB record was deleted — stop training
+                    state.status = "cancelled"
                     return
                 if row.status == "cancelled":
                     state.status = "cancelled"
@@ -784,6 +802,7 @@ def _build_training_config(
     }
     checkpoint_keys = {
         "save_interval", "eval_interval", "max_checkpoints", "upload_to_minio",
+        "checkpoint_dir",
     }
 
     for key, value in config_json.items():
@@ -805,6 +824,38 @@ def _build_training_config(
             config["megatron_overrides"] = value
 
     return config
+
+
+def _store_total_steps(task_code: str, total_steps: int, steps_per_epoch: int) -> None:
+    """Store total_steps and steps_per_epoch in the task's config_json for progress bar."""
+    import json as _json
+    try:
+        from sqlalchemy import create_engine as _ce, text as _txt
+        from sqlalchemy.orm import Session as _S
+        _engine = _ce(settings.postgres_database_url)
+        with _S(_engine) as db:
+            row = db.execute(
+                _txt("SELECT config_json FROM training_tasks WHERE task_code = :tc"),
+                {"tc": task_code},
+            ).fetchone()
+            if row is None:
+                return
+            raw = row[0]
+            if isinstance(raw, str):
+                cfg = _json.loads(raw) if raw else {}
+            elif isinstance(raw, dict):
+                cfg = dict(raw)
+            else:
+                cfg = {}
+            cfg["_total_steps"] = total_steps
+            cfg["_steps_per_epoch"] = steps_per_epoch
+            db.execute(
+                _txt("UPDATE training_tasks SET config_json = :cfg WHERE task_code = :tc"),
+                {"cfg": _json.dumps(cfg, ensure_ascii=False), "tc": task_code},
+            )
+            db.commit()
+    except Exception:
+        pass
 
 
 def _update_task_status(

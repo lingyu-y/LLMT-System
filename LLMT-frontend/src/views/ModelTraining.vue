@@ -58,6 +58,18 @@
               <el-collapse-item title="训练超参数（点击展开）" name="hp">
                 <el-form label-position="top">
                   <el-row :gutter="12">
+                    <el-col :span="12">
+                      <el-form-item label="Hidden Size（768=标准, 384=轻量）">
+                        <el-input-number v-model="form.config.hidden_size" :min="128" :max="2048" :step="64" style="width:100%" />
+                      </el-form-item>
+                    </el-col>
+                    <el-col :span="12">
+                      <el-form-item label="Num Layers（12=标准, 6=轻量）">
+                        <el-input-number v-model="form.config.num_layers" :min="2" :max="48" style="width:100%" />
+                      </el-form-item>
+                    </el-col>
+                  </el-row>
+                  <el-row :gutter="12">
                     <el-col :span="8">
                       <el-form-item label="Batch Size">
                         <el-input-number v-model="form.config.batch_size" :min="1" :max="256" style="width:100%" />
@@ -166,10 +178,11 @@
                 </div>
               </template>
             </el-table-column>
-            <el-table-column label="操作" width="280" fixed="right">
+            <el-table-column label="操作" min-width="380" fixed="right">
               <template #default="{ row }">
-                <el-button size="small" :disabled="row.status !== 'running'" :loading="row.status === 'pausing'" @click.stop="handlePause(row)">暂停</el-button>
-                <el-button size="small" :disabled="row.status !== 'paused'" :loading="row.status === 'resuming'" @click.stop="handleResume(row)">恢复</el-button>
+                <el-button size="small" :disabled="!canPause(row)" :loading="row.status === 'pausing'" @click.stop="handlePause(row)">暂停</el-button>
+                <el-button size="small" :disabled="!canResume(row)" :loading="row.status === 'resuming'" @click.stop="handleResume(row)">恢复</el-button>
+                <el-button size="small" :disabled="!canScale(row)" @click.stop="openScaleDialog(row)">扩缩容</el-button>
                 <el-button size="small" :disabled="row.status !== 'completed'" @click.stop="handlePromote(row)">转为模型</el-button>
                 <el-popconfirm title="确定删除此训练任务？" @confirm="handleDeleteTask(row)">
                   <template #reference>
@@ -220,23 +233,24 @@
         <el-form-item label="任务">
           <el-input :model-value="scaleTarget ? `${scaleTarget.task_code} / ${scaleTarget.task_name}` : ''" disabled />
         </el-form-item>
+        <el-form-item label="当前配置">
+          <span class="scale-current">{{ scaleCurrentCfg }}</span>
+        </el-form-item>
         <el-form-item label="目标 GPU 数量">
-          <el-select v-model="scaleForm.gpu_count" class="full">
-            <el-option label="1 卡" :value="1" />
-            <el-option label="2 卡" :value="2" />
-            <el-option label="4 卡" :value="4" />
-            <el-option label="8 卡" :value="8" />
+          <el-select v-model="scaleForm.gpu_count" class="full" @change="onScaleGpuChange">
+            <el-option v-for="item in scaleGpuOptions" :key="item.value" :label="item.label" :value="item.value" />
           </el-select>
         </el-form-item>
-        <el-form-item label="目标并行策略（可选）">
-          <el-select v-model="scaleForm.parallel_strategy" class="full" clearable placeholder="不修改">
-            <el-option v-for="item in options.parallel_strategies" :key="item.value" :label="item.label" :value="item.value" />
+        <el-form-item label="目标并行策略">
+          <el-select v-model="scaleForm.parallel_strategy" class="full" placeholder="选择策略">
+            <el-option v-for="item in scaleStrategies" :key="item.value" :label="item.label" :value="item.value" />
           </el-select>
         </el-form-item>
+        <el-alert v-if="scaleWarning" :title="scaleWarning" type="warning" show-icon :closable="false" style="margin-top:8px" />
       </el-form>
       <template #footer>
         <el-button @click="scaleDialogVisible = false">取消</el-button>
-        <el-button type="primary" @click="submitScale">提交扩缩容</el-button>
+        <el-button type="primary" :disabled="!canSubmitScale" :loading="scaleSubmitting" @click="submitScale">确认扩缩容并重启</el-button>
       </template>
     </el-dialog>
   </div>
@@ -252,6 +266,7 @@ import {
   deleteTrainingTask,
   pauseTrainingTask,
   resumeTrainingTask,
+  scaleTrainingTask,
   validateTrainingConfig,
   promoteTrainingTask,
   fetchTrainingTasks,
@@ -290,8 +305,8 @@ const options = reactive<TrainingOptions>({
     { value: 'megatron', label: 'Megatron-LM' },
   ],
   gpu_options: [
-    { value: '1', label: '1 × A100' }, { value: '2', label: '2 × A100' },
-    { value: '4', label: '4 × A100' }, { value: '8', label: '8 × A100' },
+    { value: '1', label: '1 × GPU' }, { value: '2', label: '2 × GPU' },
+    { value: '4', label: '4 × GPU' }, { value: '8', label: '8 × GPU' },
   ],
   parallel_strategies: [
     { value: 'ddp', label: 'DDP' }, { value: 'zero1', label: 'ZeRO Stage 1' },
@@ -302,20 +317,108 @@ const options = reactive<TrainingOptions>({
   ],
 })
 
-const gpuOptionValue = ref('4')
+const gpuOptionValue = ref('1')
 
 const form = reactive({
   task_name: '',
   dataset_id: undefined as number | undefined,
-  framework: 'deepspeed' as 'pytorch' | 'deepspeed' | 'megatron',
-  parallel_strategy: 'zero2' as string,
+  framework: 'pytorch' as 'pytorch' | 'deepspeed' | 'megatron',
+  parallel_strategy: 'ddp' as string,
   config: {
-    model_type: 'gpt2', num_gpus: 1, batch_size: 4, learning_rate: 2e-5,
-    max_epochs: 10, max_steps: 0, seq_length: 256, precision: 'fp16' as const,
+    model_type: 'gpt2', hidden_size: 384, num_layers: 6, num_gpus: 1,
+    batch_size: 1, learning_rate: 2e-5,
+    max_epochs: 10, max_steps: 0, seq_length: 128, precision: 'fp16' as const,
   },
 })
 
-const scaleForm = reactive({ gpu_count: 1, parallel_strategy: undefined as string | undefined })
+const scaleForm = reactive({ gpu_count: 1, parallel_strategy: 'ddp' as string })
+const scaleSubmitting = ref(false)
+
+// ── Scale helpers ──
+const canPause = (row: TrainingTaskListItem) => row.status === 'running'
+const canResume = (row: TrainingTaskListItem) => row.status === 'paused'
+const canScale = (row: TrainingTaskListItem) =>
+  row.status === 'running' || row.status === 'paused'
+
+const scaleGpuOptions = computed(() => {
+  if (options.gpu_options.length > 0) return options.gpu_options.map(o => ({ value: Number(o.value), label: o.label }))
+  return [1, 2, 4, 8].map(n => ({ value: n, label: `${n} × GPU` }))
+})
+
+const scaleStrategies = computed(() => {
+  const n = scaleForm.gpu_count
+  if (n <= 1) {
+    return [{ value: 'ddp', label: 'DDP（单卡）' }]
+  }
+  if (n === 2) {
+    return [
+      { value: 'ddp', label: 'DDP' },
+      { value: 'zero1', label: 'ZeRO Stage 1' },
+      { value: 'zero2', label: 'ZeRO Stage 2' },
+    ]
+  }
+  // 4+ GPUs
+  return options.parallel_strategies
+})
+
+const scaleWarning = computed(() => {
+  if (scaleForm.gpu_count <= 1 && scaleForm.parallel_strategy !== 'ddp') {
+    return '单卡只能使用 DDP 策略'
+  }
+  if (scaleForm.gpu_count === 2 && ['zero3', 'zero3_offload', 'tp', 'pp', '3d'].includes(scaleForm.parallel_strategy)) {
+    return '2 卡不建议使用该策略，可能内存不足'
+  }
+  return ''
+})
+
+const scaleCurrentCfg = computed(() => {
+  if (!scaleTarget.value) return ''
+  const cfg = scaleTarget.value.config_json || {} as Record<string, unknown>
+  const gpu = cfg.num_gpus ?? 1
+  return `${gpu} GPU · ${scaleTarget.value.parallel_strategy || 'ddp'}`
+})
+
+const canSubmitScale = computed(() => {
+  if (!scaleTarget.value) return false
+  const curGpu = (scaleTarget.value.config_json as Record<string, unknown> | null)?.num_gpus ?? 1
+  const curStrat = scaleTarget.value.parallel_strategy || 'ddp'
+  // At least one thing changed
+  return scaleForm.gpu_count !== curGpu || scaleForm.parallel_strategy !== curStrat
+})
+
+const openScaleDialog = (row: TrainingTaskListItem) => {
+  scaleTarget.value = row
+  const cfg = (row.config_json || {}) as Record<string, unknown>
+  scaleForm.gpu_count = (cfg.num_gpus as number) || Number((row.gpu_display || '1').charAt(0)) || 1
+  scaleForm.parallel_strategy = row.parallel_strategy || 'ddp'
+  scaleDialogVisible.value = true
+}
+
+const onScaleGpuChange = () => {
+  // Auto-pick a valid strategy when GPU count changes
+  const valid = scaleStrategies.value.map(s => s.value)
+  if (!valid.includes(scaleForm.parallel_strategy)) {
+    scaleForm.parallel_strategy = valid[0]!
+  }
+}
+
+const submitScale = async () => {
+  if (!scaleTarget.value || !canSubmitScale.value) return
+  scaleSubmitting.value = true
+  try {
+    await scaleTrainingTask(scaleTarget.value.id, {
+      gpu_count: scaleForm.gpu_count,
+      parallel_strategy: scaleForm.parallel_strategy,
+    })
+    ElMessage.success(`已提交 ${scaleTarget.value.task_code} 的扩缩容请求，任务将暂停并重启`)
+    scaleDialogVisible.value = false
+    await loadTasks()
+  } catch (e: unknown) {
+    ElMessage.error((e as Error).message || '扩缩容失败')
+  } finally {
+    scaleSubmitting.value = false
+  }
+}
 
 // ── Computed ──
 const canSubmit = computed(() => form.task_name && form.dataset_id)
@@ -353,6 +456,12 @@ const resourceAdvice = computed(() => {
   return '当前资源满足混合并行训练，可在任务运行中发起扩缩容请求。'
 })
 
+// ── Align parallel_strategy with framework on change ──
+const strategyDefaults: Record<string, string> = { pytorch: 'ddp', deepspeed: 'zero2', megatron: 'tp' }
+watch(() => form.framework, (fw) => {
+  form.parallel_strategy = strategyDefaults[fw] ?? 'ddp'
+})
+
 // ── Auto-scroll logs ──
 watch(filteredLogs, () => {
   if (logAutoScroll.value) {
@@ -366,12 +475,12 @@ watch(filteredLogs, () => {
 const loadOptions = async () => {
   try {
     const res = await fetchTrainingOptions()
-    if (res.data) {
-      options.models = res.data.models ?? []
-      options.datasets = res.data.datasets ?? []
-      if (res.data.frameworks?.length) options.frameworks = res.data.frameworks
-      if (res.data.gpu_options?.length) options.gpu_options = res.data.gpu_options
-      if (res.data.parallel_strategies?.length) options.parallel_strategies = res.data.parallel_strategies
+    if (res) {
+      if (res.models?.length) options.models = res.models
+      if (res.datasets?.length) options.datasets = res.datasets
+      if (res.frameworks?.length) options.frameworks = res.frameworks
+      if (res.gpu_options?.length) options.gpu_options = res.gpu_options
+      if (res.parallel_strategies?.length) options.parallel_strategies = res.parallel_strategies
     }
   } catch { /* use defaults */ }
 }
@@ -384,7 +493,7 @@ const loadTasks = async () => {
 }
 
 const loadStats = async () => {
-  try { const res = await fetchTrainingStats(); statsCounts.value = (res.data ?? {}) as Record<string, number> }
+  try { const res = await fetchTrainingStats(); statsCounts.value = (res ?? {}) as Record<string, number> }
   catch { /* ignore */ }
 }
 

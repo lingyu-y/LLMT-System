@@ -34,6 +34,9 @@ class PyTorchTrainer(BaseTrainer):
         self.loss_fn = loss_fn or nn.CrossEntropyLoss()
         self.device = self._get_device()
         self._is_distributed = dist.is_initialized()
+        self._optimizer: torch.optim.Optimizer | None = None
+        self._scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
+        self._scaler: torch.cuda.amp.GradScaler | None = None
 
     @staticmethod
     def _get_device() -> torch.device:
@@ -132,6 +135,7 @@ class PyTorchTrainer(BaseTrainer):
 
         model = self._setup_model()
         optimizer = self._build_optimizer(model)
+        self._optimizer = optimizer
 
         hp = self.config.get("hyperparams", {})
         max_epochs = hp.get("max_epochs", 10)
@@ -142,11 +146,10 @@ class PyTorchTrainer(BaseTrainer):
 
         total_steps_estimate = max_steps or (max_epochs * len(self.train_dataloader))
         scheduler = self._build_scheduler(optimizer, total_steps_estimate)
+        self._scheduler = scheduler
 
         scaler = None
         if precision == "fp16" and self.device.type == "cuda":
-            # Create GradScaler in a way that works across torch versions:
-            # prefer torch.cuda.amp.GradScaler, fall back to torch.amp.GradScaler
             try:
                 from torch.cuda.amp import GradScaler as _GradScaler
                 scaler = _GradScaler()
@@ -155,6 +158,7 @@ class PyTorchTrainer(BaseTrainer):
                     scaler = torch.amp.GradScaler()
                 except Exception:
                     scaler = None
+        self._scaler = scaler
 
         start_time = time.time()
 
@@ -258,7 +262,23 @@ class PyTorchTrainer(BaseTrainer):
             self.callbacks.on_error(self.state, error=e)
 
         self.callbacks.on_train_end(self.state)
+        self._cleanup_gpu()
         return self.state
+
+    def _cleanup_gpu(self):
+        """Release GPU memory held by model, optimizer, and scaler."""
+        self.model = None
+        self.train_dataloader = None
+        self.eval_dataloader = None
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            try:
+                torch.cuda.reset_peak_memory_stats()
+            except Exception:
+                pass
 
     def evaluate(self) -> dict[str, float]:
         """Run evaluation loop."""
@@ -293,24 +313,68 @@ class PyTorchTrainer(BaseTrainer):
         return {"eval_loss": total_loss / max(total_steps, 1)}
 
     def save_checkpoint(self, path: str) -> str:
-        """Save model checkpoint — overwrites previous one."""
+        """Save checkpoint to a directory (matching DeepSpeed's structure).
+
+        Saves to ``path/ckpt/`` so that the MinIO upload callback can walk
+        the directory and upload all files inside.
+        """
         os.makedirs(path, exist_ok=True)
         model = self.model if not isinstance(self.model, DDP) else self.model.module
-        ckpt_path = os.path.join(path, "checkpoint.pt")
-        torch.save({
+        tag = "ckpt"
+        ckpt_path = os.path.join(path, tag)
+        if os.path.exists(ckpt_path):
+            import shutil
+            if os.path.isdir(ckpt_path):
+                shutil.rmtree(ckpt_path)
+            else:
+                os.remove(ckpt_path)
+        os.makedirs(ckpt_path, exist_ok=True)
+
+        checkpoint_data: dict[str, Any] = {
             "model_state_dict": model.state_dict(),
             "epoch": self.state.epoch,
             "global_step": self.state.global_step,
             "loss": self.state.loss,
-        }, ckpt_path)
+        }
+        if self._optimizer is not None:
+            checkpoint_data["optimizer_state_dict"] = self._optimizer.state_dict()
+        if self._scheduler is not None:
+            checkpoint_data["scheduler_state_dict"] = self._scheduler.state_dict()
+        if self._scaler is not None:
+            checkpoint_data["scaler_state_dict"] = self._scaler.state_dict()
+
+        torch.save(checkpoint_data, os.path.join(ckpt_path, "checkpoint.pt"))
         self.callbacks.on_checkpoint(self.state, checkpoint_path=ckpt_path)
         return ckpt_path
 
     def load_checkpoint(self, path: str) -> None:
-        """Load model checkpoint."""
+        """Load checkpoint from a file or directory.
+
+        Supports both the old single-file format (``path/checkpoint.pt``) and
+        the new directory format (``path/ckpt/checkpoint.pt``).
+        """
         model = self.model if not isinstance(self.model, DDP) else self.model.module
-        checkpoint = torch.load(path, map_location=self.device)
+
+        # Resolve the actual .pt file
+        if os.path.isdir(path):
+            ckpt_file = os.path.join(path, "checkpoint.pt")
+        elif path.endswith(".pt"):
+            ckpt_file = path
+        else:
+            ckpt_file = os.path.join(path, "checkpoint.pt")
+
+        if not os.path.isfile(ckpt_file):
+            raise FileNotFoundError(f"Checkpoint file not found: {ckpt_file}")
+
+        checkpoint = torch.load(ckpt_file, map_location=self.device, weights_only=False)
         model.load_state_dict(checkpoint["model_state_dict"])
         self.state.epoch = checkpoint.get("epoch", 0)
         self.state.global_step = checkpoint.get("global_step", 0)
         self.state.loss = checkpoint.get("loss", 0.0)
+
+        if self._optimizer is not None and "optimizer_state_dict" in checkpoint:
+            self._optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if self._scheduler is not None and "scheduler_state_dict" in checkpoint:
+            self._scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        if self._scaler is not None and "scaler_state_dict" in checkpoint:
+            self._scaler.load_state_dict(checkpoint["scaler_state_dict"])

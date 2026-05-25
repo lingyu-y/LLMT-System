@@ -1,4 +1,4 @@
-import { del, get, post, type PageResult } from './http'
+import { del, get, post, unwrap, type ApiMessage } from './http'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -159,11 +159,11 @@ export const fetchTrainingCheckpoints = (id: number) =>
 export const fetchTrainingLogs = (id: number, params?: Record<string, string | number>) =>
   get<{ message: string; data: { task_id: number; logs: TrainingLog[]; total: number } }>(`/training/tasks/${id}/logs`, params)
 
-export const fetchTrainingOptions = () =>
-  get<{ message: string; data: TrainingOptions }>('/training/options')
+export const fetchTrainingOptions = async () =>
+  unwrap(await get<ApiMessage<TrainingOptions>>('/training/options'))
 
-export const fetchTrainingStats = () =>
-  get<{ message: string; data: Record<string, number> }>('/training/stats')
+export const fetchTrainingStats = async () =>
+  unwrap(await get<ApiMessage<Record<string, number>>>('/training/stats'))
 
 export const validateTrainingConfig = (body: TrainingTaskCreate) =>
   post<{ message: string; data: ValidationResult }>('/training/validate-config', body)

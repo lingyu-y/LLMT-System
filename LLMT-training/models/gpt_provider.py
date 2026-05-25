@@ -79,12 +79,8 @@ class GPTModel(nn.Module):
             def forward(self, x, attn_mask=None, key_padding_mask=None):
                 residual = x
                 x = self.ln_1(x)
-                attn_output, _ = self.attn(
-                    x, x, x,
-                    attn_mask=attn_mask,
-                    key_padding_mask=key_padding_mask,
-                    need_weights=False,
-                )
+                attn_output, _ = self.attn(x, x, x, attn_mask=attn_mask,
+                                           key_padding_mask=key_padding_mask, need_weights=False)
                 x = residual + attn_output
                 residual = x
                 x = self.ln_2(x)
@@ -113,34 +109,21 @@ class GPTModel(nn.Module):
         hidden_states = self.wte(input_ids) + self.wpe(position_ids)
         hidden_states = self.drop(hidden_states)
 
-        # Always build a causal mask so the model cannot attend to future tokens.
-        # Use the hidden states dtype so the mask matches the model's running
-        # precision (fp16/bf16/fp32).
+        # Causal mask — always built so each position can only attend to itself and the past
         causal = torch.triu(
-            torch.ones(seq_len, seq_len, device=input_ids.device, dtype=torch.bool),
-            diagonal=1,
-        )
-        attn_mask = torch.zeros(
-            seq_len, seq_len, device=input_ids.device, dtype=hidden_states.dtype,
-        )
+            torch.ones(seq_len, seq_len, device=input_ids.device), diagonal=1
+        ).bool()
+        attn_mask = torch.zeros(seq_len, seq_len, device=input_ids.device, dtype=hidden_states.dtype)
         attn_mask = attn_mask.masked_fill(causal, float("-inf"))
 
-        # Convert pad attention_mask (1=valid, 0=pad) to key_padding_mask of
-        # the same type as attn_mask to avoid PyTorch deprecation warnings.
+        # Padding mask — exclude pad tokens (attention_mask == 0) from attention
         key_padding_mask = None
         if attention_mask is not None:
-            pad = ~attention_mask.bool()
-            key_padding_mask = torch.zeros(
-                bsz, seq_len, device=input_ids.device, dtype=hidden_states.dtype,
-            )
-            key_padding_mask = key_padding_mask.masked_fill(pad, float("-inf"))
+            key_padding_mask = ~attention_mask.bool()
 
         for block in self.h:
-            hidden_states = block(
-                hidden_states,
-                attn_mask=attn_mask,
-                key_padding_mask=key_padding_mask,
-            )
+            hidden_states = block(hidden_states, attn_mask=attn_mask,
+                                  key_padding_mask=key_padding_mask)
 
         hidden_states = self.ln_f(hidden_states)
 

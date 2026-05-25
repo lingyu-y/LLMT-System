@@ -45,10 +45,18 @@ def _extract_max_steps(config: dict) -> int | None:
 
 def _task_progress(task: TrainingTask) -> float:
     config = task.config_json or {}
+
+    # Prefer stored total_steps (set at training start for accurate step-based progress)
+    total_steps = config.get("_total_steps")
+    if total_steps and int(total_steps) > 0:
+        return min(task.current_step / int(total_steps) * 100, 100)
+
+    # Fallback: use max_steps from config
     max_steps = _extract_max_steps(config)
     if max_steps and max_steps > 0:
         return min(task.current_step / max_steps * 100, 100)
 
+    # Legacy fallback: epoch-based estimation
     max_epoch = task.max_epoch or 0
     if max_epoch > 0 and task.current_epoch > 0:
         return min(task.current_epoch / max_epoch * 100, 100)

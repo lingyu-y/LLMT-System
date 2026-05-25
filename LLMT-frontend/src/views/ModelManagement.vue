@@ -566,6 +566,9 @@ const downloadVersion = (version: string) => {
 
 const selectModel = async (model: ModelItem) => {
   selectedModel.value = model
+  prediction.value = undefined
+  usage.value = undefined
+  inferenceInput.value = '请对当前模型做一次测试推理'
   await Promise.all([loadVersions(model.id), loadModelOps(model.id)])
 }
 
