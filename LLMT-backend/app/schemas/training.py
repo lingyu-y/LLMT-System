@@ -72,6 +72,7 @@ class TrainingConfigDict(BaseModel):
     eval_interval: int = 100
     max_checkpoints: int = 2
     upload_to_minio: bool = True
+    checkpoint_dir: str = "/tmp/llmt_checkpoints"
 
     # Framework-specific overrides
     deepspeed_overrides: Optional[dict] = None

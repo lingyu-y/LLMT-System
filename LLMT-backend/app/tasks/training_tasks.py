@@ -316,13 +316,17 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
         if resume_step > 0:
             ckpt_candidates = [
                 resume_ckpt,
-                # Pause callback saves to these fixed paths
-                "/tmp/llmt_checkpoints/checkpoint.pt",
+                # New format: ckpt/ subdirectory (matching DeepSpeed structure)
+                "/tmp/llmt_checkpoints/ckpt",
                 "/tmp/llmt_checkpoints/ckpt/checkpoint.pt",
+                # Old format: single .pt file
+                "/tmp/llmt_checkpoints/checkpoint.pt",
+                "./checkpoints/ckpt",
+                "./checkpoints/ckpt/checkpoint.pt",
                 "./checkpoints/checkpoint.pt",
             ]
             for ckpt in ckpt_candidates:
-                if ckpt and os.path.isfile(ckpt):
+                if ckpt and os.path.exists(ckpt):
                     try:
                         trainer.load_checkpoint(ckpt)
                         print(f"[TrainingTask] resumed from checkpoint {ckpt}", flush=True)
@@ -798,6 +802,7 @@ def _build_training_config(
     }
     checkpoint_keys = {
         "save_interval", "eval_interval", "max_checkpoints", "upload_to_minio",
+        "checkpoint_dir",
     }
 
     for key, value in config_json.items():
