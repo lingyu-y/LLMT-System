@@ -180,7 +180,7 @@ def _resolve_dataset_paths(ds, config) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def _build_participant_from_db(
-    p, config, provider, tokenizer, db, shared_memory, model,
+    p, config, provider, tokenizer, db, shared_memory,
 ):
     """Build a FederatedParticipant from a DB FederatedParticipant row.
 
@@ -273,7 +273,7 @@ def _build_participant_from_db(
     return FederatedParticipant(
         config=config,
         participant_config=p_config,
-        model=model,
+        model=provider.get_model(config.get_model_config_dict()),
         train_dataloader=train_dataloader,
         loss_fn=provider.get_loss_fn(config.get_model_config_dict()),
         shared_memory=shared_memory,
@@ -336,7 +336,7 @@ def run_federated_task(self, task_code: str) -> dict:
         # Seed initial participants
         for p in task.participants:
             participant = _build_participant_from_db(
-                p, config, provider, tokenizer, db, coordinator.shared_memory, model,
+                p, config, provider, tokenizer, db, coordinator.shared_memory,
             )
             coordinator.register_participant(participant)
 
@@ -370,11 +370,7 @@ def run_federated_task(self, task_code: str) -> dict:
 
         def _persist_logs():
             """Write training logs to DB so frontend sees real-time progress."""
-            from sqlalchemy import text
-            db.execute(
-                text("UPDATE federated_tasks SET training_log_json = CAST(:log AS json) WHERE id = :id"),
-                {"log": json.dumps(coordinator._training_log, default=str), "id": task.id},
-            )
+            task.training_log_json = list(coordinator._training_log)
             db.commit()
 
         coordinator._on_log_updated = _persist_logs
@@ -733,7 +729,7 @@ def _sync_participants(
     for pid in active_db_ids - coord_ids:
         p_row = db_participants[pid]
         participant = _build_participant_from_db(
-            p_row, config, provider, tokenizer, db, coordinator.shared_memory, model,
+            p_row, config, provider, tokenizer, db, coordinator.shared_memory,
         )
         coordinator.add_participant_dynamic(participant)
 
