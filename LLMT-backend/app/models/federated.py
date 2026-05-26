@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, JSON, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, IdMixin, TimestampMixin
@@ -36,7 +36,7 @@ class FederatedTask(IdMixin, TimestampMixin, Base):
     convergence_threshold: Mapped[float] = mapped_column(Float, default=1e-4)
 
     # Privacy config
-    enable_dp: Mapped[bool] = mapped_column(Integer, default=1, nullable=False)
+    enable_dp: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     dp_epsilon: Mapped[float] = mapped_column(Float, default=8.0)
     dp_delta: Mapped[float] = mapped_column(Float, default=1e-5)
     dp_noise_multiplier: Mapped[float] = mapped_column(Float, default=1.1)

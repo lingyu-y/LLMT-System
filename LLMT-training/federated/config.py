@@ -15,7 +15,7 @@ class ParticipantConfig(BaseModel):
     weight: float = Field(default=1.0, ge=0.0, description="聚合权重")
     data_size: int = Field(default=0, ge=0, description="本地数据量")
     local_epochs: int = Field(default=1, ge=1, description="本地训练轮数")
-    local_batch_size: int = Field(default=32, ge=1, description="本地训练批次大小")
+    local_batch_size: int = Field(default=8, ge=1, description="本地训练批次大小")
     local_learning_rate: float = Field(default=2e-5, gt=0, description="本地学习率")
     status: Literal["active", "inactive", "malicious"] = Field(
         default="active", description="参与方状态"
@@ -32,8 +32,8 @@ class FederatedConfig(BaseModel):
     task_code: str = Field(default="", description="训练任务代码")
 
     # Global training
-    num_rounds: int = Field(default=10, ge=1, description="联邦训练轮数")
-    min_participants: int = Field(default=2, ge=1, description="最少参与方数量")
+    num_rounds: int = Field(default=3, ge=1, description="联邦训练轮数")
+    min_participants: int = Field(default=1, ge=1, description="最少参与方数量")
     convergence_threshold: float = Field(
         default=1e-4, gt=0, description="收敛阈值（全局模型变化量）"
     )
@@ -58,11 +58,11 @@ class FederatedConfig(BaseModel):
 
     # Model
     model_type: str = Field(default="gpt2", description="模型类型")
-    vocab_size: int = Field(default=50257)
-    hidden_size: int = Field(default=768)
-    num_layers: int = Field(default=12)
-    num_attention_heads: int = Field(default=12)
-    seq_length: int = Field(default=512)
+    vocab_size: int = Field(default=10000)
+    hidden_size: int = Field(default=256)
+    num_layers: int = Field(default=4)
+    num_attention_heads: int = Field(default=4)
+    seq_length: int = Field(default=128)
     dropout: float = Field(default=0.1)
 
     # Data
@@ -72,6 +72,7 @@ class FederatedConfig(BaseModel):
 
     # Training
     precision: Literal["fp16", "bf16", "fp32"] = Field(default="fp16")
+    gradient_accumulation_steps: int = Field(default=4, ge=1, description="梯度累积步数")
     warmup_steps: int = Field(default=100)
     weight_decay: float = Field(default=0.01)
 

@@ -19,7 +19,7 @@ class ParticipantConfigRequest(BaseModel):
     weight: float = Field(default=1.0, ge=0.0, description="聚合权重")
     data_size: int = Field(default=0, ge=0, description="本地数据量")
     local_epochs: int = Field(default=1, ge=1, description="本地训练轮数")
-    local_batch_size: int = Field(default=32, ge=1, description="本地批次大小")
+    local_batch_size: int = Field(default=8, ge=1, description="本地批次大小")
     local_learning_rate: float = Field(default=2e-5, gt=0, description="本地学习率")
     dataset_id: int | None = Field(default=None, description="关联数据集ID")
 
@@ -37,16 +37,16 @@ class FederatedTaskCreate(BaseModel):
 
     # Model config
     model_type: str = Field(default="gpt2", description="模型类型")
-    vocab_size: int = Field(default=50257)
-    hidden_size: int = Field(default=768)
-    num_layers: int = Field(default=12)
-    num_attention_heads: int = Field(default=12)
-    seq_length: int = Field(default=512)
+    vocab_size: int = Field(default=10000)
+    hidden_size: int = Field(default=256)
+    num_layers: int = Field(default=4)
+    num_attention_heads: int = Field(default=4)
+    seq_length: int = Field(default=128)
     dropout: float = Field(default=0.1)
 
     # Federated config
-    num_rounds: int = Field(default=10, ge=1, description="联邦训练轮数")
-    min_participants: int = Field(default=2, ge=1, description="最少参与方数量")
+    num_rounds: int = Field(default=3, ge=1, description="联邦训练轮数")
+    min_participants: int = Field(default=1, ge=1, description="最少参与方数量")
     aggregation_strategy: Literal["fedavg", "weighted_fedavg", "fedprox"] = Field(
         default="weighted_fedavg", description="聚合策略"
     )

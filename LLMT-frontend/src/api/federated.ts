@@ -131,6 +131,9 @@ export const addParticipant = (taskId: number, body: ParticipantConfig) =>
 export const removeParticipant = (taskId: number, participantId: string) =>
   del<{ message: string }>(`/federated/tasks/${taskId}/participants/${participantId}`)
 
+export const deleteFederatedTask = (taskId: number) =>
+  del<{ message: string }>(`/federated/tasks/${taskId}`)
+
 export interface DatasetOption {
   id: number
   name: string

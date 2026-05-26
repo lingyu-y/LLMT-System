@@ -18,7 +18,6 @@
           <!-- 任务列表 -->
           <el-tab-pane label="任务列表" name="list">
             <div class="tab-toolbar">
-              <el-button type="primary" @click="showCreateDialog = true">新建联邦任务</el-button>
               <el-button @click="loadTasks">刷新</el-button>
             </div>
             <el-table :data="tasks" stripe v-loading="loading">
@@ -42,11 +41,12 @@
               <el-table-column label="状态" width="120">
                 <template #default="{ row }"><StatusBadge :label="statusLabel(row.status)" :type="statusType(row.status)" /></template>
               </el-table-column>
-              <el-table-column label="操作" width="240" fixed="right">
+              <el-table-column label="操作" width="280" fixed="right">
                 <template #default="{ row }">
                   <el-button size="small" :disabled="row.status !== 'created'" @click="handleStart(row)">启动</el-button>
                   <el-button size="small" :disabled="row.status !== 'running'" type="danger" @click="handleCancel(row)">取消</el-button>
                   <el-button size="small" @click="openDetail(row)">详情</el-button>
+                  <el-button size="small" type="danger" :disabled="row.status === 'running'" @click="handleDelete(row)">删除</el-button>
                 </template>
               </el-table-column>
             </el-table>
@@ -365,8 +365,8 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
-import { ElMessage } from 'element-plus'
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 
 import StatusBadge from '@/components/StatusBadge.vue'
 import {
@@ -378,6 +378,7 @@ import {
   fetchFederatedTasks,
   fetchFederatedTask,
   createFederatedTask,
+  deleteFederatedTask,
   startFederatedTask,
   cancelFederatedTask,
   fetchFederatedMetrics,
@@ -395,6 +396,7 @@ const selectedTask = ref<FederatedTask | null>(null)
 const showCreateDialog = ref(false)
 const showAddParticipantDialog = ref(false)
 const trainingLogs = ref<{ timestamp: string; level: string; message: string }[]>([])
+const logPollTimer = ref<ReturnType<typeof setInterval> | null>(null)
 const datasetOptions = ref<DatasetOption[]>([])
 
 // Form
@@ -402,16 +404,16 @@ const form = reactive<CreateFederatedTask & { min_participants: number; max_roun
   task_name: '多医院协作医疗模型训练',
   description: '联邦学习分布式协作训练任务',
   model_type: 'gpt2',
-  vocab_size: 50257,
-  hidden_size: 768,
-  num_layers: 12,
-  num_attention_heads: 12,
-  seq_length: 512,
+  vocab_size: 10000,
+  hidden_size: 256,
+  num_layers: 4,
+  num_attention_heads: 4,
+  seq_length: 128,
   dropout: 0.1,
-  num_rounds: 10,
-  min_participants: 2,
+  num_rounds: 3,
+  min_participants: 1,
   aggregation_strategy: 'weighted_fedavg',
-  convergence_threshold: 0.0001,
+  convergence_threshold: 0.001,
   max_rounds_no_improve: 3,
   enable_dp: true,
   dp_epsilon: 8.0,
@@ -424,16 +426,15 @@ const form = reactive<CreateFederatedTask & { min_participants: number; max_roun
   checkpoint_dir: './checkpoints/federated',
   save_every_n_rounds: 1,
   participants: [
-    { participant_id: 'hospital-A', name: 'A医院', weight: 1.0, data_size: 5000, local_epochs: 2, local_batch_size: 32, local_learning_rate: 2e-5, dataset_id: undefined },
-    { participant_id: 'hospital-B', name: 'B医院', weight: 1.0, data_size: 3000, local_epochs: 2, local_batch_size: 32, local_learning_rate: 2e-5, dataset_id: undefined },
-    { participant_id: 'hospital-C', name: 'C医院', weight: 1.0, data_size: 4000, local_epochs: 2, local_batch_size: 32, local_learning_rate: 2e-5, dataset_id: undefined },
+    { participant_id: 'hospital-A', name: 'A医院', weight: 1.0, data_size: 500, local_epochs: 1, local_batch_size: 8, local_learning_rate: 2e-5, dataset_id: undefined },
+    { participant_id: 'hospital-B', name: 'B医院', weight: 1.0, data_size: 500, local_epochs: 1, local_batch_size: 8, local_learning_rate: 2e-5, dataset_id: undefined },
   ],
 })
 
 const quickForm = reactive({
   task_name: '联邦协作训练任务',
-  num_participants: 3,
-  num_rounds: 10,
+  num_participants: 2,
+  num_rounds: 3,
   aggregation_strategy: 'weighted_fedavg',
   enable_dp: true,
 })
@@ -592,6 +593,28 @@ const handleStart = async (task: FederatedTaskListItem) => {
   }
 }
 
+const handleDelete = async (task: FederatedTaskListItem) => {
+  try {
+    await ElMessageBox.confirm(
+      `确认删除任务「${task.task_name}」(${task.task_code})？此操作不可恢复。`,
+      '确认删除',
+      { confirmButtonText: '删除', cancelButtonText: '取消', type: 'warning' },
+    )
+    await deleteFederatedTask(task.id)
+    ElMessage.success(`任务 ${task.task_code} 已删除`)
+    // If the deleted task was being viewed, close the detail
+    if (selectedTask.value?.id === task.id) {
+      selectedTask.value = null
+      activeTab.value = 'list'
+    }
+    await loadTasks()
+  } catch (e: unknown) {
+    if (e !== 'cancel' && (e as Error).message) {
+      ElMessage.error((e as Error).message || '删除失败')
+    }
+  }
+}
+
 const handleCancel = async (task: FederatedTaskListItem) => {
   try {
     await cancelFederatedTask(task.id)
@@ -602,7 +625,36 @@ const handleCancel = async (task: FederatedTaskListItem) => {
   }
 }
 
+const stopLogPolling = () => {
+  if (logPollTimer.value) {
+    clearInterval(logPollTimer.value)
+    logPollTimer.value = null
+  }
+}
+
+const pollLogs = async (taskId: number) => {
+  try {
+    const logsRes = await fetchFederatedLogs(taskId)
+    if (logsRes.data) {
+      trainingLogs.value = (logsRes.data as { logs: { timestamp: string; level: string; message: string }[] }).logs ?? []
+    }
+    // Refresh task detail to get latest status
+    const detailRes = await fetchFederatedTask(taskId)
+    if (detailRes.data) {
+      const t = detailRes.data as FederatedTask
+      selectedTask.value = { ...selectedTask.value, ...t }
+      // Stop polling when task finishes
+      if (t.status === 'completed' || t.status === 'failed' || t.status === 'cancelled') {
+        stopLogPolling()
+      }
+    }
+  } catch {
+    // ignore polling errors
+  }
+}
+
 const openDetail = async (task: FederatedTaskListItem) => {
+  stopLogPolling()
   selectedTask.value = task
   activeTab.value = 'monitor'
   try {
@@ -611,16 +663,19 @@ const openDetail = async (task: FederatedTaskListItem) => {
       fetchFederatedMetrics(task.id),
       fetchFederatedLogs(task.id),
     ])
-    // Full task details (includes participants with runtime stats)
     if (detailRes.data) {
       selectedTask.value = detailRes.data as FederatedTask
     }
-    // Overlay metrics & logs onto the selected task
     if (metricsRes.data) {
       selectedTask.value = { ...selectedTask.value, result_json: metricsRes.data as Record<string, unknown> }
     }
     if (logsRes.data) {
       trainingLogs.value = (logsRes.data as { logs: { timestamp: string; level: string; message: string }[] }).logs ?? []
+    }
+    // Start polling if task is still running
+    const t = selectedTask.value as FederatedTask | null
+    if (t && (t.status === 'running' || t.status === 'created' || t.status === 'initializing')) {
+      logPollTimer.value = setInterval(() => pollLogs(task.id), 3000)
     }
   } catch {
     // ignore
@@ -672,9 +727,9 @@ const addParticipantRow = () => {
     participant_id: `participant-${idx}`,
     name: `参与方 ${idx}`,
     weight: 1.0,
-    data_size: 2000,
-    local_epochs: 2,
-    local_batch_size: 32,
+    data_size: 500,
+    local_epochs: 1,
+    local_batch_size: 8,
     local_learning_rate: 2e-5,
     dataset_id: undefined,
   })
@@ -719,6 +774,10 @@ const loadDatasetOptions = async () => {
 onMounted(() => {
   loadTasks()
   loadDatasetOptions()
+})
+
+onUnmounted(() => {
+  stopLogPolling()
 })
 </script>
 

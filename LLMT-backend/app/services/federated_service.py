@@ -167,7 +167,7 @@ def list_tasks(
             num_rounds=t.num_rounds,
             current_round=t.current_round,
             aggregation_strategy=t.aggregation_strategy,
-            enable_dp=bool(t.enable_dp),
+            enable_dp=t.enable_dp,
             num_participants=len(t.participants) if t.participants else 0,
             best_loss=t.best_loss,
             started_at=t.started_at,
@@ -300,6 +300,18 @@ def add_participant(
     )
 
 
+def delete_task(db: Session, task_id: int) -> bool:
+    """Delete a federated task. Only tasks that are not running can be deleted."""
+    task = db.query(FederatedTask).filter(FederatedTask.id == task_id).first()
+    if task is None:
+        return False
+    if task.status == "running":
+        return False
+    db.delete(task)
+    db.commit()
+    return True
+
+
 def remove_participant(db: Session, task_id: int, participant_id: str) -> bool:
     """Remove a participant from a federated task (dynamic leave)."""
     participant = (
@@ -324,13 +336,7 @@ def get_task_logs(db: Session, task_id: int) -> list[dict[str, Any]]:
     if task is None:
         return []
 
-    logs = task.training_log_json or []
-
-    # Add simulated logs if empty
-    if not logs:
-        logs = _generate_simulated_logs(task)
-
-    return logs
+    return task.training_log_json or []
 
 
 def get_task_metrics(db: Session, task_id: int) -> dict[str, Any]:
@@ -393,7 +399,7 @@ def _to_task_out(task: FederatedTask, db: Session | None = None) -> FederatedTas
         current_round=task.current_round,
         aggregation_strategy=task.aggregation_strategy,
         convergence_threshold=task.convergence_threshold,
-        enable_dp=bool(task.enable_dp),
+        enable_dp=task.enable_dp,
         dp_epsilon=task.dp_epsilon,
         dp_delta=task.dp_delta,
         dp_noise_multiplier=task.dp_noise_multiplier,
