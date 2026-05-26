@@ -31,8 +31,7 @@ class TrainingConfigDict(BaseModel):
 
     model_config = {"protected_namespaces": ()}
 
-    # Model
-    model_type: str = "gpt2"
+    # Model (model_type hardcoded to "gpt2" in backend, no selection needed)
     vocab_size: int = 50257
     hidden_size: int = 768
     num_layers: int = 12
@@ -93,6 +92,9 @@ class TrainingTaskCreate(BaseModel):
         "ddp", "zero1", "zero2", "zero3", "zero3_offload", "tp", "pp", "3d",
     ] = "zero2"
     config: TrainingConfigDict = Field(default_factory=TrainingConfigDict)
+    base_model_version_id: int | None = Field(
+        default=None, description="继续训练时指定基础模型的版本ID（ModelVersion.id）"
+    )
 
 
 class SubmitTaskRequest(BaseModel):
@@ -183,8 +185,18 @@ class DatasetOptionItem(BaseModel):
     label: str
 
 
+class BaseModelOptionItem(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    value: int
+    label: str
+    model_code: str
+    version: str
+    model_name: str
+    hyperparams_json: dict[str, Any] = {}
+
+
 class TrainingOptionsOut(BaseModel):
-    models: list[OptionItem] = []
+    base_models: list[BaseModelOptionItem] = []
     datasets: list[DatasetOptionItem] = []
     frameworks: list[OptionItem] = []
     gpu_options: list[OptionItem] = []
