@@ -47,6 +47,7 @@
         <div class="detail-actions">
           <el-button :icon="Upload" @click="importDialogVisible = true">导入</el-button>
           <el-button :icon="Download" @click="openExportDialog">导出</el-button>
+          <el-button :icon="Clock" @click="versionHistoryDrawerVisible = true">版本历史</el-button>
           <el-popconfirm title="确定删除此模型？将删除所有版本及MinIO文件" @confirm="handleDeleteModel">
             <template #reference>
               <el-button type="danger" :icon="Delete">删除</el-button>
@@ -55,81 +56,32 @@
         </div>
       </div>
 
+      <div class="metrics-bar">
+        <div class="metric-stat">
+          <span class="metric-stat-label">当前版本</span>
+          <strong class="metric-stat-value">{{ selectedModel.version }}</strong>
+        </div>
+        <div class="metric-stat">
+          <span class="metric-stat-label">评估指标</span>
+          <strong class="metric-stat-value">{{ selectedModel.accuracy }}</strong>
+        </div>
+        <div class="metric-stat">
+          <span class="metric-stat-label">参数量</span>
+          <strong class="metric-stat-value">{{ selectedModel.params }}</strong>
+        </div>
+        <div class="metric-stat">
+          <span class="metric-stat-label">来源任务</span>
+          <strong class="metric-stat-value">{{ selectedTrainingMeta.taskId }}</strong>
+        </div>
+      </div>
+
       <div class="grid-2">
         <div class="card">
-          <div class="card-header"><h3 class="card-title">版本概述</h3></div>
-          <div class="card-body overview-grid">
-            <div class="overview-card"><span>当前版本</span><strong>{{ selectedModel.version }}</strong></div>
-            <div class="overview-card"><span>来源任务</span><strong>{{ selectedTrainingMeta.taskId }}</strong></div>
-            <div class="overview-card"><span>评估指标</span><strong>{{ selectedModel.accuracy }}</strong></div>
-            <div class="overview-card"><span>参数量</span><strong>{{ selectedModel.params }}</strong></div>
-          </div>
-        </div>
-
-        <div class="card">
-          <div class="card-header"><h3 class="card-title">训练来源</h3></div>
+          <div class="card-header"><h3 class="card-title">训练配置</h3></div>
           <div class="card-body params-grid">
-            <div v-for="[label, value] in trainingSourceItems" :key="label" class="param-item">
+            <div v-for="[label, value] in trainingConfigItems" :key="label" class="param-item">
               <span>{{ label }}</span>
               <strong>{{ value }}</strong>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div class="grid-2">
-        <div class="card">
-          <div class="card-header">
-            <h3 class="card-title">在线推理试跑</h3>
-            <el-button size="small" :icon="Promotion" :loading="predicting" @click="runPredict">运行</el-button>
-          </div>
-          <div class="card-body inference-panel">
-            <el-input v-model="inferenceInput" type="textarea" :rows="4" placeholder="输入一段文本，调用当前模型同步推理" />
-            <div v-if="prediction" class="result-box">
-              <strong>{{ prediction.latency_ms }} ms</strong>
-              <p>{{ prediction.output }}</p>
-            </div>
-            <div class="usage-row">
-              <span>分钟限额：{{ usage?.limit_per_minute ?? '-' }}</span>
-              <span>剩余额度：{{ usage?.remaining_calls ?? '-' }}</span>
-            </div>
-          </div>
-        </div>
-
-        <div class="card">
-          <div class="card-header">
-            <h3 class="card-title">安全与限流</h3>
-            <el-button size="small" :icon="DataLine" :loading="scanning" @click="runSecurityScan">扫描</el-button>
-          </div>
-          <div class="card-body security-panel">
-            <div class="security-summary">
-              <span>安全评分</span>
-              <strong>{{ securityReports[0]?.score ?? '未扫描' }}</strong>
-            </div>
-            <el-form label-position="top" class="rate-form">
-              <el-form-item label="启用限流">
-                <el-switch v-model="rateLimitForm.enabled" />
-              </el-form-item>
-              <el-form-item label="每分钟请求数">
-                <el-input-number v-model="rateLimitForm.requests_per_minute" :min="1" />
-              </el-form-item>
-              <el-form-item label="并发数">
-                <el-input-number v-model="rateLimitForm.concurrent" :min="1" />
-              </el-form-item>
-              <el-button type="primary" plain @click="saveRateLimit">保存限流</el-button>
-            </el-form>
-          </div>
-        </div>
-      </div>
-
-      <div class="grid-2">
-        <div class="card">
-          <div class="card-header"><h3 class="card-title">训练配置追溯</h3></div>
-          <div class="card-body trace-list">
-            <div v-for="item in trainingTrace" :key="item.label" class="trace-item">
-              <span>{{ item.label }}</span>
-              <strong>{{ item.value }}</strong>
-              <p>{{ item.detail }}</p>
             </div>
           </div>
         </div>
@@ -148,30 +100,53 @@
         </div>
       </div>
 
-      <div class="card">
-        <div class="card-header"><h3 class="card-title">版本历史</h3></div>
-        <div class="card-body timeline">
-          <div v-for="item in versionHistory" :key="item.version" class="timeline-item" :class="{ current: item.current }">
-            <div class="timeline-marker"><el-icon v-if="item.current"><Check /></el-icon></div>
-            <div class="timeline-content">
-              <div class="timeline-head">
-                <strong>{{ item.version }}</strong>
-                <StatusBadge v-if="item.status" :label="item.status" :type="item.current ? 'success' : 'info'" />
-                <span class="muted">{{ item.date }}</span>
-              </div>
-              <p>{{ item.metrics }}</p>
-              <p class="muted">{{ item.params }}</p>
-              <p class="muted">{{ item.training }}</p>
-              <div v-if="!item.current" class="timeline-actions">
-                <el-button size="small" type="primary" :icon="RefreshLeft" @click="rollback(item.version)">回滚到此版本</el-button>
-                <el-button size="small" :icon="Download" @click="downloadVersion(item.version)">下载</el-button>
-                <el-button size="small" :icon="DataLine" @click="openCompareDrawer(item)">对比</el-button>
-              </div>
+      <div class="card inference-card">
+        <div class="card-header">
+          <h3 class="card-title">在线推理试跑</h3>
+          <el-button size="small" type="primary" :icon="Promotion" :loading="predicting" @click="runPredict">运行</el-button>
+        </div>
+        <div class="card-body inference-row">
+          <div class="inference-input">
+            <el-input v-model="inferenceInput" type="textarea" :rows="6" placeholder="输入一段文本，调用当前模型同步推理" />
+          </div>
+          <div class="inference-output">
+            <div class="result-box">
+              <template v-if="prediction">
+                <div class="result-header">
+                  <span>推理结果</span>
+                  <strong>{{ prediction.latency_ms }} ms</strong>
+                </div>
+                <p>{{ prediction.output }}</p>
+              </template>
+              <span v-else class="result-placeholder">输入文本后点击「运行」查看推理结果</span>
             </div>
           </div>
         </div>
       </div>
     </template>
+
+    <el-drawer v-model="versionHistoryDrawerVisible" title="版本历史" size="480px">
+      <div class="timeline">
+        <div v-for="item in versionHistory" :key="item.version" class="timeline-item" :class="{ current: item.current }">
+          <div class="timeline-marker"><el-icon v-if="item.current"><Check /></el-icon></div>
+          <div class="timeline-content">
+            <div class="timeline-head">
+              <strong>{{ item.version }}</strong>
+              <StatusBadge v-if="item.status" :label="item.status" :type="item.current ? 'success' : 'info'" />
+              <span class="muted">{{ item.date }}</span>
+            </div>
+            <p>{{ item.metrics }}</p>
+            <p class="muted">{{ item.params }}</p>
+            <p class="muted">{{ item.training }}</p>
+            <div v-if="!item.current" class="timeline-actions">
+              <el-button size="small" type="primary" :icon="RefreshLeft" @click="rollback(item.version)">回滚到此版本</el-button>
+              <el-button size="small" :icon="Download" @click="downloadVersion(item.version)">下载</el-button>
+              <el-button size="small" :icon="DataLine" @click="openCompareDrawer(item)">对比</el-button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </el-drawer>
 
     <el-drawer v-model="compareDrawerVisible" title="版本对比" size="720px">
       <div v-if="compareVersion && currentVersion" class="compare-drawer">
@@ -279,26 +254,20 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { ArrowLeft, Check, DataLine, Delete, Download, Management, Promotion, RefreshLeft, Upload } from '@element-plus/icons-vue'
+import { ArrowLeft, Check, Clock, DataLine, Delete, Download, Management, Promotion, RefreshLeft, Upload } from '@element-plus/icons-vue'
 
-import { getInferenceUsage, predict, type InferenceUsage, type PredictResult } from '@/api/inference'
+import { predict, type PredictResult } from '@/api/inference'
 import StatusBadge from '@/components/StatusBadge.vue'
 import {
   compareModelVersions,
   deleteModel,
   exportModel,
   getModelDownloadUrl,
-  getModelRateLimit,
-  getSecurityReports,
   importModel,
   getModelVersions,
   listModels,
   rollbackModelVersion,
-  triggerSecurityScan,
-  updateModelRateLimit,
   type BackendModel,
-  type ModelRateLimit,
-  type SecurityReport,
 } from '@/api/models'
 
 type ModelItem = {
@@ -326,6 +295,7 @@ const keyword = ref('')
 const typeFilter = ref('全部类型')
 const selectedModel = ref<ModelItem | null>(null)
 const compareDrawerVisible = ref(false)
+const versionHistoryDrawerVisible = ref(false)
 
 const importDialogVisible = ref(false)
 const exportDialogVisible = ref(false)
@@ -333,17 +303,8 @@ const compareVersion = ref<VersionItem>()
 const models = ref<ModelItem[]>([])
 const versionHistory = ref<VersionItem[]>([])
 const predicting = ref(false)
-const scanning = ref(false)
 const inferenceInput = ref('请对当前模型做一次测试推理')
 const prediction = ref<PredictResult>()
-const usage = ref<InferenceUsage>()
-const securityReports = ref<SecurityReport[]>([])
-const rateLimit = ref<ModelRateLimit>()
-const rateLimitForm = ref({
-  enabled: true,
-  requests_per_minute: 100,
-  concurrent: 10,
-})
 
 const importForm = ref({ source_path: '', model_name: '', model_code: '', version: 'v1.0.0' })
 const exportForm = ref({ target_path: '' })
@@ -426,24 +387,6 @@ const loadVersions = async (modelCode: string) => {
   versionHistory.value = (await getModelVersions(modelCode)).map(mapVersion)
 }
 
-const loadModelOps = async (modelCode: string) => {
-  const [usageResult, reportsResult, rateResult] = await Promise.allSettled([
-    getInferenceUsage(modelCode),
-    getSecurityReports(modelCode),
-    getModelRateLimit(modelCode),
-  ])
-  if (usageResult.status === 'fulfilled') usage.value = usageResult.value[0]
-  if (reportsResult.status === 'fulfilled') securityReports.value = reportsResult.value
-  if (rateResult.status === 'fulfilled') {
-    rateLimit.value = rateResult.value
-    rateLimitForm.value = {
-      enabled: rateResult.value.enabled,
-      requests_per_minute: rateResult.value.limits.requests_per_minute,
-      concurrent: rateResult.value.limits.concurrent,
-    }
-  }
-}
-
 const filteredModels = computed(() =>
   models.value.filter((item) => {
     const matchText = `${item.name}${item.type}`.toLowerCase().includes(keyword.value.toLowerCase())
@@ -476,26 +419,20 @@ const hyperParamsSummary = computed(() => {
   return hp ? getHyperSummary(hp) : {}
 })
 
-const trainingSourceItems = computed<[string, string][]>(() => {
+const trainingConfigItems = computed<[string, string][]>(() => {
   const meta = selectedTrainingMeta.value
-  const hpSum = hyperParamsSummary.value
+  const hp = hyperParamsSummary.value
   const items: [string, string][] = [
-    ['训练任务', meta.taskId],
     ['训练框架', meta.framework],
     ['并行策略', meta.parallel],
-    ['资源规格', meta.resource],
   ]
-  for (const [label, value] of Object.entries(hpSum).slice(0, 4)) {
-    items.push([label, value])
+  const hpKeys = ['学习率', '精度', '序列长度', '隐层维度', '层数', '注意力头数']
+  for (const key of hpKeys) {
+    const val = hp[key]
+    if (val && val !== '-') items.push([key, val])
   }
   return items
 })
-
-const trainingTrace = computed(() => [
-  { label: '并行策略', value: selectedTrainingMeta.value.parallel, detail: '由训练模块的混合并行配置生成' },
-  { label: '模型存储', value: selectedTrainingMeta.value.checkpoint, detail: 'MinIO 模型仓库中的版本化存储路径' },
-  { label: '训练框架', value: selectedTrainingMeta.value.framework, detail: '支持 PyTorch / DeepSpeed / Megatron-LM' },
-])
 
 const artifacts = computed(() => [
   { label: '模型文件', path: `models/${selectedModel.value?.id}/${selectedModel.value?.version}/model.bin`, status: '已归档', type: 'success' as const },
@@ -536,6 +473,17 @@ const rollback = async (version: string) => {
   if (selectedModel.value) {
     await rollbackModelVersion(selectedModel.value.id, version)
     await loadVersions(selectedModel.value.id)
+    // 回滚后更新详情数据：用新的当前版本刷新 selectedModel
+    const newCurrent = versionHistory.value.find(v => v.current)
+    if (newCurrent) {
+      selectedModel.value = {
+        ...selectedModel.value,
+        version: newCurrent.version,
+        accuracy: newCurrent.metrics,
+        params: newCurrent.params,
+        raw: newCurrent.raw,
+      }
+    }
   }
   ElMessage.success(`已回滚到 ${version}`)
 }
@@ -548,9 +496,8 @@ const downloadVersion = (version: string) => {
 const selectModel = async (model: ModelItem) => {
   selectedModel.value = model
   prediction.value = undefined
-  usage.value = undefined
   inferenceInput.value = '请对当前模型做一次测试推理'
-  await Promise.all([loadVersions(model.id), loadModelOps(model.id)])
+  await loadVersions(model.id)
 }
 
 const runPredict = async () => {
@@ -559,35 +506,12 @@ const runPredict = async () => {
   const modelCode = selectedModel.value.raw.model_code || selectedModel.value.id
   try {
     prediction.value = await predict(modelCode, { input: inferenceInput.value.trim() })
-    const usageResult = await getInferenceUsage(modelCode)
-    usage.value = usageResult[0]
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '推理失败')
   } finally {
     predicting.value = false
   }
 }
-
-const runSecurityScan = async () => {
-  if (!selectedModel.value) return
-  scanning.value = true
-  try {
-    await triggerSecurityScan(selectedModel.value.id)
-    securityReports.value = await getSecurityReports(selectedModel.value.id)
-    ElMessage.success('安全扫描完成')
-  } catch (error) {
-    ElMessage.error(error instanceof Error ? error.message : '安全扫描失败')
-  } finally {
-    scanning.value = false
-  }
-}
-
-const saveRateLimit = async () => {
-  if (!selectedModel.value) return
-  rateLimit.value = await updateModelRateLimit(selectedModel.value.id, rateLimitForm.value)
-  ElMessage.success('限流策略已保存')
-}
-
 
 const submitImport = async () => {
   if (!importForm.value.source_path || !importForm.value.model_name || !importForm.value.model_code) {
@@ -629,49 +553,71 @@ onMounted(() => {
   gap: 12px;
 }
 
-.inference-panel,
-.security-panel {
+.inference-panel {
   display: flex;
   flex-direction: column;
   gap: 12px;
 }
 
-.result-box,
-.security-summary,
-.usage-row {
+.inference-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 20px;
+}
+
+.inference-input :deep(.el-textarea__inner) {
+  height: 200px;
+  resize: none;
+}
+
+.inference-output {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.result-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.result-header span {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.result-header strong {
+  color: var(--primary-color);
+  font-size: 14px;
+}
+
+.result-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--text-muted);
+  font-size: 14px;
+}
+
+.result-box {
   padding: 12px;
   border: 1px solid var(--border-color);
   border-radius: 8px;
   background: var(--bg-color);
+  max-height: 240px;
+  overflow-y: auto;
+  flex: 1;
 }
+
 
 .result-box p {
   margin: 8px 0 0;
   color: var(--text-secondary);
 }
 
-.usage-row {
-  display: flex;
-  justify-content: space-between;
-  color: var(--text-secondary);
-  font-size: 13px;
-}
-
-.security-summary span,
-.security-summary strong {
-  display: block;
-}
-
-.security-summary strong {
-  margin-top: 6px;
-  font-size: 24px;
-}
-
-.rate-form {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0 12px;
-}
 
 .filters {
   width: 380px;
@@ -756,44 +702,65 @@ onMounted(() => {
   color: var(--text-muted);
 }
 
-.overview-grid,
-.params-grid,
-.trace-list {
+.metrics-bar {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 16px;
+  margin-bottom: 20px;
+}
+
+.metric-stat {
+  padding: 20px 24px;
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  background: #fff;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.metric-stat:hover {
+  border-color: var(--primary-color);
+  box-shadow: 0 4px 16px rgb(37 99 235 / 8%);
+}
+
+.metric-stat-label {
+  display: block;
+  color: var(--text-muted);
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+
+.metric-stat-value {
+  display: block;
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.params-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
 }
 
-.overview-card,
-.param-item,
-.trace-item {
+.param-item {
   padding: 14px;
   border: 1px solid var(--border-color);
   border-radius: 8px;
   background: var(--bg-color);
 }
 
-.overview-card span,
-.param-item span,
-.trace-item span {
+.param-item span {
   display: block;
   color: var(--text-muted);
   font-size: 12px;
 }
 
-.overview-card strong,
-.param-item strong,
-.trace-item strong {
+.param-item strong {
   display: block;
   margin-top: 6px;
   font-size: 18px;
 }
 
-.trace-list {
-  grid-template-columns: 1fr;
-}
-
-.trace-item p,
 .artifact-item p {
   margin: 6px 0 0;
   color: var(--text-secondary);
@@ -939,14 +906,19 @@ onMounted(() => {
   .model-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+
+  .metrics-bar {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 @media (max-width: 640px) {
   .model-grid,
-  .overview-grid,
+  .metrics-bar,
   .params-grid,
   .compare-summary,
-  .compare-grid {
+  .compare-grid,
+  .inference-row {
     grid-template-columns: 1fr;
   }
 }
