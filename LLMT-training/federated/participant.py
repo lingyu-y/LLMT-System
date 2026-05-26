@@ -58,6 +58,7 @@ class FederatedParticipant:
         # Training state
         self._current_round = 0
         self._local_loss_history: list[float] = []
+        self.on_progress: Any = None  # callback(participant_id, round_num, epoch, total_epochs, loss)
 
     @property
     def participant_id(self) -> str:
@@ -97,8 +98,12 @@ class FederatedParticipant:
         self._current_round = round_num
         self.model.train()
 
-        # Store global model parameters for FedProx and update computation
-        global_params = {name: param.clone().detach() for name, param in self.model.named_parameters()}
+        # Store global model parameters for FedProx proximal term
+        global_params = (
+            {name: param.clone().detach() for name, param in self.model.named_parameters()}
+            if self.config.aggregation_strategy == "fedprox"
+            else None
+        )
 
         # Build optimizer
         optimizer = torch.optim.AdamW(
@@ -114,6 +119,7 @@ class FederatedParticipant:
 
         # Training loop
         local_epochs = self.participant_config.local_epochs
+        accum_steps = max(self.config.gradient_accumulation_steps, 1)
         total_loss = 0.0
         total_steps = 0
         start_time = time.time()
@@ -121,67 +127,92 @@ class FederatedParticipant:
         for epoch in range(local_epochs):
             epoch_loss = 0.0
             epoch_steps = 0
+            epoch_batch_count = len(self.train_dataloader)
+            optimizer.zero_grad()
 
             for step, batch in enumerate(self.train_dataloader):
-                # Move batch to device
-                batch = {
-                    k: v.to(self.device) if isinstance(v, torch.Tensor) else v
-                    for k, v in batch.items()
-                }
+                if step == 0:
+                    logger.info("Participant %s: first batch loaded, starting forward pass...", self.participant_id)
+                # Split full batch into micro-batches to limit peak logits memory.
+                full_bs = len(batch["input_ids"])
+                micro_bs = max(1, full_bs // accum_steps)
+                num_micro = (full_bs + micro_bs - 1) // micro_bs
 
-                optimizer.zero_grad()
+                micro_loss = 0.0
+                for mi in range(num_micro):
+                    m_start = mi * micro_bs
+                    m_end = min(m_start + micro_bs, full_bs)
+                    micro_batch = {k: v[m_start:m_end] for k, v in batch.items()}
 
-                # Forward pass with optional mixed precision
-                if scaler is not None:
-                    with torch.amp.autocast("cuda"):
+                    # Move micro-batch to device
+                    micro_batch = {
+                        k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                        for k, v in micro_batch.items()
+                    }
+
+                    if scaler is not None:
+                        with torch.amp.autocast("cuda"):
+                            outputs = self.model(
+                                **{k: v for k, v in micro_batch.items() if k in ("input_ids", "attention_mask")}
+                            )
+                            loss = self.loss_fn(
+                                outputs.logits.view(-1, outputs.logits.size(-1)),
+                                micro_batch["labels"].view(-1),
+                            )
+                            if self.config.aggregation_strategy == "fedprox":
+                                proximal_term = self._compute_proximal_term(global_params, self.config.fedprox_mu)
+                                loss = loss + proximal_term
+
+                        scaler.scale(loss / num_micro).backward()
+                    else:
                         outputs = self.model(
-                            **{k: v for k, v in batch.items() if k in ("input_ids", "attention_mask")}
+                            **{k: v for k, v in micro_batch.items() if k in ("input_ids", "attention_mask")}
                         )
                         loss = self.loss_fn(
                             outputs.logits.view(-1, outputs.logits.size(-1)),
-                            batch["labels"].view(-1),
+                            micro_batch["labels"].view(-1),
                         )
-                        # FedProx proximal term
                         if self.config.aggregation_strategy == "fedprox":
                             proximal_term = self._compute_proximal_term(global_params, self.config.fedprox_mu)
                             loss = loss + proximal_term
 
-                    scaler.scale(loss).backward()
+                        (loss / num_micro).backward()
 
-                    # Apply differential privacy
-                    dp_report = None
+                    micro_loss += loss.item()
+
+                epoch_loss += micro_loss
+                epoch_steps += 1
+                total_steps += 1
+
+                # Optimizer step after processing all micro-batches
+                dp_report = None
+                if scaler is not None:
                     if self.dp_mechanism is not None:
                         scaler.unscale_(optimizer)
                         dp_report = self.dp_mechanism.apply(self.model, self.participant_config.local_batch_size)
-                        scaler.scale(optimizer.param_groups[0]["params"])
-
                     scaler.step(optimizer)
                     scaler.update()
                 else:
-                    outputs = self.model(
-                        **{k: v for k, v in batch.items() if k in ("input_ids", "attention_mask")}
-                    )
-                    loss = self.loss_fn(
-                        outputs.logits.view(-1, outputs.logits.size(-1)),
-                        batch["labels"].view(-1),
-                    )
-                    # FedProx proximal term
-                    if self.config.aggregation_strategy == "fedprox":
-                        proximal_term = self._compute_proximal_term(global_params, self.config.fedprox_mu)
-                        loss = loss + proximal_term
-
-                    loss.backward()
-
-                    # Apply differential privacy
-                    dp_report = None
                     if self.dp_mechanism is not None:
                         dp_report = self.dp_mechanism.apply(self.model, self.participant_config.local_batch_size)
-
                     optimizer.step()
+                optimizer.zero_grad()
 
-                epoch_loss += loss.item()
-                epoch_steps += 1
-                total_steps += 1
+                # Progress report every 10 batches or on first batch
+                if step == 0 or (step + 1) % 10 == 0 or step == epoch_batch_count - 1:
+                    logger.info(
+                        "Participant %s, Round %d, Epoch %d/%d, Batch %d/%d, Loss: %.4f",
+                        self.participant_id, round_num, epoch + 1, local_epochs,
+                        step + 1, epoch_batch_count, micro_loss / max(step + 1, 1),
+                    )
+                    if self.on_progress is not None:
+                        try:
+                            self.on_progress(
+                                self.participant_id, round_num, -1, -1,
+                                round(micro_loss / max(step + 1, 1), 4),
+                            )
+                        except Exception:
+                            pass
 
             avg_epoch_loss = epoch_loss / max(epoch_steps, 1)
             total_loss += epoch_loss
@@ -189,6 +220,11 @@ class FederatedParticipant:
                 "Participant %s, Round %d, Local Epoch %d/%d, Loss: %.4f",
                 self.participant_id, round_num, epoch + 1, local_epochs, avg_epoch_loss,
             )
+            if self.on_progress is not None:
+                try:
+                    self.on_progress(self.participant_id, round_num, epoch + 1, local_epochs, round(avg_epoch_loss, 4))
+                except Exception:
+                    pass
 
         total_loss_avg = total_loss / max(total_steps, 1)
         elapsed = time.time() - start_time

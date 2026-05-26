@@ -138,6 +138,19 @@ def remove_participant(
     return success_response(None, "参与方已移除")
 
 
+@router.delete("/tasks/{task_id}")
+def delete_federated_task(
+    task_id: int,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """Delete a federated learning task."""
+    success = federated_service.delete_task(db, task_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="任务不存在或无法删除（运行中的任务请先取消）")
+    return success_response(None, "任务已删除")
+
+
 @router.get("/options")
 def get_federated_options(
     db: Session = Depends(get_db),

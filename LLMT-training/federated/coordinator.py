@@ -49,6 +49,7 @@ class FederatedCoordinator:
         self._rounds_no_improve = 0
         self._training_log: list[dict[str, Any]] = []
         self._status = "created"
+        self._on_log_updated: Any = None  # callback for persisting logs to DB
 
         # Register participants
         if participants:
@@ -100,11 +101,6 @@ class FederatedCoordinator:
         param_count = sum(p.numel() for p in self.global_model.parameters())
         model_size_mb = sum(p.numel() * p.element_size() for p in self.global_model.parameters()) / (1024 * 1024)
 
-        # Simulate model creation time (5-15 seconds based on model size)
-        import random
-        creation_time = random.uniform(5, 15)
-        time.sleep(max(0.1, creation_time - (time.time() - start_time)))
-
         # Write initial model to shared memory
         self.shared_memory.write_model(self.global_model)
 
@@ -117,6 +113,13 @@ class FederatedCoordinator:
             "creation_time_seconds": elapsed,
             "num_participants": len(self.participants),
         }
+        self._add_log({
+            "timestamp": time.time(),
+            "round": 0,
+            "level": "INFO",
+            "message": f"Global model initialized ({model_size_mb:.1f} MB, {param_count:,} params, {len(self.participants)} participants)",
+            "metrics": init_info,
+        })
         logger.info("Global model initialized: %s", init_info)
         return init_info
 
@@ -126,6 +129,12 @@ class FederatedCoordinator:
         Each participant reads from shared memory to load the latest global model.
         """
         self.shared_memory.write_model(self.global_model)
+        self._add_log({
+            "timestamp": time.time(),
+            "round": self._current_round,
+            "level": "INFO",
+            "message": f"Round {self._current_round}: global model distributed to {len(self.participants)} participants via shared memory",
+        })
         logger.info("Round %d: Distributed global model to shared memory", self._current_round)
 
     def collect_updates(self) -> dict[str, dict[str, torch.Tensor]]:
@@ -141,19 +150,46 @@ class FederatedCoordinator:
 
         updates: dict[str, dict[str, torch.Tensor]] = {}
         for pid, participant in active_participants.items():
-            # In the serial execution model, each participant:
-            # 1. Loads global model from shared memory
-            # 2. Performs local training
-            # 3. Computes update
-            # 4. Writes update to shared memory
-            global_state = {name: param.clone() for name, param in self.global_model.state_dict().items()}
-            participant.load_global_model()
-            metrics = participant.train_local(self._current_round)
-            update = participant.compute_update(global_state)
-            participant.submit_update(update)
+            try:
+                self._add_log({
+                    "timestamp": time.time(),
+                    "round": self._current_round,
+                    "participant_id": pid,
+                    "level": "INFO",
+                    "message": f"Round {self._current_round}: participant {pid} starting local training (epochs={participant.participant_config.local_epochs}, batch_size={participant.participant_config.local_batch_size})",
+                })
+                # Set progress callback so training progress is persisted
+                def _on_progress(pid, round_num, epoch, total_epochs, loss):
+                    if epoch > 0:
+                        msg = f"Round {round_num}: participant {pid} epoch {epoch}/{total_epochs} complete — loss={loss:.4f}"
+                    else:
+                        msg = f"Round {round_num}: participant {pid} training... batch progress loss={loss:.4f}"
+                    self._add_log({
+                        "timestamp": time.time(),
+                        "round": round_num,
+                        "participant_id": pid,
+                        "level": "INFO",
+                        "message": msg,
+                    })
+                participant.on_progress = _on_progress
+                global_state = {name: param.clone() for name, param in self.global_model.state_dict().items()}
+                participant.load_global_model()
+                metrics = participant.train_local(self._current_round)
+                update = participant.compute_update(global_state)
+                participant.submit_update(update)
 
-            updates[pid] = update
-            self._log_round_event(pid, metrics)
+                updates[pid] = update
+                self._log_round_event(pid, metrics)
+            except Exception:
+                logger.exception("Participant %s failed in round %d", pid, self._current_round)
+            finally:
+                # Free GPU memory before next participant
+                if hasattr(participant, 'model') and participant.device.type == 'cuda':
+                    try:
+                        participant.model = participant.model.cpu()
+                    except Exception:
+                        pass
+                    torch.cuda.empty_cache()
 
         # Also read any updates written to shared memory directly
         shared_updates = self.shared_memory.read_updates()
@@ -190,6 +226,12 @@ class FederatedCoordinator:
         for pid, info in anomalies.items():
             if pid in self.participants:
                 participant = self.participants[pid]
+                self._add_log({
+                    "timestamp": time.time(),
+                    "round": self._current_round,
+                    "level": "WARNING",
+                    "message": f"Round {self._current_round}: anomalous participant detected — {pid} (score={info.get('score', 'N/A')})",
+                })
 
                 if self.config.auto_remove_malicious:
                     self.remove_participant(pid)
@@ -235,6 +277,12 @@ class FederatedCoordinator:
         self.global_model.load_state_dict(new_state)
         self.shared_memory.write_model(self.global_model)
 
+        self._add_log({
+            "timestamp": time.time(),
+            "round": self._current_round,
+            "level": "INFO",
+            "message": f"Round {self._current_round}: aggregation complete ({self.config.aggregation_strategy}), global model updated",
+        })
         logger.info("Round %d: Aggregation complete, global model updated", self._current_round)
 
     def check_convergence(self, round_loss: float) -> bool:
@@ -254,6 +302,12 @@ class FederatedCoordinator:
 
         self._rounds_no_improve += 1
         if self._rounds_no_improve >= self.config.max_rounds_no_improve:
+            self._add_log({
+                "timestamp": time.time(),
+                "round": self._current_round,
+                "level": "INFO",
+                "message": f"Training converged — no improvement for {self._rounds_no_improve} rounds (threshold={self.config.convergence_threshold:.6f}, best_loss={self._best_loss:.6f})",
+            })
             logger.info(
                 "Converged: no improvement for %d rounds (threshold=%.6f)",
                 self._rounds_no_improve, self.config.convergence_threshold,
@@ -414,6 +468,12 @@ class FederatedCoordinator:
             path,
         )
 
+        self._add_log({
+            "timestamp": time.time(),
+            "round": round_num,
+            "level": "INFO",
+            "message": f"{'Final' if is_final else 'Round ' + str(round_num)} checkpoint saved to {path}",
+        })
         logger.info("Saved checkpoint: %s", path)
         return path
 
@@ -425,16 +485,42 @@ class FederatedCoordinator:
                 losses.append(p._local_loss_history[-1])
         return sum(losses) / max(len(losses), 1)
 
+    def _add_log(self, entry: dict[str, Any]) -> None:
+        self._training_log.append(entry)
+        if self._on_log_updated is not None:
+            try:
+                self._on_log_updated()
+            except Exception as exc:
+                logger.warning("Failed to persist training log: %s", exc)
+
     def _log_round_event(self, participant_id: str, metrics: dict[str, Any]) -> None:
         """Log a training event for audit trail."""
-        log_entry = {
+        loss = metrics.get("loss", 0)
+        elapsed = metrics.get("elapsed_seconds", 0)
+        steps = metrics.get("steps", 0)
+        self._add_log({
             "timestamp": time.time(),
             "round": self._current_round,
             "participant_id": participant_id,
-            "event": "local_training_complete",
+            "level": "INFO",
+            "message": f"Round {self._current_round}: participant {participant_id} completed local training — loss={loss:.4f}, steps={steps}, elapsed={elapsed:.1f}s",
             "metrics": metrics,
-        }
-        self._training_log.append(log_entry)
+        })
+
+    def cleanup(self) -> None:
+        """Release all GPU resources held by the coordinator and its participants."""
+        for participant in self.participants.values():
+            if hasattr(participant, 'model') and participant.device.type == 'cuda':
+                try:
+                    participant.model = participant.model.cpu()
+                except Exception:
+                    pass
+        try:
+            self.global_model = self.global_model.cpu()
+        except Exception:
+            pass
+        torch.cuda.empty_cache()
+        logger.info("Coordinator GPU resources released")
 
     def get_status(self) -> dict[str, Any]:
         """Get the current coordinator status."""

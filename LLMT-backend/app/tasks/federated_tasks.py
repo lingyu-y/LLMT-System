@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import tempfile
@@ -179,7 +180,7 @@ def _resolve_dataset_paths(ds, config) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def _build_participant_from_db(
-    p, config, provider, tokenizer, db, shared_memory,
+    p, config, provider, tokenizer, db, shared_memory, model,
 ):
     """Build a FederatedParticipant from a DB FederatedParticipant row.
 
@@ -233,7 +234,7 @@ def _build_participant_from_db(
                 )
                 logger.info(
                     "Participant %s: loaded dataset '%s' (%d samples) from %s",
-                    p.participant_id, ds.name, len(finetune_ds), local_path,
+                    p.participant_id, ds.name, len(finetune_ds), local_paths[0],
                 )
             else:
                 logger.warning(
@@ -272,7 +273,7 @@ def _build_participant_from_db(
     return FederatedParticipant(
         config=config,
         participant_config=p_config,
-        model=provider.get_model(config.get_model_config_dict()),
+        model=model,
         train_dataloader=train_dataloader,
         loss_fn=provider.get_loss_fn(config.get_model_config_dict()),
         shared_memory=shared_memory,
@@ -307,6 +308,7 @@ def run_federated_task(self, task_code: str) -> dict:
     from app.models.federated import FederatedTask, FederatedParticipant as DBParticipant
 
     db = SessionLocal()
+    coordinator = None
     try:
         task = db.query(FederatedTask).filter(FederatedTask.task_code == task_code).first()
         if task is None:
@@ -334,7 +336,7 @@ def run_federated_task(self, task_code: str) -> dict:
         # Seed initial participants
         for p in task.participants:
             participant = _build_participant_from_db(
-                p, config, provider, tokenizer, db, coordinator.shared_memory,
+                p, config, provider, tokenizer, db, coordinator.shared_memory, model,
             )
             coordinator.register_participant(participant)
 
@@ -355,12 +357,36 @@ def run_federated_task(self, task_code: str) -> dict:
             db.commit()
             return {"status": "failed", "error": task.error_message, "init_info": init_info}
 
+        # Persist initial logs to DB so frontend sees them immediately
+        task.training_log_json = coordinator._training_log
+        db.commit()
+
         # -------------------------------------------------------------------
         # Explicit training loop with per-round participant sync from DB
         # -------------------------------------------------------------------
         coordinator._status = "running"
         training_start = time.time()
+        last_round_with_updates = 0
+
+        def _persist_logs():
+            """Write training logs to DB so frontend sees real-time progress."""
+            from sqlalchemy import text
+            db.execute(
+                text("UPDATE federated_tasks SET training_log_json = CAST(:log AS json) WHERE id = :id"),
+                {"log": json.dumps(coordinator._training_log, default=str), "id": task.id},
+            )
+            db.commit()
+
+        coordinator._on_log_updated = _persist_logs
+        coordinator._add_log({
+            "timestamp": time.time(),
+            "round": 0,
+            "level": "INFO",
+            "message": f"Training started — {config.num_rounds} rounds, {active_count} active participants, strategy={config.aggregation_strategy}",
+        })
+
         round_results: list[dict[str, Any]] = []
+        _persist_logs()
 
         for round_num in range(1, config.num_rounds + 1):
             coordinator._current_round = round_num
@@ -385,13 +411,21 @@ def run_federated_task(self, task_code: str) -> dict:
 
             # ---- distribute model ----
             coordinator.distribute_model()
+            _persist_logs()
 
             # ---- collect updates ----
             updates = coordinator.collect_updates()
+            _persist_logs()
             if not updates:
                 logger.warning("No updates received in round %d, skipping", round_num)
                 _persist_round_progress(db, task, coordinator, round_num)
+                # If no updates for 3 consecutive rounds, abort
+                if round_num - last_round_with_updates >= 3:
+                    raise RuntimeError(
+                        f"No participant updates for {round_num - last_round_with_updates} consecutive rounds"
+                    )
                 continue
+            last_round_with_updates = round_num
 
             # ---- detect anomalies ----
             anomaly_report = coordinator.detect_and_handle_anomalies(updates)
@@ -484,10 +518,26 @@ def run_federated_task(self, task_code: str) -> dict:
         from datetime import datetime, timezone as tz
         task.ended_at = datetime.now(tz.utc)
         db.commit()
+
+        # Promote checkpoint to a model version
+        try:
+            _promote_federated_model(db, task, config, coordinator, result, tokenizer=tokenizer, creator_id=task.creator_id)
+        except Exception as promo_exc:
+            logger.exception("Model promotion failed: %s", promo_exc)
+            coordinator._add_log({
+                "timestamp": time.time(), "round": coordinator._current_round,
+                "level": "ERROR",
+                "message": f"Model promotion failed: {promo_exc}",
+            })
         return result
 
     except Exception as e:
         logger.exception("Federated task %s failed: %s", task_code, e)
+        if coordinator is not None:
+            try:
+                coordinator.cleanup()
+            except Exception:
+                pass
         try:
             db.refresh(task)
             if task.status == "cancelled":
@@ -501,11 +551,153 @@ def run_federated_task(self, task_code: str) -> dict:
         return {"status": "failed", "error": str(e)}
     finally:
         db.close()
+        if coordinator is not None:
+            try:
+                coordinator.cleanup()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _promote_federated_model(
+    db, task, config, coordinator, result, tokenizer=None, creator_id: int | None = None,
+) -> None:
+    """Promote the final federated checkpoint to a ModelVersion record."""
+    import re
+
+    from app.repositories.model_repository import create_model as create_model_version
+    from app.core.database import get_minio_client
+
+    final_path = result.get("final_model_path")
+    if not final_path or not os.path.isfile(final_path):
+        msg = f"No final checkpoint at {final_path}, skipping model promotion"
+        logger.warning("Federated task %s: %s", task.task_code, msg)
+        coordinator._add_log({
+            "timestamp": time.time(), "round": coordinator._current_round,
+            "level": "WARN", "message": msg,
+        })
+        return
+
+    coord = coordinator
+    coord._add_log({
+        "timestamp": time.time(), "round": coord._current_round,
+        "level": "INFO", "message": "Promoting federated checkpoint to model registry...",
+    })
+
+    safe_name = re.sub(r"[^a-zA-Z0-9一-鿿_-]", "_", task.task_name or "federated_model")
+    model_code = f"fl-{safe_name[:40]}-{task.task_code}"
+    model_name = task.task_name or "Federated Model"
+
+    training_metadata: dict = {
+        "task_type": "federated",
+        "task_code": task.task_code,
+        "federated_task_id": task.id,
+        "model_type": config.model_type,
+        "num_rounds": config.num_rounds,
+        "aggregation_strategy": config.aggregation_strategy,
+        "num_participants": len(task.participants or []),
+        "best_loss": result.get("best_loss"),
+        "total_elapsed_seconds": result.get("total_elapsed_seconds"),
+        # Model config must be at top level so inference engine can read it
+        "vocab_size": config.vocab_size,
+        "hidden_size": config.hidden_size,
+        "num_layers": config.num_layers,
+        "num_attention_heads": config.num_attention_heads,
+        "seq_length": config.seq_length,
+        "dropout": config.dropout,
+        "model_config": config.get_model_config_dict(),
+    }
+    metrics = {
+        "best_loss": result.get("best_loss"),
+        "total_rounds": result.get("total_rounds"),
+        "participant_count": len(task.participants or []),
+    }
+
+    # Create ModelVersion record FIRST to get the auto-generated version string
+    model_version = create_model_version(
+        db=db,
+        model_name=model_name,
+        model_code=model_code,
+        description=task.description or "",
+        framework="pytorch",
+        metrics=metrics,
+        training_metadata=training_metadata,
+        task_id=None,
+        creator_id=creator_id,
+    )
+    storage_path = model_version.storage_path  # e.g. models/{code}/v1.0.0
+
+    # Upload files to MinIO at the correct storage_path
+    minio_uploaded = False
+    try:
+        minio = get_minio_client()
+        bucket = "models"
+        if not minio.bucket_exists(bucket):
+            minio.make_bucket(bucket)
+
+        # Upload checkpoint as checkpoint.pt (inference engine recognises:
+        # mp_rank_00_model_states.pt > checkpoint.pt > model_states.pt)
+        dest_ckpt = f"{storage_path}/checkpoint.pt"
+        minio.fput_object(bucket, dest_ckpt, final_path)
+        logger.info("Uploaded checkpoint -> minio://%s/%s", bucket, dest_ckpt)
+
+        # Save and upload tokenizer vocab
+        if tokenizer is not None:
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
+                vocab_path = tmp.name
+                try:
+                    tokenizer.save_vocab(vocab_path)
+                except AttributeError:
+                    try:
+                        tokenizer.save_pretrained(os.path.dirname(vocab_path))
+                    except Exception:
+                        pass
+            if os.path.isfile(vocab_path) and os.path.getsize(vocab_path) > 0:
+                minio.fput_object(bucket, f"{storage_path}/tokenizer_vocab.json", vocab_path)
+                logger.info("Uploaded tokenizer vocab -> minio://%s/%s/tokenizer_vocab.json", bucket, storage_path)
+            try:
+                os.unlink(vocab_path)
+            except Exception:
+                pass
+
+            # Try uploading HuggingFace tokenizer directory
+            try:
+                tmp_dir = tempfile.mkdtemp()
+                tokenizer.save_pretrained(tmp_dir)
+                for fname in os.listdir(tmp_dir):
+                    fpath = os.path.join(tmp_dir, fname)
+                    if os.path.isfile(fpath):
+                        minio.fput_object(bucket, f"{storage_path}/tokenizer/{fname}", fpath)
+                import shutil
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                logger.info("Uploaded tokenizer/ -> minio://%s/%s/tokenizer/", bucket, storage_path)
+            except Exception:
+                pass
+
+        minio_uploaded = True
+    except Exception as exc:
+        logger.warning("MinIO upload failed for %s: %s", storage_path, exc)
+
+    # Update result_json with promotion info
+    task.result_json = {
+        **(task.result_json or {}),
+        "promoted_model_code": model_version.model_code,
+        "promoted_model_version": model_version.version,
+        "promoted_model_id": model_version.id,
+        "minio_uploaded": minio_uploaded,
+    }
+    db.commit()
+    coord._add_log({
+        "timestamp": time.time(), "round": coord._current_round,
+        "level": "INFO",
+        "message": f"Model promoted: {model_code} v{model_version.version} (id={model_version.id})",
+    })
+    logger.info("Federated model promoted: %s v%s", model_code, model_version.version)
+
 
 def _sync_participants(
     coordinator,
@@ -541,7 +733,7 @@ def _sync_participants(
     for pid in active_db_ids - coord_ids:
         p_row = db_participants[pid]
         participant = _build_participant_from_db(
-            p_row, config, provider, tokenizer, db, coordinator.shared_memory,
+            p_row, config, provider, tokenizer, db, coordinator.shared_memory, model,
         )
         coordinator.add_participant_dynamic(participant)
 
@@ -591,6 +783,7 @@ def _persist_round_progress(
         if coordinator._best_loss != float("inf")
         else None
     )
+    task.training_log_json = coordinator._training_log
 
     # Update participant runtime stats from coordinator state
     db_participants: dict[str, DBParticipant] = {
