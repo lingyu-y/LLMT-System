@@ -136,6 +136,8 @@ def get_gpu_count() -> int:
 def create_task(db: Session, body: TrainingTaskCreate, creator_id: int) -> TrainingTaskOut:
     """Create a training task and dispatch it to Celery."""
     config_dict = body.config.model_dump()
+    if body.base_model_version_id is not None:
+        config_dict["base_model_version_id"] = body.base_model_version_id
 
     task = repo.create_task(
         db,
@@ -477,10 +479,18 @@ def get_options(db: Session) -> dict[str, Any]:
     """Return available options for training configuration."""
     from app.repositories import model_repository
 
-    models = model_repository.get_models(db, page=1, page_size=1000)[0]
-    model_options = [
-        {"value": m.model_code, "label": f"{m.model_name} ({m.version})"}
-        for m in models
+    # Base models for fine-tune (continue training from existing model version)
+    all_models = model_repository.get_models(db, page=1, page_size=1000)[0]
+    base_models = [
+        {
+            "value": m.id,
+            "label": f"{m.model_name} ({m.version})",
+            "model_code": m.model_code,
+            "version": m.version,
+            "model_name": m.model_name,
+            "hyperparams_json": m.hyperparams_json,
+        }
+        for m in all_models
     ]
 
     datasets = (
@@ -519,7 +529,7 @@ def get_options(db: Session) -> dict[str, Any]:
     ]
 
     return {
-        "models": model_options,
+        "base_models": base_models,
         "datasets": dataset_options,
         "frameworks": frameworks,
         "gpu_options": gpu_options,
@@ -578,6 +588,16 @@ def validate_config(config: TrainingConfigDict, framework: str, strategy: str) -
 # Promote to model
 # ---------------------------------------------------------------------------
 
+def _gen_model_code(task) -> str:
+    """Generate a sanitized model_code from a task's name."""
+    import re
+    model_code = re.sub(r"[^a-zA-Z0-9一-鿿_-]", "-", task.task_name.lower())
+    model_code = re.sub(r"-+", "-", model_code).strip("-")
+    if not model_code:
+        model_code = f"model-{task.task_code.lower()}"
+    return model_code
+
+
 def promote_to_model(db: Session, task_id: int) -> dict | None:
     """Promote a completed training task's checkpoints to a ModelVersion.
 
@@ -599,13 +619,22 @@ def promote_to_model(db: Session, task_id: int) -> dict | None:
         return {"model_code": existing.model_code, "version": existing.version, "id": existing.id}
 
     config = task.config_json or {}
-    model_type = config.get("model_type", "gpt2")
+    model_type = "gpt2"
     framework = task.framework or "pytorch"
 
-    model_code = re.sub(r"[^a-zA-Z0-9一-鿿_-]", "-", task.task_name.lower())
-    model_code = re.sub(r"-+", "-", model_code).strip("-")
-    if not model_code:
-        model_code = f"model-{task.task_code.lower()}"
+    # If fine-tune, reuse base model's model_code for same version history
+    base_model_version_id = config.get("base_model_version_id")
+    if base_model_version_id is not None:
+        base_mv = db.query(ModelVersion).filter(ModelVersion.id == base_model_version_id).first()
+        if base_mv is not None:
+            model_code = base_mv.model_code
+            model_name_val = base_mv.model_name
+        else:
+            model_code = _gen_model_code(task)
+            model_name_val = task.task_name
+    else:
+        model_code = _gen_model_code(task)
+        model_name_val = task.task_name
 
     hyperparams: dict[str, Any] = {
         "framework": framework,
@@ -737,7 +766,7 @@ def promote_to_model(db: Session, task_id: int) -> dict | None:
 
     model = model_repository.create_model(
         db,
-        model_name=task.task_name,
+        model_name=model_name_val,
         model_code=model_code,
         tag=f"from-{task.task_code}",
         description=f"从训练任务 {task.task_code} 创建",

@@ -39,9 +39,20 @@
               </el-row>
               <el-row :gutter="16">
                 <el-col :span="12">
-                  <el-form-item label="训练模型">
-                    <el-select v-model="form.config.model_type" class="full" placeholder="选择模型">
-                      <el-option v-for="item in options.models" :key="item.value" :label="item.label" :value="item.value" />
+                  <el-form-item label="基础模型">
+                    <el-select
+                      v-model="baseModelId"
+                      class="full"
+                      placeholder="选填，不选则从零训练"
+                      clearable
+                      @change="onBaseModelChange"
+                    >
+                      <el-option
+                        v-for="item in options.base_models"
+                        :key="item.value"
+                        :label="item.label"
+                        :value="item.value"
+                      />
                     </el-select>
                   </el-form-item>
                 </el-col>
@@ -57,18 +68,6 @@
             <el-collapse style="margin-top:8px">
               <el-collapse-item title="训练超参数（点击展开）" name="hp">
                 <el-form label-position="top">
-                  <el-row :gutter="12">
-                    <el-col :span="12">
-                      <el-form-item label="Hidden Size（768=标准, 384=轻量）">
-                        <el-input-number v-model="form.config.hidden_size" :min="128" :max="2048" :step="64" style="width:100%" />
-                      </el-form-item>
-                    </el-col>
-                    <el-col :span="12">
-                      <el-form-item label="Num Layers（12=标准, 6=轻量）">
-                        <el-input-number v-model="form.config.num_layers" :min="2" :max="48" style="width:100%" />
-                      </el-form-item>
-                    </el-col>
-                  </el-row>
                   <el-row :gutter="12">
                     <el-col :span="8">
                       <el-form-item label="Batch Size">
@@ -297,7 +296,7 @@ const logContainer = ref<HTMLDivElement>()
 let refreshTimer: number | null = null
 
 const options = reactive<TrainingOptions>({
-  models: [],
+  base_models: [],
   datasets: [],
   frameworks: [
     { value: 'pytorch', label: 'PyTorch' },
@@ -319,13 +318,15 @@ const options = reactive<TrainingOptions>({
 
 const gpuOptionValue = ref('1')
 
+const baseModelId = ref<number | undefined>(undefined)
+
 const form = reactive({
   task_name: '',
   dataset_id: undefined as number | undefined,
   framework: 'pytorch' as 'pytorch' | 'deepspeed' | 'megatron',
   parallel_strategy: 'ddp' as string,
   config: {
-    model_type: 'gpt2', hidden_size: 384, num_layers: 6, num_gpus: 1,
+    hidden_size: 384, num_layers: 6, num_gpus: 1,
     batch_size: 1, learning_rate: 2e-5,
     max_epochs: 10, max_steps: 0, seq_length: 128, precision: 'fp16' as const,
   },
@@ -476,7 +477,7 @@ const loadOptions = async () => {
   try {
     const res = await fetchTrainingOptions()
     if (res) {
-      if (res.models?.length) options.models = res.models
+      if (res.base_models?.length) options.base_models = res.base_models as any
       if (res.datasets?.length) options.datasets = res.datasets
       if (res.frameworks?.length) options.frameworks = res.frameworks
       if (res.gpu_options?.length) options.gpu_options = res.gpu_options
@@ -509,6 +510,18 @@ const selectTask = async (row: TrainingTaskListItem) => {
   await loadLogs(row.id)
 }
 
+const onBaseModelChange = (selectedId: number | undefined) => {
+  if (selectedId == null) return  // cleared, unlock is automatic via isBaseModelSelected
+  const found = options.base_models.find(m => m.value === selectedId)
+  if (!found) return
+  const hp = found.hyperparams_json || {}
+  if (hp.hidden_size != null) form.config.hidden_size = hp.hidden_size as number
+  if (hp.num_layers != null) form.config.num_layers = hp.num_layers as number
+  if (hp.num_attention_heads != null) form.config.num_attention_heads = hp.num_attention_heads as number
+  if (hp.vocab_size != null) form.config.vocab_size = hp.vocab_size as number
+  if (hp.seq_length != null) form.config.seq_length = hp.seq_length as number
+}
+
 const clearLogs = () => { trainingLogs.value = [] }
 
 const startTraining = async () => {
@@ -518,10 +531,14 @@ const startTraining = async () => {
     const gpuCount = Number(gpuOptionValue.value)
     const cfg: Record<string, any> = { ...form.config, num_gpus: gpuCount }
     if (!cfg.max_steps) delete cfg.max_steps
-    const res = await createTrainingTask({
+    const payload: any = {
       task_name: form.task_name, dataset_id: form.dataset_id!, framework: form.framework,
       parallel_strategy: form.parallel_strategy as any, config: cfg,
-    })
+    }
+    if (baseModelId.value != null) {
+      payload.base_model_version_id = baseModelId.value
+    }
+    const res = await createTrainingTask(payload)
     ElMessage.success(`训练任务已创建: ${res.data?.task_code ?? ''}`)
     await loadTasks(); await loadStats()
   } catch (e: unknown) { ElMessage.error((e as Error).message || '创建失败') }

@@ -243,6 +243,11 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
         model_provider = ModelRegistry.get(model_type)
         model = model_provider.get_model(config_dict.get("model", {}))
 
+        # --- Fine-tune: load pretrained weights from a previous ModelVersion ---
+        base_model_version_id = config_dict.get("base_model_version_id")
+        if base_model_version_id is not None:
+            _load_pretrained_weights(model, base_model_version_id)
+
         # Build dataloaders from config
         from llmt_training.data.data_utils import create_dataset_from_config, build_dataloaders
         is_distributed = config_dict.get("strategy", {}).get("num_gpus", 1) > 1
@@ -753,6 +758,88 @@ def _download_dataset_from_minio(
         return None
 
 
+def _load_pretrained_weights(model, base_model_version_id: int) -> None:
+    """Load pretrained model weights from a previous ModelVersion for fine-tuning.
+
+    Downloads checkpoint.pt from MinIO models bucket, then loads the state_dict
+    into *model* in-place.  Reports progress to stdout so it appears in task logs.
+    """
+    import logging
+    import tempfile
+
+    _log = logging.getLogger(__name__)
+
+    try:
+        from sqlalchemy import create_engine as _ce
+        from sqlalchemy.orm import Session as _S
+        from app.models.model_version import ModelVersion as _MV
+        from app.core.database import get_minio_client
+
+        _engine = _ce(settings.postgres_database_url)
+        with _S(_engine) as db:
+            mv = db.query(_MV).filter(_MV.id == base_model_version_id).first()
+            if mv is None:
+                print(
+                    f"[TrainingTask] WARNING: base_model_version_id={base_model_version_id} not found, "
+                    "training from scratch",
+                    flush=True,
+                )
+                return
+
+            model_code = mv.model_code
+            version = mv.version
+            storage_path = mv.storage_path  # e.g. "models/my-model/v1.0.0"
+
+        print(
+            f"[TrainingTask] Loading pretrained weights from {model_code} {version} "
+            f"(storage_path={storage_path})",
+            flush=True,
+        )
+
+        minio = get_minio_client()
+        model_bucket = settings.MINIO_BUCKET_MODELS
+
+        # Check if checkpoint exists in MinIO
+        ckpt_object = f"{storage_path}/checkpoint.pt"
+        local_dir = tempfile.mkdtemp(prefix="finetune_ckpt_")
+        local_path = os.path.join(local_dir, "checkpoint.pt")
+
+        minio.fget_object(model_bucket, ckpt_object, local_path)
+        print(f"[TrainingTask] Downloaded checkpoint from MinIO: {ckpt_object}", flush=True)
+
+        checkpoint = torch.load(local_path, map_location="cpu")
+        # Resolve the actual state_dict from the checkpoint wrapper.
+        # PyTorchTrainer saves under "model_state_dict"; other conventions also handled.
+        if "model_state_dict" in checkpoint:
+            state_dict = checkpoint["model_state_dict"]
+        elif "model" in checkpoint:
+            state_dict = checkpoint["model"]
+        elif "state_dict" in checkpoint:
+            state_dict = checkpoint["state_dict"]
+        else:
+            state_dict = checkpoint
+
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(f"[TrainingTask] Missing keys (will use random init): {missing}", flush=True)
+        if unexpected:
+            print(f"[TrainingTask] Unexpected keys (ignored): {unexpected}", flush=True)
+        print(
+            f"[TrainingTask] Successfully loaded pretrained weights from {model_code} {version}",
+            flush=True,
+        )
+
+        import shutil
+        shutil.rmtree(local_dir, ignore_errors=True)
+    except Exception as exc:
+        print(
+            f"[TrainingTask] WARNING: Failed to load pretrained weights: {exc}. "
+            "Training from scratch.",
+            flush=True,
+        )
+        _log.exception("_load_pretrained_weights failed")
+
+
 def _build_training_config(
     task_code: str,
     framework: str,
@@ -784,7 +871,7 @@ def _build_training_config(
 
     # Map flat keys to nested structure
     model_keys = {
-        "model_type", "vocab_size", "hidden_size", "num_layers",
+        "vocab_size", "hidden_size", "num_layers",
         "num_attention_heads", "intermediate_size", "seq_length",
         "max_position_embeddings", "dropout", "layer_norm_eps", "activation",
     }
@@ -822,7 +909,10 @@ def _build_training_config(
             config["deepspeed_overrides"] = value
         elif key == "megatron_overrides":
             config["megatron_overrides"] = value
+        elif key == "base_model_version_id":
+            config["base_model_version_id"] = value
 
+    config["model"]["model_type"] = "gpt2"
     return config
 
 
@@ -917,16 +1007,34 @@ def _promote_to_model(task_code: str) -> dict | None:
                 return {"model_code": existing.model_code, "version": existing.version, "id": existing.id}
 
             config = task.config_json or {}
-            model_type = config.get("model_type", "gpt2")
+            model_type = "gpt2"
             framework = task.framework or "pytorch"
 
-            # Generate model_code from task_name (sanitize for use as model code)
-            model_code = re.sub(r"[^a-zA-Z0-9一-鿿_-]", "-", task.task_name.lower())
-            model_code = re.sub(r"-+", "-", model_code).strip("-")
-            if not model_code:
-                model_code = f"model-{task_code.lower()}"
-
-            model_name = task.task_name
+            # If this was a fine-tune task, reuse the base model's model_code
+            # so the new version goes into the same model's version history.
+            base_model_version_id = config.get("base_model_version_id")
+            if base_model_version_id is not None:
+                base_mv = (
+                    db.query(model_repository.ModelVersion)
+                    .filter(model_repository.ModelVersion.id == base_model_version_id)
+                    .first()
+                )
+                if base_mv is not None:
+                    model_code = base_mv.model_code
+                    model_name = base_mv.model_name
+                else:
+                    model_code = re.sub(r"[^a-zA-Z0-9一-鿿_-]", "-", task.task_name.lower())
+                    model_code = re.sub(r"-+", "-", model_code).strip("-")
+                    if not model_code:
+                        model_code = f"model-{task_code.lower()}"
+                    model_name = task.task_name
+            else:
+                # Generate model_code from task_name (sanitize for use as model code)
+                model_code = re.sub(r"[^a-zA-Z0-9一-鿿_-]", "-", task.task_name.lower())
+                model_code = re.sub(r"-+", "-", model_code).strip("-")
+                if not model_code:
+                    model_code = f"model-{task_code.lower()}"
+                model_name = task.task_name
 
             # Build structured hyperparams from training config
             hyperparams: dict[str, Any] = {

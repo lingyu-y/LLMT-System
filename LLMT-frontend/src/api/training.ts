@@ -5,7 +5,6 @@ import { del, get, post, unwrap, type ApiMessage } from './http'
 // ---------------------------------------------------------------------------
 
 export interface TrainingConfigDict {
-  model_type: string
   vocab_size: number
   hidden_size: number
   num_layers: number
@@ -48,6 +47,7 @@ export interface TrainingTaskCreate {
   framework: 'pytorch' | 'deepspeed' | 'megatron'
   parallel_strategy: 'ddp' | 'zero1' | 'zero2' | 'zero3' | 'zero3_offload' | 'tp' | 'pp' | '3d'
   config: Partial<TrainingConfigDict>
+  base_model_version_id?: number
 }
 
 export interface ScaleTaskRequest {
@@ -104,8 +104,17 @@ export interface DatasetOptionItem {
   label: string
 }
 
+export interface BaseModelOption {
+  value: number       // ModelVersion.id
+  label: string       // "model_name (version)"
+  model_code: string
+  version: string
+  model_name: string
+  hyperparams_json: Record<string, unknown>
+}
+
 export interface TrainingOptions {
-  models: OptionItem[]
+  base_models: BaseModelOption[]
   datasets: DatasetOptionItem[]
   frameworks: OptionItem[]
   gpu_options: OptionItem[]

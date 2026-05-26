@@ -47,7 +47,6 @@
         <div class="detail-actions">
           <el-button :icon="Upload" @click="importDialogVisible = true">导入</el-button>
           <el-button :icon="Download" @click="openExportDialog">导出</el-button>
-          <el-button type="primary" :icon="Plus" @click="openVersionDialog">创建新版本</el-button>
           <el-popconfirm title="确定删除此模型？将删除所有版本及MinIO文件" @confirm="handleDeleteModel">
             <template #reference>
               <el-button type="danger" :icon="Delete">删除</el-button>
@@ -252,18 +251,6 @@
       </div>
     </el-drawer>
 
-    <el-dialog v-model="versionDialogVisible" title="创建模型版本" width="560px">
-      <el-form label-position="top">
-        <el-form-item label="版本号"><el-input v-model="versionForm.version" placeholder="例如 v1.2.0" /></el-form-item>
-        <el-form-item label="标签"><el-input v-model="versionForm.tag" placeholder="stable / candidate" /></el-form-item>
-        <el-form-item label="说明"><el-input v-model="versionForm.description" type="textarea" :rows="3" /></el-form-item>
-      </el-form>
-      <template #footer>
-        <el-button @click="versionDialogVisible = false">取消</el-button>
-        <el-button type="primary" @click="submitVersion">创建</el-button>
-      </template>
-    </el-dialog>
-
     <el-dialog v-model="importDialogVisible" title="从模型仓库导入" width="560px">
       <el-form label-position="top">
         <el-form-item label="源路径"><el-input v-model="importForm.source_path" placeholder="models/source/path" /></el-form-item>
@@ -292,13 +279,12 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { ArrowLeft, Check, DataLine, Delete, Download, Management, Plus, Promotion, RefreshLeft, Upload } from '@element-plus/icons-vue'
+import { ArrowLeft, Check, DataLine, Delete, Download, Management, Promotion, RefreshLeft, Upload } from '@element-plus/icons-vue'
 
 import { getInferenceUsage, predict, type InferenceUsage, type PredictResult } from '@/api/inference'
 import StatusBadge from '@/components/StatusBadge.vue'
 import {
   compareModelVersions,
-  createModelVersion,
   deleteModel,
   exportModel,
   getModelDownloadUrl,
@@ -340,7 +326,7 @@ const keyword = ref('')
 const typeFilter = ref('全部类型')
 const selectedModel = ref<ModelItem | null>(null)
 const compareDrawerVisible = ref(false)
-const versionDialogVisible = ref(false)
+
 const importDialogVisible = ref(false)
 const exportDialogVisible = ref(false)
 const compareVersion = ref<VersionItem>()
@@ -358,7 +344,7 @@ const rateLimitForm = ref({
   requests_per_minute: 100,
   concurrent: 10,
 })
-const versionForm = ref({ version: '', tag: '', description: '' })
+
 const importForm = ref({ source_path: '', model_name: '', model_code: '', version: 'v1.0.0' })
 const exportForm = ref({ target_path: '' })
 
@@ -528,11 +514,6 @@ const openCompareDrawer = async (version: VersionItem) => {
   compareDrawerVisible.value = true
 }
 
-const openVersionDialog = () => {
-  versionForm.value = { version: '', tag: '', description: '' }
-  versionDialogVisible.value = true
-}
-
 const handleDeleteModel = async () => {
   if (!selectedModel.value?.id) return
   try {
@@ -607,21 +588,6 @@ const saveRateLimit = async () => {
   ElMessage.success('限流策略已保存')
 }
 
-const submitVersion = async () => {
-  if (!selectedModel.value || !versionForm.value.version.trim()) {
-    ElMessage.warning('请填写版本号')
-    return
-  }
-  await createModelVersion(selectedModel.value.id, {
-    version: versionForm.value.version,
-    tag: versionForm.value.tag,
-    description: versionForm.value.description,
-    framework: selectedModel.value.raw.framework,
-  })
-  versionDialogVisible.value = false
-  await loadVersions(selectedModel.value.id)
-  ElMessage.success('模型版本已创建')
-}
 
 const submitImport = async () => {
   if (!importForm.value.source_path || !importForm.value.model_name || !importForm.value.model_code) {
