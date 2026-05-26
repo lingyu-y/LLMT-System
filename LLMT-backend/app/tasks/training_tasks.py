@@ -808,9 +808,11 @@ def _load_pretrained_weights(model, base_model_version_id: int) -> None:
         print(f"[TrainingTask] Downloaded checkpoint from MinIO: {ckpt_object}", flush=True)
 
         checkpoint = torch.load(local_path, map_location="cpu")
-        # The checkpoint may wrap state_dict under a "model" key (PyTorchTrainer
-        # convention) or be a raw state_dict.
-        if "model" in checkpoint:
+        # Resolve the actual state_dict from the checkpoint wrapper.
+        # PyTorchTrainer saves under "model_state_dict"; other conventions also handled.
+        if "model_state_dict" in checkpoint:
+            state_dict = checkpoint["model_state_dict"]
+        elif "model" in checkpoint:
             state_dict = checkpoint["model"]
         elif "state_dict" in checkpoint:
             state_dict = checkpoint["state_dict"]
