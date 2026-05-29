@@ -11,3 +11,4 @@ LLMT-training/checkpoints/
 .Python
 industryinstruction.jsonl
 industryinstruction_80mb.jsonl
+LLMT-training/tokenizers/*.vocab
