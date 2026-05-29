@@ -11,6 +11,7 @@ import torch
 from llmt_training.data.pretrain_dataset import PretrainDataset
 from llmt_training.data.finetune_dataset import FinetuneDataset
 from llmt_training.data.data_utils import create_dataset_from_config
+from llmt_training.core.simple_tokenizer import SimpleTokenizer
 
 
 class TestPretrainDataset:
@@ -55,6 +56,23 @@ class TestFinetuneDataset:
             assert len(ds) == 10
         finally:
             os.unlink(path)
+
+    def test_prompt_response_masks_prompt_labels(self):
+        tokenizer = SimpleTokenizer(vocab_size=1000)
+        ds = FinetuneDataset(
+            [{"prompt": "Question one", "response": "Answer two"}],
+            seq_length=8,
+            tokenizer=tokenizer,
+        )
+
+        sample = ds[0]
+        answer_id = tokenizer.word_to_id["Answer"]
+        two_id = tokenizer.word_to_id["two"]
+
+        assert sample["labels"][0].item() == -100
+        assert sample["labels"][1].item() == answer_id
+        assert sample["labels"][2].item() == two_id
+        assert sample["labels"][3].item() == -100
 
 
 class TestCreateDataset:

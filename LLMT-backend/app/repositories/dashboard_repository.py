@@ -165,7 +165,8 @@ def get_summary(db: Session) -> dict:
         TrainingTask.ended_at >= today_start,
     ).count()
     alert_count = db.query(SystemLog).filter(
-        SystemLog.action.in_(["security_alert", "error", "critical"]),
+        SystemLog.action.in_(["error", "critical", "training_error", "training_failed"]),
+        SystemLog.resource.in_(["training_task", "training", "gpu", "resource"]),
         SystemLog.created_at >= today_start,
     ).count()
 
@@ -326,6 +327,8 @@ def get_training_tasks(db: Session) -> list[dict]:
 def get_activities(db: Session, limit: int = 10) -> list[dict]:
     logs = (
         db.query(SystemLog)
+        .filter(SystemLog.resource != "model_version")
+        .filter(~SystemLog.action.in_(["security_scan", "security_alert"]))
         .order_by(SystemLog.created_at.desc())
         .limit(limit)
         .all()
@@ -359,9 +362,10 @@ def get_alerts(db: Session, limit: int = 10) -> list[dict]:
         .filter(
             SystemLog.action.in_(
                 ["error", "ERROR", "critical", "CRITICAL", "alert", "ALERT",
-                 "security_alert", "login_failed", "login_blocked"]
+                 "training_error", "training_failed", "login_failed", "login_blocked"]
             )
         )
+        .filter(SystemLog.resource != "model_version")
         .order_by(SystemLog.created_at.desc())
         .limit(limit)
         .all()
@@ -369,7 +373,8 @@ def get_alerts(db: Session, limit: int = 10) -> list[dict]:
     if not logs:
         logs = (
             db.query(SystemLog)
-            .filter(SystemLog.action.in_(["error", "security_alert", "login_failed"]))
+            .filter(SystemLog.action.in_(["error", "training_error", "training_failed", "login_failed"]))
+            .filter(SystemLog.resource != "model_version")
             .order_by(SystemLog.created_at.desc())
             .limit(3)
             .all()

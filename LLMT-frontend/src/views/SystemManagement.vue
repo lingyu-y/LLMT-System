@@ -115,37 +115,56 @@
           <el-tab-pane v-if="canLogView" label="日志管理" name="logs">
             <div class="toolbar logs-toolbar">
               <el-select v-model="level" class="toolbar-select" placeholder="级别筛选" clearable>
+                <el-option label="DEBUG" value="DEBUG" />
                 <el-option label="INFO" value="INFO" />
                 <el-option label="WARN" value="WARN" />
                 <el-option label="ERROR" value="ERROR" />
+                <el-option label="CRITICAL" value="CRITICAL" />
+              </el-select>
+              <el-select v-model="category" class="toolbar-select" placeholder="类别筛选" clearable>
+                <el-option label="审计操作" value="audit" />
+                <el-option label="训练日志" value="training" />
+                <el-option label="异常日志" value="exception" />
+                <el-option label="应用日志" value="application" />
               </el-select>
               <el-select v-model="module" class="toolbar-select" placeholder="模块筛选" clearable>
-                <el-option label="模型训练" value="模型训练" />
-                <el-option label="模型管理" value="模型管理" />
-                <el-option label="数据处理" value="数据处理" />
-                <el-option label="文档生成" value="文档生成" />
-                <el-option label="系统" value="系统" />
-                <el-option label="系统管理" value="系统管理" />
+                <el-option label="训练任务" value="training" />
+                <el-option label="数据集" value="dataset" />
+                <el-option label="模型版本" value="model_version" />
+                <el-option label="认证" value="auth" />
+                <el-option label="用户" value="user" />
+                <el-option label="角色" value="role" />
+                <el-option label="应用异常" value="app.exception" />
               </el-select>
+              <el-input v-model="logKeyword" class="toolbar-input" placeholder="搜索日志内容" clearable @keyup.enter="loadLogs" />
+              <el-button :icon="Refresh" @click="loadLogs">刷新</el-button>
               <el-button :icon="Download" @click="handleExportLogs">导出日志</el-button>
             </div>
 
             <div class="table-wrap">
-              <el-table :data="filteredLogs" stripe>
+              <el-table :data="logs" stripe>
                 <el-table-column prop="created_at" label="时间" width="180" />
                 <el-table-column prop="level" label="级别" width="90">
                   <template #default="{ row }">
                     <el-tag :type="logLevelTagType(row.level)">{{ row.level ?? 'INFO' }}</el-tag>
                   </template>
                 </el-table-column>
+                <el-table-column label="类别" width="90">
+                  <template #default="{ row }">{{ logCategoryLabel(row.category) }}</template>
+                </el-table-column>
+                <el-table-column label="模块" width="110">
+                  <template #default="{ row }">{{ logModuleLabel(row.module || row.resource) }}</template>
+                </el-table-column>
                 <el-table-column prop="action" label="操作" width="110">
                   <template #default="{ row }">
                     <el-tag type="success">{{ row.action }}</el-tag>
                   </template>
                 </el-table-column>
-                <el-table-column prop="resource" label="资源" width="120" />
+                <el-table-column prop="task_code" label="任务" width="150" show-overflow-tooltip />
                 <el-table-column prop="username" label="用户" width="120" />
-                <el-table-column prop="detail" label="内容" min-width="260" />
+                <el-table-column label="内容" min-width="320" show-overflow-tooltip>
+                  <template #default="{ row }">{{ row.message || row.detail }}</template>
+                </el-table-column>
               </el-table>
             </div>
           </el-tab-pane>
@@ -208,7 +227,7 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Download, Plus } from '@element-plus/icons-vue'
+import { Download, Plus, Refresh } from '@element-plus/icons-vue'
 
 import StatusBadge from '@/components/StatusBadge.vue'
 import type { RoleCode } from '@/mock/auth'
@@ -262,6 +281,8 @@ const authStore = useAuthStore()
 const activeTab = ref('')
 const level = ref('')
 const module = ref('')
+const category = ref('')
+const logKeyword = ref('')
 const userKeyword = ref('')
 const userDialogVisible = ref(false)
 const assignDialogVisible = ref(false)
@@ -309,15 +330,29 @@ const filteredUsers = computed(() => {
   if (!keyword) return userRows.value
   return userRows.value.filter((item) => `${item.name}${item.account}`.toLowerCase().includes(keyword))
 })
-const filteredLogs = computed(() =>
-  logs.value.filter((item) => (!level.value || (item.level ?? 'INFO') === level.value) && (!module.value || item.resource === module.value)),
-)
-
 const logLevelTagType = (logLevel?: string) => {
+  if (logLevel === 'CRITICAL') return 'danger'
   if (logLevel === 'ERROR') return 'danger'
   if (logLevel === 'WARN') return 'warning'
   return 'info'
 }
+
+const logCategoryLabel = (value?: string) => ({
+  audit: '审计',
+  training: '训练',
+  exception: '异常',
+  application: '应用',
+}[value ?? ''] ?? value ?? '-')
+
+const logModuleLabel = (value?: string) => ({
+  training: '训练任务',
+  dataset: '数据集',
+  model_version: '模型版本',
+  auth: '认证',
+  user: '用户',
+  role: '角色',
+  'app.exception': '应用异常',
+}[value ?? ''] ?? value ?? '-')
 
 const formatRoleNames = (roleCodes: string[]) =>
   roleCodes.map((roleCode) => roleRows.value.find((role) => role.code === roleCode)?.name ?? roleCode).join('、')
@@ -355,22 +390,33 @@ const collectMenuIds = (items: SystemMenu[]) => {
 }
 
 const loadSystemData = async () => {
-  const [usersPage, rolesPage, menuTree, logsPage] = await Promise.all([
+  const [usersPage, rolesPage, menuTree] = await Promise.all([
     listUsers({ page: 1, page_size: 100 }),
     listRoles({ page: 1, page_size: 100 }),
     listMenus(),
-    listLogs({ page: 1, page_size: 100 }),
   ])
 
   userRows.value = usersPage.data.map(mapUser)
   roleRows.value = rolesPage.data.map(mapRole)
   menus.value = menuTree
   menuKeyIdMap.value = collectMenuIds(menuTree)
-  logs.value = logsPage.data
+  await loadLogs()
   if (!roleRows.value.some((role) => role.code === selectedMenuRole.value)) {
     selectedMenuRole.value = roleRows.value[0]?.code ?? 'admin'
   }
   await selectMenuRole(selectedMenuRole.value)
+}
+
+const loadLogs = async () => {
+  const logsPage = await listLogs({
+    page: 1,
+    page_size: 100,
+    keyword: logKeyword.value,
+    level: level.value,
+    module: module.value,
+    category: category.value,
+  })
+  logs.value = logsPage.data
 }
 
 const resetUserForm = () => {
@@ -511,7 +557,12 @@ const handleTabChange = (name: string | number) => {
 }
 
 const handleExportLogs = async () => {
-  const blob = await exportLogs()
+  const blob = await exportLogs({
+    keyword: logKeyword.value,
+    level: level.value,
+    module: module.value,
+    category: category.value,
+  })
   const url = URL.createObjectURL(blob)
   const link = document.createElement('a')
   link.href = url
@@ -537,6 +588,17 @@ watch(
     void selectMenuRole(roleCode)
   },
   { immediate: true },
+)
+
+watch(
+  [level, module, category],
+  () => {
+    if (activeTab.value === 'logs') {
+      loadLogs().catch((error) => {
+        ElMessage.error(error instanceof Error ? error.message : '日志加载失败')
+      })
+    }
+  },
 )
 
 onMounted(() => {

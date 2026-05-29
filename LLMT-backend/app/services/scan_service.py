@@ -1,10 +1,15 @@
-"""Clair 镜像漏洞扫描服务 — 模拟分析 + 风险评估 + 告警。"""
+"""Clair 镜像漏洞扫描服务 — 真实 Clair API + 模拟兜底。"""
 
+import base64
 import random
 import uuid
 from datetime import datetime, timezone
+from urllib.parse import quote
 
+import httpx
 from sqlalchemy.orm import Session
+
+from app.core.config import get_settings
 
 # 模拟漏洞数据库
 CVE_DATABASE = [
@@ -92,6 +97,177 @@ def simulate_clair_scan(model_code: str, model_version: str) -> list[dict]:
     return sorted(vulns, key=lambda v: severity_order.get(v["severity"], 99))
 
 
+def _find_image_ref(model, override: str | None = None) -> str | None:
+    meta = model.hyperparams_json or {}
+    return (
+        override
+        or meta.get("image_ref")
+        or meta.get("container_image")
+        or meta.get("docker_image")
+        or get_settings().CLAIR_DEFAULT_IMAGE_REF
+    )
+
+
+def _parse_image_ref(image_ref: str) -> tuple[str, str, str]:
+    """Parse registry/repository/reference from an OCI image reference."""
+    if "://" in image_ref:
+        image_ref = image_ref.split("://", 1)[1]
+    first, _, rest = image_ref.partition("/")
+    if not rest:
+        registry = "registry-1.docker.io"
+        remainder = f"library/{first}"
+    elif "." in first or ":" in first or first == "localhost":
+        registry = first
+        remainder = rest
+    else:
+        registry = "registry-1.docker.io"
+        remainder = image_ref
+
+    if "@" in remainder:
+        repository, reference = remainder.rsplit("@", 1)
+    elif ":" in remainder.rsplit("/", 1)[-1]:
+        repository, reference = remainder.rsplit(":", 1)
+    else:
+        repository, reference = remainder, "latest"
+    return registry, repository, reference
+
+
+def _registry_headers() -> dict[str, str]:
+    settings = get_settings()
+    headers = {
+        "Accept": ", ".join([
+            "application/vnd.oci.image.manifest.v1+json",
+            "application/vnd.docker.distribution.manifest.v2+json",
+            "application/vnd.oci.image.index.v1+json",
+            "application/vnd.docker.distribution.manifest.list.v2+json",
+        ]),
+    }
+    if settings.CLAIR_REGISTRY_AUTH_HEADER:
+        headers["Authorization"] = settings.CLAIR_REGISTRY_AUTH_HEADER
+    elif settings.CLAIR_REGISTRY_USERNAME and settings.CLAIR_REGISTRY_PASSWORD:
+        raw = f"{settings.CLAIR_REGISTRY_USERNAME}:{settings.CLAIR_REGISTRY_PASSWORD}".encode()
+        headers["Authorization"] = f"Basic {base64.b64encode(raw).decode()}"
+    return headers
+
+
+def _resolve_manifest(image_ref: str) -> dict:
+    """Resolve an image reference into the Clair Manifest object."""
+    settings = get_settings()
+    registry, repository, reference = _parse_image_ref(image_ref)
+    scheme = settings.CLAIR_REGISTRY_SCHEME or "https"
+    base = f"{scheme}://{registry}/v2/{repository}"
+    timeout = settings.CLAIR_SCAN_TIMEOUT_SECONDS
+
+    with httpx.Client(timeout=timeout, verify=not settings.CLAIR_REGISTRY_INSECURE, trust_env=False) as client:
+        manifest_url = f"{base}/manifests/{quote(reference, safe=':')}"
+        response = client.get(manifest_url, headers=_registry_headers())
+        response.raise_for_status()
+        manifest_digest = response.headers.get("Docker-Content-Digest") or reference
+        manifest = response.json()
+
+        media_type = manifest.get("mediaType", "")
+        if "manifest.list" in media_type or "image.index" in media_type:
+            manifests = manifest.get("manifests") or []
+            if not manifests:
+                raise RuntimeError("镜像 manifest list 为空")
+            manifest_digest = manifests[0]["digest"]
+            response = client.get(f"{base}/manifests/{manifest_digest}", headers=_registry_headers())
+            response.raise_for_status()
+            manifest = response.json()
+
+    layers = []
+    auth_headers = {}
+    auth_value = _registry_headers().get("Authorization")
+    if auth_value:
+        auth_headers = {"Authorization": [auth_value]}
+    for layer in manifest.get("layers", []):
+        digest = layer.get("digest")
+        if not digest:
+            continue
+        layer_obj = {
+            "hash": digest,
+            "uri": f"{base}/blobs/{quote(digest, safe=':')}",
+        }
+        if auth_headers:
+            layer_obj["headers"] = auth_headers
+        layers.append(layer_obj)
+
+    if not layers:
+        raise RuntimeError("镜像没有可扫描的 layers")
+
+    return {"hash": manifest_digest, "layers": layers}
+
+
+def _clair_headers(kind: str) -> dict[str, str]:
+    if kind == "index":
+        return {
+            "Content-Type": "application/vnd.clair.manifest.v1+json",
+            "Accept": "application/vnd.clair.index_report.v1+json",
+        }
+    return {"Accept": "application/vnd.clair.vulnerability_report.v1+json"}
+
+
+def _severity(value: str | None) -> str:
+    normalized = (value or "").lower()
+    if normalized in {"critical", "crit"}:
+        return "Critical"
+    if normalized in {"high", "important"}:
+        return "High"
+    if normalized in {"medium", "moderate"}:
+        return "Medium"
+    if normalized in {"low", "negligible"}:
+        return "Low"
+    return "Medium"
+
+
+def _normalize_clair_report(report: dict) -> list[dict]:
+    vulnerabilities = report.get("vulnerabilities") or {}
+    packages = report.get("packages") or {}
+    package_vulns = report.get("package_vulnerabilities") or {}
+    rows: list[dict] = []
+
+    for package_key, vuln_ids in package_vulns.items():
+        package = packages.get(package_key) or {}
+        for vuln_id in vuln_ids:
+            vuln = vulnerabilities.get(vuln_id) or {}
+            fixed_in = vuln.get("fixed_in_version") or vuln.get("fixed_in") or ""
+            rows.append({
+                "cve_id": vuln.get("name") or vuln_id,
+                "severity": _severity(vuln.get("normalized_severity") or vuln.get("severity")),
+                "pkg_name": package.get("name") or package_key,
+                "pkg_version": package.get("version") or "",
+                "fixed_version": fixed_in or "请参考发行版安全公告",
+                "description": vuln.get("description") or vuln.get("issued") or "Clair 未返回详细描述",
+                "fix_suggestion": f"升级 {package.get('name') or package_key} 到修复版本 {fixed_in}" if fixed_in else "请升级基础镜像或应用发行版安全补丁",
+            })
+
+    severity_order = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
+    return sorted(rows, key=lambda v: severity_order.get(v["severity"], 99))
+
+
+def run_clair_scan(image_ref: str) -> list[dict]:
+    """Call Clair v4 API to index an image and retrieve vulnerabilities."""
+    settings = get_settings()
+    manifest = _resolve_manifest(image_ref)
+    clair = settings.CLAIR_API_URL.rstrip("/")
+    timeout = settings.CLAIR_SCAN_TIMEOUT_SECONDS
+    with httpx.Client(timeout=timeout, trust_env=False) as client:
+        index_response = client.post(
+            f"{clair}/indexer/api/v1/index_report",
+            json=manifest,
+            headers=_clair_headers("index"),
+        )
+        index_response.raise_for_status()
+        digest = (index_response.json().get("manifest_hash") or manifest["hash"])
+
+        report_response = client.get(
+            f"{clair}/matcher/api/v1/vulnerability_report/{quote(digest, safe=':')}",
+            headers=_clair_headers("report"),
+        )
+        report_response.raise_for_status()
+        return _normalize_clair_report(report_response.json())
+
+
 def compute_risk_score(vulns: list[dict]) -> int:
     """根据漏洞数量和严重程度计算安全风险评分 (0-100，越高越安全)。"""
     weights = {"Critical": 30, "High": 15, "Medium": 5, "Low": 2}
@@ -104,11 +280,30 @@ def check_alert(vulns: list[dict]) -> list[dict]:
     return [v for v in vulns if v["severity"] in ("Critical", "High")]
 
 
-def run_security_scan(db: Session, model, *, triggered_by: str = "admin") -> dict:
+def run_security_scan(
+    db: Session,
+    model,
+    *,
+    triggered_by: str = "admin",
+    image_ref: str | None = None,
+) -> dict:
     """执行完整的安全扫描流程并持久化结果。"""
 
-    # Step 1-5: 模拟 Clair 分析 + 生成 CVE 清单
-    vulns = simulate_clair_scan(model.model_code, model.version)
+    settings = get_settings()
+    resolved_image_ref = _find_image_ref(model, image_ref)
+    scanner = "simulated"
+    scan_error = None
+    if settings.CLAIR_SCAN_ENABLED and resolved_image_ref:
+        try:
+            vulns = run_clair_scan(resolved_image_ref)
+            scanner = "clair"
+        except Exception as exc:
+            scan_error = str(exc)
+            if not settings.CLAIR_SIMULATION_FALLBACK:
+                raise RuntimeError(f"Clair真实扫描失败: {scan_error}") from exc
+            vulns = simulate_clair_scan(model.model_code, model.version)
+    else:
+        vulns = simulate_clair_scan(model.model_code, model.version)
 
     # Step 6: 风险评估
     score = compute_risk_score(vulns)
@@ -129,6 +324,9 @@ def run_security_scan(db: Session, model, *, triggered_by: str = "admin") -> dic
         "scanned_at": now,
         "model_code": model.model_code,
         "version": model.version,
+        "scanner": scanner,
+        "image_ref": resolved_image_ref,
+        "scan_error": scan_error,
         "score": score,
         "summary": summary,
         "vulnerabilities": vulns,
@@ -153,7 +351,11 @@ def run_security_scan(db: Session, model, *, triggered_by: str = "admin") -> dic
         log_service.create_log(
             db, user_id=None, username=triggered_by,
             action="security_scan", resource="model_version", resource_id=model.id,
-            detail=f"对 {model.model_code}:{model.version} 执行安全扫描，评分 {score}，发现 {summary['critical']} 严重 / {summary['high']} 高危",
+            detail=(
+                f"对 {model.model_code}:{model.version} 执行安全扫描"
+                f"({scanner})，评分 {score}，发现 {summary['critical']} 严重 / {summary['high']} 高危"
+                + (f"，Clair错误: {scan_error}" if scan_error else "")
+            ),
         )
         for alert_v in alerts:
             log_service.create_log(
@@ -166,6 +368,10 @@ def run_security_scan(db: Session, model, *, triggered_by: str = "admin") -> dic
 
     return {
         "scan_id": scan_id,
+        "scanned_at": now,
+        "scanner": scanner,
+        "image_ref": resolved_image_ref,
+        "scan_error": scan_error,
         "score": score,
         "summary": summary,
         "vulnerabilities": vulns,

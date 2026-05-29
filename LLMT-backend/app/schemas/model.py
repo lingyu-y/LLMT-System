@@ -6,6 +6,9 @@ from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 
+VERSION_PATTERN = r"^v\d+\.\d+\.\d+$"
+
+
 class ModelMetrics(BaseModel):
     """结构化模型性能指标。"""
     accuracy_train: float | None = None
@@ -49,7 +52,7 @@ class ModelImport(BaseModel):
     source_path: str = Field(..., min_length=1, description="MinIO 中的源路径")
     model_name: str = Field(..., min_length=1, max_length=128)
     model_code: str = Field(..., min_length=1, max_length=64)
-    version: str = Field(..., min_length=1, max_length=32)
+    version: str = Field(..., min_length=1, max_length=32, pattern=VERSION_PATTERN)
     tag: Optional[str] = Field(default=None, max_length=32)
     description: Optional[str] = None
     framework: Optional[str] = Field(default=None, max_length=32)
@@ -75,14 +78,14 @@ class ModelExport(BaseModel):
     model_config = {"protected_namespaces": ()}
 
     model_code: str = Field(..., min_length=1, max_length=64)
-    version: str = Field(..., min_length=1, max_length=32)
+    version: str = Field(..., min_length=1, max_length=32, pattern=VERSION_PATTERN)
     target_path: str = Field(..., min_length=1, description="导出到 MinIO 的目标路径")
 
 
 class VersionCreate(BaseModel):
     model_config = {"protected_namespaces": ()}
 
-    version: str = Field(..., min_length=1, max_length=32)
+    version: str = Field(..., min_length=1, max_length=32, pattern=VERSION_PATTERN)
     model_name: Optional[str] = Field(default=None, max_length=128)
     tag: Optional[str] = Field(default=None, max_length=32)
     description: Optional[str] = None

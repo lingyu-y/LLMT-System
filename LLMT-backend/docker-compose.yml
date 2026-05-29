@@ -56,6 +56,34 @@ services:
     volumes:
       - llmt_elasticsearch_data:/usr/share/elasticsearch/data
 
+  # Clair 漏洞库与索引数据
+  clair-postgres:
+    image: postgres:16
+    container_name: llmt-clair-postgres
+    environment:
+      POSTGRES_DB: ${CLAIR_POSTGRES_DB:-clair}
+      POSTGRES_USER: ${CLAIR_POSTGRES_USER:-clair}
+      POSTGRES_PASSWORD: ${CLAIR_POSTGRES_PASSWORD:-clair}
+    ports:
+      - "5433:5432"
+    volumes:
+      - llmt_clair_postgres_data:/var/lib/postgresql/data
+
+  # 容器镜像漏洞扫描：Clair v4 combo 模式
+  clair:
+    profiles:
+      - clair-image
+    image: ${CLAIR_IMAGE:-quay.io/projectquay/clair:nightly-2024-02-03}
+    container_name: llmt-clair
+    command: ["-conf", "/etc/clair/config.yaml", "-mode", "combo"]
+    ports:
+      - "6060:6060"
+      - "6061:6061"
+    volumes:
+      - ./clair/config.yaml:/etc/clair/config.yaml:ro
+    depends_on:
+      - clair-postgres
+
   # 消息队列：Celery broker / backend
   redis:
     image: redis:7-alpine
@@ -81,4 +109,5 @@ volumes:
   llmt_influxdb_data:
   llmt_influxdb_config:
   llmt_elasticsearch_data:
+  llmt_clair_postgres_data:
   llmt_redis_data:

@@ -1,0 +1,28 @@
+.....................................................                    [100%]
+=============================== warnings summary ===============================
+app/main.py:21
+  /home/cst/LLMT-System/LLMT-backend/app/main.py:21: DeprecationWarning: 
+          on_event is deprecated, use lifespan event handlers instead.
+  
+          Read more about it in the
+          [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+          
+    @app.on_event("startup")
+
+../../anaconda3/envs/llmt-backend/lib/python3.10/site-packages/fastapi/applications.py:4495
+  /home/cst/anaconda3/envs/llmt-backend/lib/python3.10/site-packages/fastapi/applications.py:4495: DeprecationWarning: 
+          on_event is deprecated, use lifespan event handlers instead.
+  
+          Read more about it in the
+          [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+          
+    return self.router.on_event(event_type)
+
+tests/module/test_dataset_training_model_document_system.py: 13 warnings
+tests/integration/test_cross_module_flows.py: 4 warnings
+tests/system/test_api_business_flows.py: 6 warnings
+  /home/cst/anaconda3/envs/llmt-backend/lib/python3.10/site-packages/httpx/_client.py:680: DeprecationWarning: The 'app' shortcut is now deprecated. Use the explicit style 'transport=WSGITransport(app=...)' instead.
+    warnings.warn(message, DeprecationWarning)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+53 passed, 25 warnings in 99.17s (0:01:39)

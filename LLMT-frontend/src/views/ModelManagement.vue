@@ -100,6 +100,85 @@
         </div>
       </div>
 
+      <div class="grid-2 security-policy">
+        <div class="card">
+          <div class="card-header">
+            <h3 class="card-title">容器镜像漏洞扫描</h3>
+            <el-button size="small" type="primary" :icon="Lock" :loading="scanning" @click="runSecurityScan">扫描</el-button>
+          </div>
+          <div class="card-body security-panel">
+            <div class="security-summary">
+              <div>
+                <span>风险评分</span>
+                <strong>{{ latestSecurityReport?.score ?? '-' }}</strong>
+              </div>
+              <div>
+                <span>Critical / High</span>
+                <strong>{{ criticalHighCount }}</strong>
+              </div>
+              <div>
+                <span>扫描时间</span>
+                <strong>{{ latestSecurityReport?.scanned_at?.replace('T', ' ').slice(0, 16) ?? '-' }}</strong>
+              </div>
+            </div>
+            <el-alert
+              v-if="latestSecurityReport?.scan_error"
+              :title="`Clair 调用失败，已使用模拟报告：${latestSecurityReport.scan_error}`"
+              type="warning"
+              show-icon
+              :closable="false"
+            />
+            <div class="image-ref-row">
+              <el-input v-model="scanImageRef" placeholder="镜像地址，例如 registry.local:5000/llmt/model-api:v1" clearable />
+              <el-tag>{{ latestSecurityReport?.scanner ?? '未扫描' }}</el-tag>
+            </div>
+            <div v-if="latestSecurityReport" class="scan-meta">
+              <span>{{ latestSecurityReport.image_ref || '未记录镜像地址' }}</span>
+              <span>{{ latestSecurityReport.scan_id }}</span>
+              <span>{{ latestVulnerabilities.length }} CVE</span>
+            </div>
+            <el-table :data="latestVulnerabilities" size="small" max-height="260">
+              <el-table-column prop="cve_id" label="CVE编号" width="150" />
+              <el-table-column prop="severity" label="等级" width="100">
+                <template #default="{ row }">
+                  <el-tag :type="severityTagType(row.severity)">{{ row.severity }}</el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="软件包" min-width="160">
+                <template #default="{ row }">{{ row.pkg_name }} {{ row.pkg_version }}</template>
+              </el-table-column>
+              <el-table-column prop="fix_suggestion" label="修复建议" min-width="240" show-overflow-tooltip />
+            </el-table>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h3 class="card-title">API调用频率限制</h3>
+            <el-button size="small" type="primary" :icon="Setting" :loading="savingRateLimit" @click="saveRateLimit">保存</el-button>
+          </div>
+          <div class="card-body rate-limit-form">
+            <el-form label-position="top">
+              <el-form-item label="启用限流">
+                <el-switch v-model="rateLimitForm.enabled" />
+              </el-form-item>
+              <el-form-item label="每分钟请求数">
+                <el-input-number v-model="rateLimitForm.requests_per_minute" :min="1" :max="100000" class="full-input" />
+              </el-form-item>
+              <el-form-item label="每小时请求数">
+                <el-input-number v-model="rateLimitForm.requests_per_hour" :min="1" :max="1000000" class="full-input" />
+              </el-form-item>
+              <el-form-item label="并发请求数">
+                <el-input-number v-model="rateLimitForm.concurrent" :min="1" :max="10000" class="full-input" />
+              </el-form-item>
+              <el-form-item label="单次最大Token">
+                <el-input-number v-model="rateLimitForm.max_tokens_per_request" :min="1" :max="1000000" class="full-input" />
+              </el-form-item>
+            </el-form>
+          </div>
+        </div>
+      </div>
+
       <div class="card inference-card">
         <div class="card-header">
           <h3 class="card-title">在线推理试跑</h3>
@@ -252,9 +331,9 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { ArrowLeft, Check, Clock, DataLine, Delete, Download, Management, Promotion, RefreshLeft, Upload } from '@element-plus/icons-vue'
+import { ArrowLeft, Check, Clock, DataLine, Delete, Download, Lock, Management, Promotion, RefreshLeft, Setting, Upload } from '@element-plus/icons-vue'
 
 import { predict, type PredictResult } from '@/api/inference'
 import StatusBadge from '@/components/StatusBadge.vue'
@@ -263,11 +342,17 @@ import {
   deleteModel,
   exportModel,
   getModelDownloadUrl,
+  getModelRateLimit,
+  getSecurityReports,
   importModel,
   getModelVersions,
   listModels,
   rollbackModelVersion,
+  triggerSecurityScan,
+  updateModelRateLimit,
   type BackendModel,
+  type ModelRateLimit,
+  type SecurityReport,
 } from '@/api/models'
 
 type ModelItem = {
@@ -303,11 +388,23 @@ const compareVersion = ref<VersionItem>()
 const models = ref<ModelItem[]>([])
 const versionHistory = ref<VersionItem[]>([])
 const predicting = ref(false)
+const scanning = ref(false)
+const savingRateLimit = ref(false)
 const inferenceInput = ref('请对当前模型做一次测试推理')
 const prediction = ref<PredictResult>()
+const securityReports = ref<SecurityReport[]>([])
+const rateLimit = ref<ModelRateLimit>()
+const scanImageRef = ref('')
 
 const importForm = ref({ source_path: '', model_name: '', model_code: '', version: 'v1.0.0' })
 const exportForm = ref({ target_path: '' })
+const rateLimitForm = reactive({
+  enabled: true,
+  requests_per_minute: 100,
+  requests_per_hour: 5000,
+  concurrent: 10,
+  max_tokens_per_request: 4096,
+})
 
 const colors = [
   'linear-gradient(135deg, #3b82f6, #2563eb)',
@@ -442,6 +539,41 @@ const artifacts = computed(() => [
 
 const currentVersion = computed(() => versionHistory.value.find((item) => item.current) ?? versionHistory.value[0])
 const historicalCheckpoint = computed(() => `ckpt/${compareVersion.value?.version ?? 'history'}/best`)
+const latestSecurityReport = computed(() => securityReports.value[0])
+const latestVulnerabilities = computed(() => latestSecurityReport.value?.vulnerabilities ?? [])
+const criticalHighCount = computed(() => {
+  const summary = latestSecurityReport.value?.summary
+  return summary ? `${summary.critical} / ${summary.high}` : '-'
+})
+
+const severityTagType = (severity: string) => {
+  if (severity === 'Critical') return 'danger'
+  if (severity === 'High') return 'warning'
+  if (severity === 'Medium') return 'info'
+  return 'success'
+}
+
+const applyRateLimit = (config: ModelRateLimit) => {
+  rateLimit.value = config
+  rateLimitForm.enabled = config.enabled
+  rateLimitForm.requests_per_minute = config.limits.requests_per_minute
+  rateLimitForm.requests_per_hour = config.limits.requests_per_hour
+  rateLimitForm.concurrent = config.limits.concurrent
+  rateLimitForm.max_tokens_per_request = config.limits.max_tokens_per_request
+}
+
+const loadSecurityReports = async (modelCode: string) => {
+  const reports = await getSecurityReports(modelCode)
+  securityReports.value = [...reports].sort((a, b) => String(b.scanned_at ?? '').localeCompare(String(a.scanned_at ?? '')))
+}
+
+const mergeSecurityReport = (report: SecurityReport) => {
+  securityReports.value = [report, ...securityReports.value.filter((item) => item.scan_id !== report.scan_id)]
+}
+
+const loadRateLimit = async (modelCode: string) => {
+  applyRateLimit(await getModelRateLimit(modelCode))
+}
 
 const openCompareDrawer = async (version: VersionItem) => {
   compareVersion.value = version
@@ -496,8 +628,40 @@ const downloadVersion = (version: string) => {
 const selectModel = async (model: ModelItem) => {
   selectedModel.value = model
   prediction.value = undefined
+  securityReports.value = []
+  scanImageRef.value = String(model.raw.hyperparams_json?.image_ref ?? model.raw.hyperparams_json?.container_image ?? '')
   inferenceInput.value = '请对当前模型做一次测试推理'
-  await loadVersions(model.id)
+  await Promise.all([loadVersions(model.id), loadSecurityReports(model.id), loadRateLimit(model.id)])
+}
+
+const runSecurityScan = async () => {
+  if (!selectedModel.value) return
+  scanning.value = true
+  try {
+    const report = await triggerSecurityScan(selectedModel.value.id, scanImageRef.value.trim() || undefined)
+    mergeSecurityReport(report)
+    loadSecurityReports(selectedModel.value.id).then(() => {
+      mergeSecurityReport(report)
+    }).catch(() => undefined)
+    ElMessage.success(`漏洞扫描完成：${report.scanner ?? 'unknown'}，发现 ${report.summary?.total ?? report.vulnerabilities?.length ?? 0} 个漏洞`)
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '漏洞扫描失败')
+  } finally {
+    scanning.value = false
+  }
+}
+
+const saveRateLimit = async () => {
+  if (!selectedModel.value) return
+  savingRateLimit.value = true
+  try {
+    applyRateLimit(await updateModelRateLimit(selectedModel.value.id, { ...rateLimitForm }))
+    ElMessage.success('限流策略已保存')
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '限流策略保存失败')
+  } finally {
+    savingRateLimit.value = false
+  }
 }
 
 const runPredict = async () => {
@@ -787,6 +951,68 @@ onMounted(() => {
   display: block;
 }
 
+.security-policy {
+  margin-top: 20px;
+}
+
+.security-panel,
+.rate-limit-form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.security-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.security-summary > div {
+  padding: 14px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-color);
+}
+
+.security-summary span {
+  display: block;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.security-summary strong {
+  display: block;
+  margin-top: 6px;
+  color: var(--text-primary);
+  font-size: 18px;
+}
+
+.image-ref-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+}
+
+.scan-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.scan-meta span {
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--bg-color);
+}
+
+.full-input {
+  width: 100%;
+}
+
 .timeline {
   display: flex;
   flex-direction: column;
@@ -916,6 +1142,8 @@ onMounted(() => {
   .model-grid,
   .metrics-bar,
   .params-grid,
+  .security-summary,
+  .image-ref-row,
   .compare-summary,
   .compare-grid,
   .inference-row {

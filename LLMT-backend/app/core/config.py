@@ -49,6 +49,9 @@ class Settings(BaseSettings):
     ELASTICSEARCH_USERNAME: str | None = None
     ELASTICSEARCH_PASSWORD: str | None = None
     ELASTICSEARCH_INDEX_LOGS: str = "system-logs"
+    ELASTICSEARCH_LOG_RETENTION_DAYS: int = 90
+    ELASTICSEARCH_REQUEST_TIMEOUT_SECONDS: float = 1.0
+    ELASTICSEARCH_FALLBACK_LOG_PATH: str = "logs/elasticsearch-fallback.jsonl"
 
     # Redis / Celery
     REDIS_HOST: str = "localhost"
@@ -65,6 +68,18 @@ class Settings(BaseSettings):
     LLMT_INFERENCE_MAX_CHECKPOINT_MB: int = 1024
     LLMT_INFERENCE_CACHE_SIZE: int = 1
     LLMT_INFERENCE_DEVICE: str = "cpu"
+
+    # Clair image vulnerability scanning
+    CLAIR_SCAN_ENABLED: bool = False
+    CLAIR_API_URL: str = "http://localhost:6060"
+    CLAIR_SCAN_TIMEOUT_SECONDS: float = 60.0
+    CLAIR_SIMULATION_FALLBACK: bool = True
+    CLAIR_DEFAULT_IMAGE_REF: str | None = None
+    CLAIR_REGISTRY_SCHEME: str = "https"
+    CLAIR_REGISTRY_AUTH_HEADER: str | None = None
+    CLAIR_REGISTRY_USERNAME: str | None = None
+    CLAIR_REGISTRY_PASSWORD: str | None = None
+    CLAIR_REGISTRY_INSECURE: bool = False
 
     @field_validator("DEBUG", mode="before")
     @classmethod

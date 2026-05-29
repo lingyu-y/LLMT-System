@@ -1,6 +1,11 @@
 """Document schemas."""
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
+
+
+DocumentType = Literal["report", "article", "manual", "summary", "qa"]
 
 
 class DocumentChatRequest(BaseModel):
@@ -14,7 +19,7 @@ class DocumentGenerateRequest(BaseModel):
     model_config = {"protected_namespaces": ()}
 
     model_code: str = Field(..., description="模型代码")
-    doc_type: str = Field(..., description="文档类型: report/article/manual/summary/qa")
+    doc_type: DocumentType = Field(..., description="文档类型: report/article/manual/summary/qa")
     title: str = Field(..., min_length=1, description="文档标题")
     outline: str | None = Field(default=None, description="大纲（可选）")
     requirements: str | None = Field(default=None, description="补充需求（可选）")
@@ -28,7 +33,7 @@ class DraftSaveRequest(BaseModel):
     model_config = {"protected_namespaces": ()}
 
     model_code: str = Field(...)
-    doc_type: str = Field(...)
+    doc_type: DocumentType = Field(...)
     title: str = Field(..., min_length=1)
     content: str = Field(..., min_length=1)
 

@@ -607,8 +607,11 @@ _TEXT_JSON_KEYS = (
     "content",
     "body",
     "sentence",
+    "instruction",
     "prompt",
     "question",
+    "response",
+    "completion",
     "answer",
     "input",
     "output",
@@ -618,6 +621,9 @@ _TEXT_JSON_KEYS = (
     "问题",
     "答案",
 )
+
+_PROMPT_JSON_KEYS = ("prompt", "instruction", "question", "input", "问题")
+_RESPONSE_JSON_KEYS = ("response", "completion", "answer", "output", "答案")
 
 
 def _iter_response_lines(response, chunk_size: int = 64 * 1024):
@@ -678,11 +684,55 @@ def _extract_json_texts(value: object) -> list[str]:
     return []
 
 
-def _write_jsonl_record(output, text: str) -> int:
-    normalized = _normalize_text(text)
-    if not normalized:
+def _first_normalized_value(value: dict, keys: tuple[str, ...]) -> str:
+    for key in keys:
+        item = value.get(key)
+        if isinstance(item, (str, int, float)):
+            text = _normalize_text(item)
+            if text:
+                return text
+    return ""
+
+
+def _extract_instruction_records(value: object) -> list[dict[str, str] | str]:
+    if isinstance(value, list):
+        records: list[dict[str, str] | str] = []
+        for item in value:
+            records.extend(_extract_instruction_records(item))
+        return records
+    if isinstance(value, dict):
+        prompt = _first_normalized_value(value, _PROMPT_JSON_KEYS)
+        response = _first_normalized_value(value, _RESPONSE_JSON_KEYS)
+        if prompt and response:
+            return [{
+                "prompt": prompt,
+                "response": response,
+                "text": _normalize_text(f"{prompt}\n{response}"),
+            }]
+        return _extract_json_texts(value)
+    return _extract_json_texts(value)
+
+
+def _write_jsonl_record(output, record: dict[str, str] | str) -> int:
+    if isinstance(record, dict):
+        prompt = _normalize_text(record.get("prompt", ""))
+        response = _normalize_text(record.get("response", ""))
+        text = _normalize_text(record.get("text", ""))
+        if prompt and response:
+            payload = {
+                "prompt": prompt,
+                "response": response,
+                "text": text or _normalize_text(f"{prompt}\n{response}"),
+            }
+        else:
+            payload = {"text": text}
+    else:
+        text = _normalize_text(record)
+        payload = {"text": text}
+
+    if not payload.get("text"):
         return 0
-    line = json.dumps({"text": normalized}, ensure_ascii=False) + "\n"
+    line = json.dumps(payload, ensure_ascii=False) + "\n"
     data = line.encode("utf-8")
     output.write(data)
     return len(data)
@@ -722,8 +772,8 @@ def _iter_object_records(minio, bucket: str, object_name: str):
                 except json.JSONDecodeError:
                     yield stripped
                     continue
-                for text in _extract_json_texts(parsed):
-                    yield text
+                for record in _extract_instruction_records(parsed):
+                    yield record
         elif suffix == "csv":
             reader = _stdlib_csv.reader(lines)
             for row in reader:

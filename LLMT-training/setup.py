@@ -19,6 +19,7 @@ setup(
         "pydantic>=2.0",
         "click>=8.0",
         "pyyaml>=6.0",
+        "sentencepiece>=0.1.99",
     ],
     extras_require={
         "deepspeed": ["deepspeed>=0.12.0"],

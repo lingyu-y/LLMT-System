@@ -36,15 +36,20 @@ export interface SystemMenu {
 }
 
 export interface SystemLog {
-  id: number
+  id?: number | null
   user_id?: number | null
   username: string
-  level?: 'INFO' | 'WARN' | 'ERROR' | string
+  level?: 'DEBUG' | 'INFO' | 'WARN' | 'ERROR' | 'CRITICAL' | string
+  category?: string
+  module?: string
   action: string
   resource: string
   resource_id?: number | null
   detail: string
+  message?: string
   ip_address?: string | null
+  task_id?: number | null
+  task_code?: string | null
   created_at?: string | null
 }
 
@@ -88,17 +93,38 @@ export const getRoleMenus = async (roleId: number) => unwrap(await get<ApiMessag
 export const saveRoleMenus = async (roleId: number, menuIds: number[]) =>
   await put<ApiMessage>(`/system/roles/${roleId}/menus`, { menu_ids: menuIds })
 
-export const listLogs = (params?: { page?: number; page_size?: number; keyword?: string; action?: string; resource?: string; username?: string }) =>
+export interface LogQueryParams extends Record<string, string | number | boolean | null | undefined> {
+  page?: number
+  page_size?: number
+  keyword?: string
+  action?: string
+  resource?: string
+  username?: string
+  level?: string
+  module?: string
+  category?: string
+  start_date?: string
+  end_date?: string
+}
+
+export const listLogs = (params?: LogQueryParams) =>
   get<PageResult<SystemLog>>('/system/logs', params)
 
 export const listMyLogs = (params?: { page?: number; page_size?: number }) => get<PageResult<SystemLog>>('/system/my-logs', params)
 
-export const exportLogs = async () => {
+export const exportLogs = async (params?: Omit<LogQueryParams, 'page' | 'page_size'>) => {
   const token = localStorage.getItem('llmt_token')
   const headers = new Headers()
   if (token) headers.set('Authorization', `Bearer ${token}`)
 
-  const response = await fetch('/api/v1/system/logs/export', { headers })
+  const url = new URL('/api/v1/system/logs/export', window.location.origin)
+  Object.entries(params ?? {}).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== '') {
+      url.searchParams.set(key, String(value))
+    }
+  })
+
+  const response = await fetch(url.toString(), { headers })
   if (!response.ok) {
     const body = await response.json().catch(() => undefined)
     throw new Error(body?.detail ?? body?.message ?? '日志导出失败')

@@ -1,0 +1,15 @@
+.git
+.vscode
+**/__pycache__
+**/.pytest_cache
+**/.venv
+**/node_modules
+**/dist
+**/*.db
+**/*.sqlite
+**/*.pt
+**/*.bin
+**/*.safetensors
+LLMT-backend/checkpoints
+LLMT-backend/test_output*.txt
+LLMT-training/llmt_training.egg-info

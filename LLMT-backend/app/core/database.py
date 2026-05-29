@@ -101,10 +101,19 @@ def ensure_minio_buckets() -> list[str]:
 def _create_elasticsearch_client() -> Elasticsearch:
     username = settings.ELASTICSEARCH_USERNAME
     password = settings.ELASTICSEARCH_PASSWORD
+    client_kwargs = {
+        "request_timeout": settings.ELASTICSEARCH_REQUEST_TIMEOUT_SECONDS,
+        "retry_on_timeout": False,
+        "max_retries": 0,
+    }
 
     if username and password:
-        return Elasticsearch(settings.ELASTICSEARCH_URL, basic_auth=(username, password))
-    return Elasticsearch(settings.ELASTICSEARCH_URL)
+        return Elasticsearch(
+            settings.ELASTICSEARCH_URL,
+            basic_auth=(username, password),
+            **client_kwargs,
+        )
+    return Elasticsearch(settings.ELASTICSEARCH_URL, **client_kwargs)
 
 
 es_client = _create_elasticsearch_client()

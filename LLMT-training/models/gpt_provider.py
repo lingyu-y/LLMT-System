@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
 import torch.nn as nn
 
 from llmt_training.core.base_model import BaseModelProvider
-from llmt_training.core.simple_tokenizer import SimpleTokenizer
+from llmt_training.core.sentencepiece_tokenizer import SentencePieceTokenizer
+
+GPT2_VOCAB_SIZE = 50257
+DEFAULT_SENTENCEPIECE_PATH = "tokenizers/industry_spm.model"
 
 
 class GPTConfig:
@@ -142,13 +146,39 @@ class GPTModel(nn.Module):
 class GPTModelProvider(BaseModelProvider):
     """Provider for GPT-2 series models."""
 
+    @staticmethod
+    def _resolve_tokenizer_path(path: str | None) -> str:
+        candidate = path or DEFAULT_SENTENCEPIECE_PATH
+        if os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+        package_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        candidate = os.path.join(package_root, candidate)
+        if os.path.isfile(candidate):
+            return candidate
+        raise FileNotFoundError(f"SentencePiece tokenizer not found: {path or DEFAULT_SENTENCEPIECE_PATH}")
+
+    @classmethod
+    def _sentencepiece_tokenizer(cls, config: dict[str, Any]) -> SentencePieceTokenizer:
+        path = cls._resolve_tokenizer_path(config.get("tokenizer_path"))
+        return SentencePieceTokenizer(path)
+
+    @staticmethod
+    def _uses_sentencepiece(config: dict[str, Any]) -> bool:
+        return (
+            config.get("tokenizer_type") == "sentencepiece"
+            or int(config.get("vocab_size", GPT2_VOCAB_SIZE) or GPT2_VOCAB_SIZE) != GPT2_VOCAB_SIZE
+        )
+
     def get_model(self, config: dict[str, Any]) -> nn.Module:
         config = config.get("model", config)
         max_positions = config.get("max_position_embeddings") or config.get(
             "seq_length", 1024,
         )
+        vocab_size = GPT2_VOCAB_SIZE
+        if self._uses_sentencepiece(config):
+            vocab_size = self._sentencepiece_tokenizer(config).vocab_size
         gpt_config = GPTConfig(
-            vocab_size=config.get("vocab_size", 50257),
+            vocab_size=vocab_size,
             hidden_size=config.get("hidden_size", 768),
             num_layers=config.get("num_layers", 12),
             num_attention_heads=config.get("num_attention_heads", 12),
@@ -161,15 +191,20 @@ class GPTModelProvider(BaseModelProvider):
         return GPTModel(gpt_config)
 
     def get_tokenizer(self, config: dict[str, Any]) -> Any:
-        vocab_size = config.get("vocab_size", 50257)
+        if self._uses_sentencepiece(config):
+            return self._sentencepiece_tokenizer(config)
         try:
             from transformers import GPT2Tokenizer
             tokenizer = GPT2Tokenizer.from_pretrained("gpt2", local_files_only=True)
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token
             return tokenizer
-        except Exception:
-            return SimpleTokenizer(vocab_size=vocab_size)
+        except Exception as exc:
+            raise RuntimeError(
+                "GPT-2 training requires a local GPT2Tokenizer. "
+                "Please make sure transformers is installed and the gpt2 tokenizer "
+                "files are available locally, then keep model vocab_size=50257."
+            ) from exc
 
     def get_loss_fn(self, config: dict[str, Any]) -> nn.Module:
         return nn.CrossEntropyLoss()

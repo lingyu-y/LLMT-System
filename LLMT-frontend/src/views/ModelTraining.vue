@@ -108,6 +108,52 @@
                   </el-row>
                 </el-form>
               </el-collapse-item>
+              <el-collapse-item title="差分隐私保护（点击展开）" name="dp">
+                <div class="dp-header">
+                  <span>启用后训练 Step 会执行梯度裁剪与噪声注入</span>
+                  <el-switch v-model="form.config.enable_dp" />
+                </div>
+                <el-form v-if="form.config.enable_dp" label-position="top">
+                  <el-row :gutter="12">
+                    <el-col :span="8">
+                      <el-form-item label="ε 隐私预算">
+                        <el-input-number v-model="form.config.dp_epsilon" :min="0.01" :max="100" :step="0.1" :precision="2" style="width:100%" />
+                      </el-form-item>
+                    </el-col>
+                    <el-col :span="8">
+                      <el-form-item label="δ 失败概率">
+                        <el-input-number v-model="form.config.dp_delta" :min="1e-12" :max="1" :step="1e-6" :precision="8" style="width:100%" />
+                      </el-form-item>
+                    </el-col>
+                    <el-col :span="8">
+                      <el-form-item label="噪声机制">
+                        <el-select v-model="form.config.dp_noise_mechanism" style="width:100%">
+                          <el-option label="Gaussian" value="Gaussian" />
+                          <el-option label="Laplace" value="Laplace" />
+                        </el-select>
+                      </el-form-item>
+                    </el-col>
+                  </el-row>
+                  <el-row :gutter="12">
+                    <el-col :span="8">
+                      <el-form-item label="梯度裁剪阈值">
+                        <el-input-number v-model="form.config.dp_max_grad_norm" :min="0.1" :max="100" :step="0.1" :precision="1" style="width:100%" />
+                      </el-form-item>
+                    </el-col>
+                    <el-col :span="8">
+                      <el-form-item label="噪声乘数">
+                        <el-input-number v-model="form.config.dp_noise_multiplier" :min="0" :max="20" :step="0.1" :precision="2" style="width:100%" />
+                      </el-form-item>
+                    </el-col>
+                    <el-col :span="8">
+                      <el-form-item label="预计每步ε消耗">
+                        <el-input :model-value="dpStepEstimate" disabled />
+                      </el-form-item>
+                    </el-col>
+                  </el-row>
+                  <el-alert v-if="dpWarning" :title="dpWarning" type="warning" show-icon :closable="false" />
+                </el-form>
+              </el-collapse-item>
             </el-collapse>
           </div>
 
@@ -213,6 +259,12 @@
           </div>
         </div>
         <div class="card-body log-body" ref="logContainer">
+          <div v-if="selectedPrivacyReport" class="privacy-report">
+            <div><span>隐私预算</span><strong>{{ selectedPrivacyReport.spent_epsilon }} / {{ selectedPrivacyReport.total_epsilon }}</strong></div>
+            <div><span>δ</span><strong>{{ selectedPrivacyReport.delta }}</strong></div>
+            <div><span>噪声</span><strong>{{ selectedPrivacyReport.noise_mechanism }}</strong></div>
+            <div><span>状态</span><strong>{{ selectedPrivacyReport.budget_exhausted ? '预算耗尽' : '已生成' }}</strong></div>
+          </div>
           <div v-if="!selectedTask" class="log-empty">点击任务列表中的任务查看训练日志</div>
           <div v-else-if="filteredLogs.length === 0" class="log-empty">暂无日志</div>
           <div v-else ref="logScroll" class="log-container">
@@ -280,6 +332,7 @@ import {
 import StatusBadge from '@/components/StatusBadge.vue'
 
 // ── State ──
+const TRAINING_CONFIG_STORAGE_KEY = 'llmt_training_config_draft'
 const loading = ref(false)
 const submitting = ref(false)
 const tasks = ref<TrainingTaskListItem[]>([])
@@ -326,9 +379,16 @@ const form = reactive({
   framework: 'pytorch' as 'pytorch' | 'deepspeed' | 'megatron',
   parallel_strategy: 'ddp' as string,
   config: {
-    hidden_size: 384, num_layers: 6, num_gpus: 1,
+    vocab_size: 32000, tokenizer_type: 'sentencepiece' as 'gpt2' | 'sentencepiece', tokenizer_path: 'tokenizers/industry_spm.model',
+    hidden_size: 384, num_layers: 6, num_attention_heads: 6, num_gpus: 1,
     batch_size: 1, learning_rate: 2e-5,
     max_epochs: 10, max_steps: 0, seq_length: 128, precision: 'fp16' as const,
+    enable_dp: false,
+    dp_epsilon: 8.0,
+    dp_delta: 1e-5,
+    dp_noise_mechanism: 'Gaussian' as 'Gaussian' | 'Laplace',
+    dp_noise_multiplier: 1.1 as number | null,
+    dp_max_grad_norm: 1.0,
   },
 })
 
@@ -444,6 +504,11 @@ const filteredLogs = computed(() => {
   return logs
 })
 
+const selectedPrivacyReport = computed(() => {
+  const report = selectedTask.value?.config_json?.privacy_audit_report
+  return report && typeof report === 'object' ? report as Record<string, any> : null
+})
+
 const recommendedStrategy = computed(() => {
   const n = Number(gpuOptionValue.value)
   if (form.framework === 'megatron') return '张量并行 + 流水线并行'
@@ -455,6 +520,24 @@ const resourceAdvice = computed(() => {
   const n = Number(gpuOptionValue.value)
   if (n <= 1) return '单卡适合小规模微调，建议使用 DDP。'
   return '当前资源满足混合并行训练，可在任务运行中发起扩缩容请求。'
+})
+
+const dpStepEstimate = computed(() => {
+  if (!form.config.enable_dp) return '-'
+  const delta = Math.max(form.config.dp_delta || 1e-5, 1e-12)
+  const multiplier = form.config.dp_noise_multiplier || Math.sqrt(2 * Math.log(1.25 / delta)) / Math.max(form.config.dp_epsilon, 0.01)
+  if (form.config.dp_noise_mechanism === 'Laplace') {
+    return (1 / Math.max(form.config.dp_epsilon, 0.01)).toFixed(4)
+  }
+  return (Math.sqrt(2 * Math.log(1.25 / delta)) / Math.max(multiplier, 1e-6)).toFixed(4)
+})
+
+const dpWarning = computed(() => {
+  if (!form.config.enable_dp) return ''
+  if (form.framework !== 'pytorch') return '当前普通训练的梯度加噪仅在 PyTorch/DDP 路径生效'
+  if (form.config.dp_epsilon < 1 || form.config.dp_epsilon > 10) return '推荐 ε 范围为 1.0-10.0'
+  if (form.config.dp_delta < 1e-6 || form.config.dp_delta > 1e-5) return '推荐 δ 范围为 1e-6 到 1e-5'
+  return ''
 })
 
 // ── Align parallel_strategy with framework on change ──
@@ -515,29 +598,44 @@ const onBaseModelChange = (selectedId: number | undefined) => {
   const found = options.base_models.find(m => m.value === selectedId)
   if (!found) return
   const hp = found.hyperparams_json || {}
+  const baseTokenizer = hp.tokenizer_type
+  const baseVocabSize = Number(hp.vocab_size || 0)
+  if ((baseTokenizer && baseTokenizer !== 'sentencepiece') || (baseVocabSize && baseVocabSize !== 32000)) {
+    ElMessage.warning('当前系统只支持继续训练 SentencePiece 模型，请选择使用 SentencePiece 训练出的模型版本')
+    baseModelId.value = undefined
+    return
+  }
   if (hp.hidden_size != null) form.config.hidden_size = hp.hidden_size as number
   if (hp.num_layers != null) form.config.num_layers = hp.num_layers as number
   if (hp.num_attention_heads != null) form.config.num_attention_heads = hp.num_attention_heads as number
-  if (hp.vocab_size != null) form.config.vocab_size = hp.vocab_size as number
+  form.config.vocab_size = 32000
+  form.config.tokenizer_type = 'sentencepiece'
+  form.config.tokenizer_path = 'tokenizers/industry_spm.model'
   if (hp.seq_length != null) form.config.seq_length = hp.seq_length as number
 }
 
 const clearLogs = () => { trainingLogs.value = [] }
 
+const buildTrainingPayload = () => {
+  const gpuCount = Number(gpuOptionValue.value)
+  const cfg: Record<string, any> = { ...form.config, num_gpus: gpuCount }
+  cfg.vocab_size = 32000
+  cfg.tokenizer_type = 'sentencepiece'
+  cfg.tokenizer_path = 'tokenizers/industry_spm.model'
+  if (!cfg.max_steps) delete cfg.max_steps
+  return {
+    task_name: form.task_name, dataset_id: form.dataset_id!, framework: form.framework,
+    parallel_strategy: form.parallel_strategy as any,
+    config: cfg,
+    ...(baseModelId.value != null ? { base_model_version_id: baseModelId.value } : {}),
+  }
+}
+
 const startTraining = async () => {
   if (!canSubmit.value) { ElMessage.warning('请填写任务名称并选择数据集'); return }
   submitting.value = true
   try {
-    const gpuCount = Number(gpuOptionValue.value)
-    const cfg: Record<string, any> = { ...form.config, num_gpus: gpuCount }
-    if (!cfg.max_steps) delete cfg.max_steps
-    const payload: any = {
-      task_name: form.task_name, dataset_id: form.dataset_id!, framework: form.framework,
-      parallel_strategy: form.parallel_strategy as any, config: cfg,
-    }
-    if (baseModelId.value != null) {
-      payload.base_model_version_id = baseModelId.value
-    }
+    const payload: any = buildTrainingPayload()
     const res = await createTrainingTask(payload)
     ElMessage.success(`训练任务已创建: ${res.data?.task_code ?? ''}`)
     await loadTasks(); await loadStats()
@@ -568,15 +666,19 @@ const handleDeleteTask = async (row: TrainingTaskListItem) => {
   catch (e: unknown) { ElMessage.error((e as Error).message || '删除失败') }
 }
 
-const handleSaveConfig = () => { ElMessage.success('并行配置已保存') }
+const handleSaveConfig = () => {
+  localStorage.setItem(TRAINING_CONFIG_STORAGE_KEY, JSON.stringify({
+    form,
+    gpuOptionValue: gpuOptionValue.value,
+    baseModelId: baseModelId.value ?? null,
+    savedAt: new Date().toISOString(),
+  }))
+  ElMessage.success(`配置已保存到浏览器 localStorage：${TRAINING_CONFIG_STORAGE_KEY}`)
+}
 const handleValidateConfig = async () => {
   if (!canSubmit.value) { ElMessage.warning('请先填写任务名称和数据集'); return }
   try {
-    const body = {
-      task_name: form.task_name, dataset_id: form.dataset_id!, framework: form.framework,
-      parallel_strategy: form.parallel_strategy as any,
-      config: { ...form.config, num_gpus: Number(gpuOptionValue.value) },
-    }
+    const body = buildTrainingPayload()
     const res = await validateTrainingConfig(body)
     const result = res.data
     if (result?.valid) ElMessage.success('配置验证通过')
@@ -592,6 +694,21 @@ const statusType = (s: string): 'success' | 'warning' | 'danger' | 'info' => ({ 
 
 // ── Lifecycle ──
 onMounted(() => {
+  const saved = localStorage.getItem(TRAINING_CONFIG_STORAGE_KEY)
+  if (saved) {
+    try {
+      const parsed = JSON.parse(saved)
+      if (parsed?.form) {
+        const { config, ...rest } = parsed.form
+        Object.assign(form, rest)
+        Object.assign(form.config, config ?? {})
+      }
+      if (parsed?.gpuOptionValue) gpuOptionValue.value = parsed.gpuOptionValue
+      if (parsed?.baseModelId != null) baseModelId.value = parsed.baseModelId
+    } catch {
+      localStorage.removeItem(TRAINING_CONFIG_STORAGE_KEY)
+    }
+  }
   loadOptions(); loadTasks(); loadStats()
   refreshTimer = window.setInterval(async () => {
     await loadTasks(); await loadStats()
@@ -632,6 +749,16 @@ onBeforeUnmount(() => {
 .recommend-box strong { font-size: 15px; }
 .recommend-box p { margin: 6px 0 0; font-size: 13px; color: var(--text-secondary); }
 
+.dp-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
 .action-row {
   display: flex; gap: 10px; margin-top: 20px; flex-wrap: wrap;
 }
@@ -666,6 +793,30 @@ onBeforeUnmount(() => {
   padding: 0 !important;
   max-height: 360px; overflow-y: auto;
 }
+.privacy-report {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  padding: 12px;
+  background: #f8fafc;
+  border-bottom: 1px solid var(--border-color);
+}
+.privacy-report div {
+  padding: 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: #fff;
+}
+.privacy-report span {
+  display: block;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.privacy-report strong {
+  display: block;
+  margin-top: 4px;
+  font-size: 14px;
+}
 .log-empty {
   padding: 40px; text-align: center; color: var(--text-muted); font-size: 14px;
 }
@@ -687,5 +838,6 @@ onBeforeUnmount(() => {
 @media (max-width: 900px) {
   .config-grid { grid-template-columns: 1fr; }
   .bottom-panels { grid-template-columns: 1fr; }
+  .privacy-report { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 </style>

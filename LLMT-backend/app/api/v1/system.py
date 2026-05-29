@@ -440,6 +440,16 @@ def _format_beijing_time(value: datetime | None) -> str:
     return value.astimezone(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _format_es_time(value: str | None) -> str:
+    if not value:
+        return ""
+    try:
+        normalized = value.replace("Z", "+00:00")
+        return _format_beijing_time(datetime.fromisoformat(normalized))
+    except ValueError:
+        return value
+
+
 def _log_level(action: str, detail: str = "") -> str:
     text = f"{action} {detail}".lower()
     if any(keyword in text for keyword in ("error", "failed", "fail", "exception", "错误", "失败", "异常")):
@@ -459,11 +469,51 @@ def list_logs(
     action: str = Query(""),
     resource: str = Query(""),
     username: str = Query(""),
+    level: str = Query(""),
+    module: str = Query(""),
+    category: str = Query(""),
     start_date: str = Query(""),
     end_date: str = Query(""),
     db: Session = Depends(get_db),
     _admin=Depends(require_admin),
 ):
+    es_result = log_service.search_logs(
+        page=page,
+        page_size=page_size,
+        keyword=keyword,
+        level=level,
+        module=module,
+        category=category,
+        action=action,
+        resource=resource,
+        username=username,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if es_result is not None:
+        logs, total = es_result
+        data = [
+            {
+                "id": lg.get("id"),
+                "user_id": lg.get("user_id"),
+                "username": lg.get("username", ""),
+                "action": lg.get("action", ""),
+                "resource": lg.get("resource") or lg.get("module", ""),
+                "level": lg.get("level", "INFO"),
+                "category": lg.get("category", ""),
+                "module": lg.get("module", ""),
+                "resource_id": lg.get("resource_id"),
+                "detail": lg.get("detail") or lg.get("message", ""),
+                "message": lg.get("message") or lg.get("detail", ""),
+                "ip_address": lg.get("ip_address", ""),
+                "task_id": lg.get("task_id"),
+                "task_code": lg.get("task_code"),
+                "created_at": _format_es_time(lg.get("created_at") or lg.get("timestamp")),
+            }
+            for lg in logs
+        ]
+        return paginated_response(data, total, page, page_size)
+
     logs, total = log_repository.get_logs(
         db,
         page=page, page_size=page_size,
@@ -490,32 +540,69 @@ def export_logs(
     action: str = Query(""),
     resource: str = Query(""),
     username: str = Query(""),
+    level: str = Query(""),
+    module: str = Query(""),
+    category: str = Query(""),
     start_date: str = Query(""),
     end_date: str = Query(""),
     db: Session = Depends(get_db),
     _admin=Depends(require_admin),
 ):
-    logs, _ = log_repository.get_logs(
-        db, page=1, page_size=10000,
-        keyword=keyword, action=action, resource=resource,
-        username=username, start_date=start_date, end_date=end_date,
+    es_result = log_service.search_logs(
+        page=1,
+        page_size=10000,
+        keyword=keyword,
+        level=level,
+        module=module,
+        category=category,
+        action=action,
+        resource=resource,
+        username=username,
+        start_date=start_date,
+        end_date=end_date,
     )
     output = io.StringIO()
     output.write("\ufeff")
     writer = csv.writer(output)
-    writer.writerow(["ID", "级别", "用户名", "操作", "资源", "资源ID", "详情", "IP", "时间"])
-    for lg in logs:
-        writer.writerow([
-            lg.id,
-            _log_level(lg.action, lg.detail),
-            lg.username,
-            lg.action,
-            lg.resource,
-            lg.resource_id or "",
-            lg.detail,
-            lg.ip_address,
-            _format_beijing_time(lg.created_at),
-        ])
+    writer.writerow(["ID", "级别", "类别", "模块", "用户名", "操作", "资源", "资源ID", "详情", "IP", "任务", "时间"])
+    if es_result is not None:
+        logs, _ = es_result
+        for lg in logs:
+            writer.writerow([
+                lg.get("id", ""),
+                lg.get("level", "INFO"),
+                lg.get("category", ""),
+                lg.get("module", ""),
+                lg.get("username", ""),
+                lg.get("action", ""),
+                lg.get("resource", ""),
+                lg.get("resource_id") or "",
+                lg.get("detail") or lg.get("message", ""),
+                lg.get("ip_address", ""),
+                lg.get("task_code") or lg.get("task_id") or "",
+                _format_es_time(lg.get("created_at") or lg.get("timestamp")),
+            ])
+    else:
+        logs, _ = log_repository.get_logs(
+            db, page=1, page_size=10000,
+            keyword=keyword, action=action, resource=resource,
+            username=username, start_date=start_date, end_date=end_date,
+        )
+        for lg in logs:
+            writer.writerow([
+                lg.id,
+                _log_level(lg.action, lg.detail),
+                "audit",
+                lg.resource,
+                lg.username,
+                lg.action,
+                lg.resource,
+                lg.resource_id or "",
+                lg.detail,
+                lg.ip_address,
+                "",
+                _format_beijing_time(lg.created_at),
+            ])
 
     filename = quote("system-logs.csv")
     return StreamingResponse(
@@ -523,6 +610,26 @@ def export_logs(
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"},
     )
+
+
+@router.get("/logs/stats")
+def get_log_stats(
+    start_date: str = Query(""),
+    end_date: str = Query(""),
+    _admin=Depends(require_admin),
+):
+    stats = log_service.get_log_stats(start_date=start_date, end_date=end_date)
+    if stats is None:
+        stats = {
+            "levels": [],
+            "modules": [],
+            "categories": [],
+            "errors_over_time": [],
+            "source": "unavailable",
+        }
+    else:
+        stats["source"] = "elasticsearch"
+    return success_response(stats)
 
 
 @router.get("/my-logs")

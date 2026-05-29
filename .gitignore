@@ -9,3 +9,5 @@ LLMT-training/checkpoints/
 *.pyo
 *.pyd
 .Python
+industryinstruction.jsonl
+industryinstruction_80mb.jsonl

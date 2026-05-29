@@ -18,6 +18,18 @@ _log = logging.getLogger(__name__)
 _cache: dict[str, tuple[torch.nn.Module, Any]] = {}
 
 
+def _normalize_model_config(model_config: dict[str, Any] | None) -> dict[str, Any]:
+    cfg = dict(model_config or {})
+    if cfg.get("tokenizer_type") is None and int(cfg.get("vocab_size", 50257) or 50257) != 50257:
+        cfg["tokenizer_type"] = "sentencepiece"
+        cfg.setdefault("tokenizer_path", "tokenizers/industry_spm.model")
+    return cfg
+
+
+def _tokenizer_name(tokenizer: Any) -> str:
+    return tokenizer.__class__.__name__
+
+
 def _env_int(name: str, default: int) -> int:
     try:
         from app.core.config import get_settings
@@ -269,24 +281,44 @@ def _load_tokenizer(model_type: str, model_config: dict[str, Any] | None,
                     model_code: str = "", version: str = "") -> Any:
     """Load the appropriate tokenizer.
 
-    1. Try loading a saved SimpleTokenizer vocab from the checkpoint directory.
-    2. Fall back to the model provider's tokenizer (e.g. GPT2Tokenizer).
-    3. If that fails too, use a fresh SimpleTokenizer.
+    SentencePiece configs must never fall back to SimpleTokenizer/GPT2Tokenizer,
+    otherwise a 32k model can be decoded with the wrong vocabulary.
     """
-    cfg = model_config or {}
+    cfg = _normalize_model_config(model_config)
     vocab_size = cfg.get("vocab_size", 50257)
+    use_sentencepiece = cfg.get("tokenizer_type") == "sentencepiece"
 
     tokenizer_dir = _download_tokenizer_dir(model_code, version) if model_code and version else None
     if tokenizer_dir is not None:
-        try:
-            from transformers import AutoTokenizer
-            _log.info("Loading tokenizer from %s", tokenizer_dir)
-            tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, local_files_only=True)
-            if getattr(tokenizer, "pad_token", None) is None and getattr(tokenizer, "eos_token", None) is not None:
-                tokenizer.pad_token = tokenizer.eos_token
-            return tokenizer
-        except Exception as exc:
-            _log.warning("Failed to load saved tokenizer directory: %s", exc)
+        spm_path = os.path.join(tokenizer_dir, "sentencepiece.model")
+        if os.path.isfile(spm_path):
+            try:
+                from llmt_training.core.sentencepiece_tokenizer import SentencePieceTokenizer
+                _log.info("Loading SentencePiece tokenizer from %s", spm_path)
+                return SentencePieceTokenizer(spm_path)
+            except Exception as exc:
+                _log.warning("Failed to load saved SentencePiece tokenizer: %s", exc)
+        if cfg.get("tokenizer_type") == "sentencepiece":
+            _log.warning(
+                "Model version tokenizer directory %s does not contain sentencepiece.model; "
+                "falling back to configured local SentencePiece tokenizer",
+                tokenizer_dir,
+            )
+        else:
+            try:
+                from transformers import AutoTokenizer
+                _log.info("Loading tokenizer from %s", tokenizer_dir)
+                tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, local_files_only=True)
+                if getattr(tokenizer, "pad_token", None) is None and getattr(tokenizer, "eos_token", None) is not None:
+                    tokenizer.pad_token = tokenizer.eos_token
+                return tokenizer
+            except Exception as exc:
+                _log.warning("Failed to load saved tokenizer directory: %s", exc)
+
+    if use_sentencepiece:
+        from llmt_training.models.registry import ModelRegistry
+        provider = ModelRegistry.get(model_type)
+        return provider.get_tokenizer(cfg)
 
     # Try saved tokenizer vocab from checkpoint
     vocab_path = _find_tokenizer_vocab(model_code, version)
@@ -322,6 +354,8 @@ def _load_tokenizer(model_type: str, model_config: dict[str, Any] | None,
         provider = ModelRegistry.get(model_type)
         return provider.get_tokenizer(cfg)
     except Exception as exc:
+        if cfg.get("tokenizer_type") == "sentencepiece":
+            raise RuntimeError(f"SentencePiece tokenizer unavailable: {exc}") from exc
         _log.warning("Model provider tokenizer unavailable: %s, using SimpleTokenizer", exc)
         from llmt_training.core.simple_tokenizer import SimpleTokenizer
         return SimpleTokenizer(vocab_size=vocab_size)
@@ -333,7 +367,10 @@ def load_model(model_code: str, version: str, model_type: str = "gpt2",
 
     Returns (model, tokenizer) tuple, or None on failure.
     """
-    cache_key = f"{model_code}:{version}"
+    cfg = _normalize_model_config(model_config)
+    tokenizer_type = cfg.get("tokenizer_type", "gpt2")
+    vocab_size_for_key = cfg.get("vocab_size", 50257)
+    cache_key = f"{model_code}:{version}:{tokenizer_type}:{vocab_size_for_key}"
     if cache_key in _cache:
         return _cache[cache_key]
 
@@ -359,7 +396,6 @@ def load_model(model_code: str, version: str, model_type: str = "gpt2",
     # 2. Build model via registry
     from llmt_training.models.registry import ModelRegistry
     provider = ModelRegistry.get(model_type)
-    cfg = model_config or {}
     model = provider.get_model(cfg)
     tokenizer = _load_tokenizer(model_type, cfg, model_code, version)
 

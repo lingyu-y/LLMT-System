@@ -15,6 +15,11 @@ from torch.utils.data import DataLoader, DistributedSampler
 from llmt_training.core.base_trainer import BaseTrainer
 from llmt_training.core.callbacks import CallbackList
 from llmt_training.core.state import TrainingState
+from llmt_training.trainers.batch_validation import (
+    model_vocab_size,
+    sanitize_token_batch,
+    validate_token_batch,
+)
 
 
 class PyTorchTrainer(BaseTrainer):
@@ -136,6 +141,7 @@ class PyTorchTrainer(BaseTrainer):
         model = self._setup_model()
         optimizer = self._build_optimizer(model)
         self._optimizer = optimizer
+        vocab_size = model_vocab_size(model, self.config)
 
         hp = self.config.get("hyperparams", {})
         max_epochs = hp.get("max_epochs", 10)
@@ -143,8 +149,21 @@ class PyTorchTrainer(BaseTrainer):
         grad_accum = hp.get("gradient_accumulation_steps", 1)
         max_grad_norm = hp.get("max_grad_norm", 1.0)
         precision = hp.get("precision", "fp16")
-
         total_steps_estimate = max_steps or (max_epochs * len(self.train_dataloader))
+        privacy_cfg = self.config.get("privacy", {})
+        dp_mechanism = None
+        if privacy_cfg.get("enable_dp"):
+            from llmt_training.federated.privacy import DPMechanism
+            dp_mechanism = DPMechanism(
+                epsilon=float(privacy_cfg.get("epsilon", 8.0)),
+                delta=float(privacy_cfg.get("delta", 1e-5)),
+                noise_multiplier=privacy_cfg.get("noise_multiplier"),
+                max_grad_norm=float(privacy_cfg.get("max_grad_norm", max_grad_norm)),
+                noise_mechanism=privacy_cfg.get("noise_mechanism", "Gaussian"),
+                expected_steps=total_steps_estimate,
+            )
+            max_grad_norm = float(privacy_cfg.get("max_grad_norm", max_grad_norm))
+
         scheduler = self._build_scheduler(optimizer, total_steps_estimate)
         self._scheduler = scheduler
 
@@ -177,10 +196,6 @@ class PyTorchTrainer(BaseTrainer):
                     if total_steps_estimate and self.state.global_step >= total_steps_estimate:
                         break
 
-                    # Move batch to device
-                    batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
-                             for k, v in batch.items()}
-
                     # Ensure model input ids are integer tensors for embedding lookup
                     if "input_ids" in batch and isinstance(batch["input_ids"], torch.Tensor):
                         batch["input_ids"] = batch["input_ids"].long()
@@ -188,6 +203,17 @@ class PyTorchTrainer(BaseTrainer):
                         batch["attention_mask"] = batch["attention_mask"].long()
                     if "labels" in batch and isinstance(batch["labels"], torch.Tensor):
                         batch["labels"] = batch["labels"].long()
+
+                    sanitize_token_batch(batch, pad_token_id=0)
+                    validate_token_batch(
+                        batch,
+                        vocab_size=vocab_size,
+                        step=self.state.global_step + 1,
+                    )
+
+                    # Move batch to device
+                    batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                             for k, v in batch.items()}
 
                     # Forward
                     if scaler is not None:
@@ -210,15 +236,34 @@ class PyTorchTrainer(BaseTrainer):
 
                     # Gradient accumulation
                     if (step + 1) % grad_accum == 0:
+                        dp_report = None
+                        optimizer_stepped = True
                         if scaler is not None:
                             scaler.unscale_(optimizer)
-                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                            if dp_mechanism is not None:
+                                dp_report = dp_mechanism.apply(model, int(hp.get("batch_size", 1)))
+                            else:
+                                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                            old_scale = scaler.get_scale()
                             scaler.step(optimizer)
                             scaler.update()
+                            optimizer_stepped = scaler.get_scale() >= old_scale
                         else:
-                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                            if dp_mechanism is not None:
+                                dp_report = dp_mechanism.apply(model, int(hp.get("batch_size", 1)))
+                            else:
+                                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                             optimizer.step()
-                        if scheduler is not None:
+                        if dp_report is not None:
+                            self.state.grad_norm = float(dp_report.get("grad_norm_before_clip", 0.0))
+                            self.state.custom_metrics["privacy_report"] = dp_mechanism.get_privacy_report()
+                            self.state.custom_metrics["privacy_spent_epsilon"] = float(dp_report.get("spent_epsilon", 0.0))
+                            self.state.custom_metrics["privacy_remaining_epsilon"] = float(dp_report.get("remaining_epsilon", 0.0))
+                            if dp_mechanism.is_budget_exhausted():
+                                self.state.status = "failed"
+                                self.state.error_message = "隐私预算已耗尽，训练已自动停止"
+                                break
+                        if scheduler is not None and optimizer_stepped:
                             scheduler.step()
                         optimizer.zero_grad()
 
@@ -243,6 +288,8 @@ class PyTorchTrainer(BaseTrainer):
 
                 self.callbacks.on_epoch_end(self.state)
 
+                if self.state.status == "failed":
+                    break
                 if self._should_stop():
                     break
                 if total_steps_estimate and self.state.global_step >= total_steps_estimate:
@@ -250,6 +297,8 @@ class PyTorchTrainer(BaseTrainer):
 
             if self.state.status not in ("cancelled", "failed", "paused"):
                 self.state.status = "completed"
+                if dp_mechanism is not None:
+                    self.state.custom_metrics["privacy_report"] = dp_mechanism.get_privacy_report()
                 if self.state.global_step > 0:
                     ckpt_dir = self.config.get("checkpoint", {}).get(
                         "checkpoint_dir", "/tmp/llmt_checkpoints",

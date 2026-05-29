@@ -81,6 +81,8 @@ export interface CreateFederatedTask {
   description?: string
   model_type: string
   vocab_size: number
+  tokenizer_type: 'gpt2' | 'sentencepiece'
+  tokenizer_path: string
   hidden_size: number
   num_layers: number
   num_attention_heads: number

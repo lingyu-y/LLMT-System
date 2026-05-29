@@ -204,10 +204,17 @@ class ReportingCallbackBridge(TrainingCallback):
                 current_epoch=state.epoch,
                 current_step=state.global_step,
             )
+            privacy_suffix = ""
+            if "privacy_spent_epsilon" in state.custom_metrics:
+                privacy_suffix = (
+                    f" — ε消耗: {state.custom_metrics['privacy_spent_epsilon']:.4f}"
+                    f" — ε剩余: {state.custom_metrics.get('privacy_remaining_epsilon', 0.0):.4f}"
+                )
             self.postgres_updater.append_log(
                 self.task_code, "INFO",
                 f"Epoch {state.epoch + 1} — Step {state.global_step} — "
-                f"loss: {state.loss:.4f} — lr: {state.learning_rate:.2e}",
+                f"loss: {state.loss:.4f} — lr: {state.learning_rate:.2e}"
+                f"{privacy_suffix}",
                 step=state.global_step,
             )
 

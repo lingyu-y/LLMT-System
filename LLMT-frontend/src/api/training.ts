@@ -1,4 +1,4 @@
-import { del, get, post, unwrap, type ApiMessage } from './http'
+import { del, get, post, unwrap, type ApiMessage, type PageResult } from './http'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -6,6 +6,8 @@ import { del, get, post, unwrap, type ApiMessage } from './http'
 
 export interface TrainingConfigDict {
   vocab_size: number
+  tokenizer_type: 'gpt2' | 'sentencepiece'
+  tokenizer_path: string
   hidden_size: number
   num_layers: number
   num_attention_heads: number
@@ -36,6 +38,12 @@ export interface TrainingConfigDict {
   eval_interval: number
   max_checkpoints: number
   upload_to_minio: boolean
+  enable_dp: boolean
+  dp_epsilon: number
+  dp_delta: number
+  dp_noise_mechanism: 'Gaussian' | 'Laplace'
+  dp_noise_multiplier: number | null
+  dp_max_grad_norm: number
   deepspeed_overrides: Record<string, unknown> | null
   megatron_overrides: Record<string, unknown> | null
 }

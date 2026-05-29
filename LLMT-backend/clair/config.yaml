@@ -1,0 +1,27 @@
+http_listen_addr: ":6060"
+introspection_addr: ":6061"
+log_level: info
+
+indexer:
+  connstring: "postgres://clair:clair@clair-postgres:5432/clair?sslmode=disable"
+  migrations: true
+  layer_scan_concurrency: 5
+  scanner: {}
+
+matcher:
+  connstring: "postgres://clair:clair@clair-postgres:5432/clair?sslmode=disable"
+  indexer_addr: "http://clair:6060"
+  migrations: true
+  period: "6h"
+  disable_updaters: false
+
+notifier:
+  connstring: "postgres://clair:clair@clair-postgres:5432/clair?sslmode=disable"
+  indexer_addr: "http://clair:6060"
+  matcher_addr: "http://clair:6060"
+  migrations: true
+  poll_interval: "5m"
+  delivery_interval: "1m"
+
+auth:
+  psk: null
