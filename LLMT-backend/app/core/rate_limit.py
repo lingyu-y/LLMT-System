@@ -78,12 +78,14 @@ def _check_redis(r, key, max_requests, window_seconds, now, window_start):
     pipe = r.pipeline()
     pipe.zremrangebyscore(key, 0, window_start)  # 清理过期
     pipe.zcard(key)                                # 当前窗口内计数
-    pipe.zadd(key, {str(now): now})                # 记录本次
     pipe.expire(key, window_seconds * 2)           # 设置 TTL
-    _, current, _, _ = pipe.execute()
+    _, current, _ = pipe.execute()
 
-    remaining = max(0, max_requests - current)
     allowed = current < max_requests
+    if allowed:
+        r.zadd(key, {f"{now}:{threading.get_ident()}": now})
+        r.expire(key, window_seconds * 2)
+        current += 1
 
     if not allowed:
         oldest = r.zrange(key, 0, 0, withscores=True)
@@ -93,8 +95,8 @@ def _check_redis(r, key, max_requests, window_seconds, now, window_start):
 
     return allowed, {
         "limit": max_requests,
-        "remaining": remaining,
-        "current": current + 1,
+        "remaining": max(0, max_requests - current),
+        "current": current,
         "window_seconds": window_seconds,
         "retry_after_seconds": max(0, retry_after) if not allowed else 0,
     }
@@ -182,6 +184,10 @@ def rate_limit_http_exception(info: dict):
         detail={
             "detail": "请求频率超限，请稍后重试",
             "rate_limit": info,
+        },
+        headers={
+            "Retry-After": str(info.get("retry_after_seconds", 60)),
+            **rate_limit_headers(info),
         },
     )
 

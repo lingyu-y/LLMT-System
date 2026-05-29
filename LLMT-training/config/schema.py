@@ -18,6 +18,8 @@ class ModelConfig(BaseModel):
 
     model_type: str = "gpt2"
     vocab_size: int = 50257
+    tokenizer_type: Literal["gpt2", "sentencepiece"] = "sentencepiece"
+    tokenizer_path: str = "tokenizers/industry_spm.model"
     hidden_size: int = 768
     num_layers: int = 12
     num_attention_heads: int = 12
@@ -36,6 +38,8 @@ class ModelConfig(BaseModel):
 
     @model_validator(mode="after")
     def _set_defaults(self) -> "ModelConfig":
+        if self.model_type == "gpt2" and self.tokenizer_type == "gpt2":
+            self.vocab_size = 50257
         if self.intermediate_size is None:
             self.intermediate_size = 4 * self.hidden_size
         if self.max_position_embeddings is None:
@@ -121,6 +125,17 @@ class ReportingConfig(BaseModel):
     report_gpu_metrics: bool = True
 
 
+class PrivacyConfig(BaseModel):
+    """Differential privacy configuration."""
+
+    enable_dp: bool = False
+    epsilon: float = Field(default=8.0, ge=0.01, le=100.0)
+    delta: float = Field(default=1e-5, ge=1e-12, le=1.0)
+    noise_mechanism: Literal["Gaussian", "Laplace"] = "Gaussian"
+    noise_multiplier: float | None = Field(default=None, ge=0)
+    max_grad_norm: float = Field(default=1.0, gt=0)
+
+
 # ---------------------------------------------------------------------------
 # Unified config
 # ---------------------------------------------------------------------------
@@ -144,6 +159,7 @@ class TrainingConfig(BaseModel):
     strategy: StrategyConfig = Field(default_factory=StrategyConfig)
     checkpoint: CheckpointConfig = Field(default_factory=CheckpointConfig)
     reporting: ReportingConfig = Field(default_factory=ReportingConfig)
+    privacy: PrivacyConfig = Field(default_factory=PrivacyConfig)
 
     # Framework-specific overrides (merged on top of generated config)
     deepspeed_overrides: Optional[dict] = None

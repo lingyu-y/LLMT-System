@@ -404,7 +404,9 @@ const form = reactive<CreateFederatedTask & { min_participants: number; max_roun
   task_name: '多医院协作医疗模型训练',
   description: '联邦学习分布式协作训练任务',
   model_type: 'gpt2',
-  vocab_size: 10000,
+  vocab_size: 32000,
+  tokenizer_type: 'sentencepiece',
+  tokenizer_path: 'tokenizers/industry_spm.model',
   hidden_size: 256,
   num_layers: 4,
   num_attention_heads: 4,
@@ -445,7 +447,7 @@ const newParticipant = reactive<ParticipantConfig>({
   weight: 1.0,
   data_size: 1000,
   local_epochs: 2,
-  local_batch_size: 32,
+  local_batch_size: 8,
   local_learning_rate: 2e-5,
   dataset_id: undefined,
 })
@@ -541,7 +543,7 @@ const handleQuickCreate = async () => {
       weight: 1.0,
       data_size: 2000 + Math.floor(Math.random() * 3000),
       local_epochs: 2,
-      local_batch_size: 32,
+      local_batch_size: 8,
       local_learning_rate: 2e-5,
       dataset_id: undefined,
     })
@@ -549,11 +551,13 @@ const handleQuickCreate = async () => {
   const body: CreateFederatedTask = {
     task_name: quickForm.task_name,
     model_type: 'gpt2',
-    vocab_size: 50257,
-    hidden_size: 768,
-    num_layers: 12,
-    num_attention_heads: 12,
-    seq_length: 512,
+    vocab_size: 32000,
+    tokenizer_type: 'sentencepiece',
+    tokenizer_path: 'tokenizers/industry_spm.model',
+    hidden_size: 384,
+    num_layers: 6,
+    num_attention_heads: 6,
+    seq_length: 128,
     dropout: 0.1,
     num_rounds: quickForm.num_rounds,
     min_participants: 2,
@@ -655,7 +659,7 @@ const pollLogs = async (taskId: number) => {
 
 const openDetail = async (task: FederatedTaskListItem) => {
   stopLogPolling()
-  selectedTask.value = task
+  selectedTask.value = task as unknown as FederatedTask
   activeTab.value = 'monitor'
   try {
     const [detailRes, metricsRes, logsRes] = await Promise.all([
@@ -667,7 +671,7 @@ const openDetail = async (task: FederatedTaskListItem) => {
       selectedTask.value = detailRes.data as FederatedTask
     }
     if (metricsRes.data) {
-      selectedTask.value = { ...selectedTask.value, result_json: metricsRes.data as Record<string, unknown> }
+      selectedTask.value = { ...(selectedTask.value as FederatedTask), result_json: metricsRes.data as Record<string, unknown> }
     }
     if (logsRes.data) {
       trainingLogs.value = (logsRes.data as { logs: { timestamp: string; level: string; message: string }[] }).logs ?? []
@@ -737,6 +741,9 @@ const addParticipantRow = () => {
 
 const resetForm = () => {
   form.participants = []
+  form.vocab_size = 32000
+  form.tokenizer_type = 'sentencepiece'
+  form.tokenizer_path = 'tokenizers/industry_spm.model'
   form.num_rounds = 10
   form.aggregation_strategy = 'weighted_fedavg'
   form.enable_dp = true

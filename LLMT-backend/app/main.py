@@ -2,7 +2,7 @@
 
 from importlib import import_module
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 
 from app.api.router import api_router
 from app.core.config import get_settings
@@ -16,6 +16,28 @@ app = FastAPI(
 )
 
 app.include_router(api_router, prefix=settings.API_PREFIX)
+
+
+@app.middleware("http")
+async def index_unhandled_exceptions(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except Exception as exc:
+        try:
+            from app.services import log_service
+            log_service.index_log(
+                level="ERROR",
+                module="app.exception",
+                message=str(exc),
+                category="exception",
+                action="unhandled_exception",
+                resource=request.url.path,
+                ip_address=request.client.host if request.client else "",
+                extra={"method": request.method},
+            )
+        except Exception:
+            pass
+        raise
 
 
 @app.on_event("startup")

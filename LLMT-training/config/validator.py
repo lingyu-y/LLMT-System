@@ -76,6 +76,16 @@ class ConfigValidator:
             if s.tensor_model_parallel_size > 1 or s.pipeline_model_parallel_size > 1:
                 result.errors.append("PyTorch 框架不支持 TP/PP，请使用 Megatron 框架")
 
+        if config.privacy.enable_dp:
+            if config.framework != "pytorch":
+                result.warnings.append(
+                    "普通训练差分隐私当前仅在 PyTorch/DDP 训练循环中执行梯度加噪"
+                )
+            if not (1.0 <= config.privacy.epsilon <= 10.0):
+                result.warnings.append("推荐 ε 范围为 1.0-10.0")
+            if not (1e-6 <= config.privacy.delta <= 1e-5):
+                result.warnings.append("推荐 δ 范围为 1e-6 到 1e-5")
+
         # ---- Hyperparameter sanity ----
 
         if hp.learning_rate <= 0:

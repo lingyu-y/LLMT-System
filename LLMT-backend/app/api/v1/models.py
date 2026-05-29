@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import StreamingResponse
+import httpx
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -323,9 +324,33 @@ def get_model_version_detail(
     return success_response(_build_model_out(model))
 
 
+@router.get("/security/clair/status")
+def get_clair_status(
+    _admin=Depends(require_admin),
+):
+    settings = get_settings()
+    url = settings.CLAIR_API_URL.rstrip("/")
+    try:
+        response = httpx.get(f"{url}/openapi/v1", timeout=3.0, trust_env=False)
+        return success_response({
+            "enabled": settings.CLAIR_SCAN_ENABLED,
+            "url": url,
+            "reachable": response.status_code < 500,
+            "status_code": response.status_code,
+        })
+    except Exception as exc:
+        return success_response({
+            "enabled": settings.CLAIR_SCAN_ENABLED,
+            "url": url,
+            "reachable": False,
+            "error": str(exc),
+        })
+
+
 @router.post("/{model_code}/security/scan")
 def trigger_security_scan(
     model_code: str,
+    body: dict | None = None,
     db: Session = Depends(get_db),
     _admin=Depends(require_admin),
 ):
@@ -335,12 +360,19 @@ def trigger_security_scan(
 
     from app.services.scan_service import run_security_scan
 
-    result = run_security_scan(db, model, triggered_by="admin")
+    try:
+        result = run_security_scan(db, model, triggered_by="admin", image_ref=(body or {}).get("image_ref"))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
     return success_response({
         "scan_id": result["scan_id"],
         "model_code": model.model_code,
         "version": model.version,
         "status": "completed",
+        "scanner": result.get("scanner"),
+        "image_ref": result.get("image_ref"),
+        "scan_error": result.get("scan_error"),
+        "scanned_at": result.get("scanned_at"),
         "score": result["score"],
         "summary": result["summary"],
         "alerts_triggered": result["alerts_triggered"],
@@ -367,6 +399,9 @@ def get_security_reports(
                 "model_code": r["model_code"],
                 "version": r["version"],
                 "status": "completed",
+                "scanner": r.get("scanner", "simulated"),
+                "image_ref": r.get("image_ref"),
+                "scan_error": r.get("scan_error"),
                 "score": r.get("score"),
                 "summary": r.get("summary"),
                 "vulnerabilities": r.get("vulnerabilities", []),

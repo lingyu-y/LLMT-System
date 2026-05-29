@@ -66,22 +66,64 @@ def ensure_elasticsearch_index() -> str:
 
     client = get_elasticsearch_client()
     index_name = settings.ELASTICSEARCH_INDEX_LOGS
+    index_settings = {
+        "index": {
+            "number_of_shards": 1,
+            "number_of_replicas": 0,
+        }
+    }
+    try:
+        policy_name = f"{index_name}-{settings.ELASTICSEARCH_LOG_RETENTION_DAYS}d-retention"
+        client.ilm.put_lifecycle(
+            name=policy_name,
+            policy={
+                "phases": {
+                    "delete": {
+                        "min_age": f"{settings.ELASTICSEARCH_LOG_RETENTION_DAYS}d",
+                        "actions": {"delete": {}},
+                    }
+                }
+            },
+        )
+        index_settings["index"]["lifecycle.name"] = policy_name
+    except Exception:
+        pass
+    mappings = {
+        "properties": {
+            "id": {"type": "long"},
+            "timestamp": {"type": "date"},
+            "created_at": {"type": "date"},
+            "level": {"type": "keyword"},
+            "category": {"type": "keyword"},
+            "module": {"type": "keyword"},
+            "message": {"type": "text"},
+            "detail": {"type": "text"},
+            "action": {"type": "keyword"},
+            "resource": {"type": "keyword"},
+            "resource_id": {"type": "long"},
+            "user_id": {"type": "integer"},
+            "username": {"type": "keyword"},
+            "ip_address": {"type": "keyword"},
+            "task_id": {"type": "long"},
+            "task_code": {"type": "keyword"},
+            "step": {"type": "long"},
+            "trace_id": {"type": "keyword"},
+        }
+    }
 
     if client.indices.exists(index=index_name):
+        client.indices.put_mapping(index=index_name, properties=mappings["properties"])
+        if "lifecycle.name" in index_settings["index"]:
+            client.indices.put_settings(
+                index=index_name,
+                settings={"index": {"lifecycle.name": index_settings["index"]["lifecycle.name"]}},
+            )
         return index_name
 
     client.indices.create(
         index=index_name,
-        mappings={
-            "properties": {
-                "timestamp": {"type": "date"},
-                "level": {"type": "keyword"},
-                "module": {"type": "keyword"},
-                "message": {"type": "text"},
-                "user_id": {"type": "integer"},
-                "task_code": {"type": "keyword"},
-            }
-        },
+        settings=index_settings,
+        mappings=mappings,
     )
     return index_name
 

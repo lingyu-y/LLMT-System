@@ -322,8 +322,23 @@ def run_federated_task(self, task_code: str) -> dict:
         from llmt_training.federated.coordinator import FederatedCoordinator
         from llmt_training.models.registry import ModelRegistry
 
-        # Build config
-        config = FederatedConfig(**task.config_json)
+        # Build config. Older queued tasks may not have tokenizer metadata.
+        task_config = dict(task.config_json or {})
+        if task_config.get("model_type", "gpt2") == "gpt2":
+            task_config["tokenizer_type"] = task_config.get("tokenizer_type") or "sentencepiece"
+            task_config["tokenizer_path"] = task_config.get("tokenizer_path") or "tokenizers/industry_spm.model"
+            if task_config["tokenizer_type"] == "sentencepiece":
+                task_config["vocab_size"] = 32000
+        config = FederatedConfig(**task_config)
+        if task_config != task.config_json:
+            task.config_json = task_config
+            task.model_config_json = {
+                **(task.model_config_json or {}),
+                "vocab_size": config.vocab_size,
+                "tokenizer_type": config.tokenizer_type,
+                "tokenizer_path": config.tokenizer_path,
+            }
+            db.commit()
 
         # Build global model & tokenizer
         provider = ModelRegistry.get(config.model_type)
@@ -599,6 +614,8 @@ def _promote_federated_model(
         "total_elapsed_seconds": result.get("total_elapsed_seconds"),
         # Model config must be at top level so inference engine can read it
         "vocab_size": config.vocab_size,
+        "tokenizer_type": config.tokenizer_type,
+        "tokenizer_path": config.tokenizer_path,
         "hidden_size": config.hidden_size,
         "num_layers": config.num_layers,
         "num_attention_heads": config.num_attention_heads,
@@ -640,8 +657,19 @@ def _promote_federated_model(
         minio.fput_object(bucket, dest_ckpt, final_path)
         logger.info("Uploaded checkpoint -> minio://%s/%s", bucket, dest_ckpt)
 
-        # Save and upload tokenizer vocab
-        if tokenizer is not None:
+        if config.tokenizer_type == "sentencepiece":
+            spm_path = config.tokenizer_path
+            if not os.path.isabs(spm_path):
+                spm_path = os.path.join(settings.LLMT_TRAINING_MODULE_PATH, spm_path)
+            if os.path.isfile(spm_path):
+                minio.fput_object(bucket, f"{storage_path}/tokenizer/sentencepiece.model", spm_path)
+                logger.info(
+                    "Uploaded SentencePiece tokenizer -> minio://%s/%s/tokenizer/sentencepiece.model",
+                    bucket, storage_path,
+                )
+            else:
+                logger.warning("SentencePiece tokenizer not found at %s", spm_path)
+        elif tokenizer is not None:
             import tempfile
             with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
                 vocab_path = tmp.name

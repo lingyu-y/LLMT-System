@@ -23,6 +23,17 @@ from app.schemas.federated import (
 logger = logging.getLogger(__name__)
 
 
+def _normalize_federated_config(config: dict[str, Any] | None) -> dict[str, Any]:
+    """Ensure federated tasks use the current SentencePiece tokenizer defaults."""
+    normalized = dict(config or {})
+    if normalized.get("model_type", "gpt2") == "gpt2":
+        normalized["tokenizer_type"] = normalized.get("tokenizer_type") or "sentencepiece"
+        normalized["tokenizer_path"] = normalized.get("tokenizer_path") or "tokenizers/industry_spm.model"
+        if normalized["tokenizer_type"] == "sentencepiece":
+            normalized["vocab_size"] = 32000
+    return normalized
+
+
 # ---------------------------------------------------------------------------
 # CRUD helpers
 # ---------------------------------------------------------------------------
@@ -35,6 +46,8 @@ def create_task(db: Session, body: FederatedTaskCreate, creator_id: int) -> Fede
     model_config = {
         "model_type": body.model_type,
         "vocab_size": body.vocab_size,
+        "tokenizer_type": body.tokenizer_type,
+        "tokenizer_path": body.tokenizer_path,
         "hidden_size": body.hidden_size,
         "num_layers": body.num_layers,
         "num_attention_heads": body.num_attention_heads,
@@ -62,6 +75,8 @@ def create_task(db: Session, body: FederatedTaskCreate, creator_id: int) -> Fede
         task_code=task_code,
         model_type=body.model_type,
         vocab_size=body.vocab_size,
+        tokenizer_type=body.tokenizer_type,
+        tokenizer_path=body.tokenizer_path,
         hidden_size=body.hidden_size,
         num_layers=body.num_layers,
         num_attention_heads=body.num_attention_heads,
@@ -84,7 +99,7 @@ def create_task(db: Session, body: FederatedTaskCreate, creator_id: int) -> Fede
         save_every_n_rounds=body.save_every_n_rounds,
         participants=participants_for_config,
     )
-    config_dict = json.loads(config_obj.model_dump_json())
+    config_dict = _normalize_federated_config(json.loads(config_obj.model_dump_json()))
 
     task = FederatedTask(
         task_name=body.task_name,
@@ -187,6 +202,8 @@ def start_task(db: Session, task_id: int) -> FederatedTaskOut | None:
     task.status = "running"
     task.started_at = datetime.now(timezone.utc)
     task.current_round = 1
+    task.config_json = _normalize_federated_config(task.config_json)
+    task.model_config_json = _normalize_federated_config(task.model_config_json)
 
     # Dispatch to Celery for actual training
     try:

@@ -75,11 +75,16 @@ def predict(body: PredictRequest) -> dict[str, Any]:
     try:
         from llmt_training.inference.engine import load_model, run_inference
 
+        model_cfg = dict(body.model_cfg or {})
+        if model_cfg.get("tokenizer_type") is None and int(model_cfg.get("vocab_size", 50257) or 50257) != 50257:
+            model_cfg["tokenizer_type"] = "sentencepiece"
+            model_cfg.setdefault("tokenizer_path", "tokenizers/industry_spm.model")
+
         model_tok = load_model(
             body.model_code,
             body.version,
             model_type=body.model_type,
-            model_config=body.model_cfg,
+            model_config=model_cfg,
         )
         if model_tok is None:
             raise HTTPException(
@@ -96,15 +101,18 @@ def predict(body: PredictRequest) -> dict[str, Any]:
             tokenizer,
             body.input,
             max_new_tokens=max_new_tokens,
-            temperature=float(params.get("temperature", 0.8)),
-            top_p=float(params.get("top_p", 0.9)),
-            top_k=int(params.get("top_k", 50)),
+            temperature=float(params.get("temperature", 0.7)),
+            top_p=float(params.get("top_p", 0.85)),
+            top_k=int(params.get("top_k", 20)),
         )
         return {
             "model_code": body.model_code,
             "output": output_text,
             "latency_ms": latency_ms,
             "input": body.input,
+            "tokenizer": tokenizer.__class__.__name__,
+            "vocab_size": getattr(tokenizer, "vocab_size", None),
+            "model_config": model_cfg,
         }
     except HTTPException:
         raise

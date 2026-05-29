@@ -17,6 +17,11 @@ from llmt_training.core.callbacks import CallbackList
 from llmt_training.core.state import TrainingState
 from llmt_training.config.schema import TrainingConfig
 from llmt_training.config.merger import ConfigMerger
+from llmt_training.trainers.batch_validation import (
+    model_vocab_size,
+    sanitize_token_batch,
+    validate_token_batch,
+)
 
 
 class DeepSpeedTrainer(BaseTrainer):
@@ -174,6 +179,7 @@ class DeepSpeedTrainer(BaseTrainer):
         # Move model to correct device before init
         self.model = self.model.to(device)
         print(f"[DeepSpeedTrainer] initializing DeepSpeed on device={device}", flush=True)
+        vocab_size = model_vocab_size(self.model, self.config)
 
         # Ensure distributed init environment variables are set (required by DeepSpeed)
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
@@ -221,15 +227,23 @@ class DeepSpeedTrainer(BaseTrainer):
                     if total_steps and self.state.global_step >= total_steps:
                         break
 
-                    # Move batch to device
-                    batch = {k: v.to(model_engine.device) if isinstance(v, torch.Tensor) else v
-                             for k, v in batch.items()}
                     if "input_ids" in batch and isinstance(batch["input_ids"], torch.Tensor):
                         batch["input_ids"] = batch["input_ids"].long()
                     if "attention_mask" in batch and isinstance(batch["attention_mask"], torch.Tensor):
                         batch["attention_mask"] = batch["attention_mask"].long()
                     if "labels" in batch and isinstance(batch["labels"], torch.Tensor):
                         batch["labels"] = batch["labels"].long()
+
+                    sanitize_token_batch(batch, pad_token_id=0)
+                    validate_token_batch(
+                        batch,
+                        vocab_size=vocab_size,
+                        step=self.state.global_step + 1,
+                    )
+
+                    # Move batch to device
+                    batch = {k: v.to(model_engine.device) if isinstance(v, torch.Tensor) else v
+                             for k, v in batch.items()}
 
                     # Forward
                     outputs = model_engine(**{k: v for k, v in batch.items()

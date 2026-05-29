@@ -20,20 +20,51 @@ from app.repositories import inference_repository
 router = APIRouter(prefix="/inference", tags=["模型推理"])
 settings = get_settings()
 
-# 推理接口限流配置
-INFERENCE_RATE_LIMIT = 60  # 次/分钟
+DEFAULT_INFERENCE_RATE_LIMIT = 100  # 次/分钟
 INFERENCE_RATE_WINDOW = 60  # 秒
 
 
 def _check_inference_rate_limit(
     request: Request,
     current_user: User,
+    model,
+    db: Session,
 ) -> dict:
     """推理接口限流检查。"""
+    hyperparams = model.hyperparams_json or {}
+    stored = hyperparams.get("rate_limit") or {}
+    if stored.get("enabled", True) is False:
+        return {
+            "limit": 0,
+            "remaining": 0,
+            "current": 0,
+            "window_seconds": INFERENCE_RATE_WINDOW,
+            "retry_after_seconds": 0,
+            "disabled": True,
+        }
+
+    limits = stored.get("limits") or {}
+    requests_per_minute = int(limits.get("requests_per_minute") or DEFAULT_INFERENCE_RATE_LIMIT)
     key = extract_rate_limit_key(request, current_user.id)
-    allowed, info = check_rate_limit(key, INFERENCE_RATE_LIMIT, INFERENCE_RATE_WINDOW)
+    allowed, info = check_rate_limit(key, requests_per_minute, INFERENCE_RATE_WINDOW)
     if not allowed:
         from app.core.rate_limit import rate_limit_http_exception
+        try:
+            from app.services import log_service
+            log_service.create_log(
+                db,
+                user_id=current_user.id,
+                username=current_user.username,
+                action="rate_limit_exceeded",
+                resource="inference",
+                resource_id=model.id,
+                detail=(
+                    f"模型 {model.model_code}:{model.version} 推理请求超限，"
+                    f"{info['current']}/{info['limit']} 次/{info['window_seconds']}秒"
+                ),
+            )
+        except Exception:
+            pass
         raise rate_limit_http_exception(info)
     return info
 
@@ -55,8 +86,6 @@ def predict_sync(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    rate_info = _check_inference_rate_limit(request, current_user)
-
     input_text = body.get("input", "")
     params = body.get("parameters", {})
 
@@ -72,8 +101,13 @@ def predict_sync(
     if mv is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型不存在或不可用")
 
+    rate_info = _check_inference_rate_limit(request, current_user, mv, db)
+
     # Extract model type & config from stored hyperparams
-    hyper = mv.hyperparams_json or {}
+    hyper = dict(mv.hyperparams_json or {})
+    if hyper.get("tokenizer_type") is None and int(hyper.get("vocab_size", 50257) or 50257) != 50257:
+        hyper["tokenizer_type"] = "sentencepiece"
+        hyper.setdefault("tokenizer_path", "tokenizers/industry_spm.model")
     model_code = mv.model_code
     model_type = hyper.get("model_type", "gpt2")
     version = mv.version or "v1.0.0"
@@ -101,6 +135,9 @@ def predict_sync(
                     detail = response.text
                 raise HTTPException(status_code=response.status_code, detail=detail)
             result = response.json()
+            result.setdefault("model_id", mv.id)
+            result.setdefault("version", version)
+            result.setdefault("model_config", hyper)
         else:
             from llmt_training.inference.engine import load_model, run_inference
 
@@ -118,15 +155,20 @@ def predict_sync(
             output_text, latency_ms = run_inference(
                 model, tokenizer, input_text,
                 max_new_tokens=max_new_tokens,
-                temperature=float(params.get("temperature", 0.8)),
-                top_p=float(params.get("top_p", 0.9)),
-                top_k=int(params.get("top_k", 50)),
+                temperature=float(params.get("temperature", 0.7)),
+                top_p=float(params.get("top_p", 0.85)),
+                top_k=int(params.get("top_k", 20)),
             )
             result = {
                 "model_code": model_code,
+                "model_id": mv.id,
+                "version": version,
                 "output": output_text,
                 "latency_ms": latency_ms,
                 "input": input_text,
+                "tokenizer": tokenizer.__class__.__name__,
+                "vocab_size": getattr(tokenizer, "vocab_size", None),
+                "model_config": hyper,
             }
     except httpx.RequestError as exc:
         raise HTTPException(
@@ -146,7 +188,7 @@ def predict_sync(
 
     return JSONResponse(
         content={"message": "推理完成", "data": result},
-        headers=rate_limit_headers(rate_info),
+        headers=rate_limit_headers(rate_info) if not rate_info.get("disabled") else {},
     )
 
 

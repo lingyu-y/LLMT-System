@@ -127,9 +127,19 @@ class PostgresStatusUpdater:
     def append_log(
         self, task_code: str, level: str, message: str, step: int | None = None,
     ) -> bool:
-        """Append a training log entry to the task's config_json._training_log array."""
+        """Append a training log entry and index it for Elasticsearch search."""
         import json
         from datetime import datetime, timezone
+
+        timestamp = datetime.now(timezone.utc).isoformat()
+        entry = {
+            "timestamp": timestamp,
+            "level": level,
+            "message": message,
+        }
+        if step is not None:
+            entry["step"] = step
+        self._index_training_log(task_code, entry)
 
         try:
             from sqlalchemy import create_engine, text
@@ -140,14 +150,6 @@ class PostgresStatusUpdater:
                 return False
 
             engine = create_engine(url)
-            entry = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "level": level,
-                "message": message,
-            }
-            if step is not None:
-                entry["step"] = step
-
             with Session(engine) as session:
                 # Read current config_json — may be a dict or a JSON string
                 # depending on the DB driver and column type.
@@ -178,6 +180,38 @@ class PostgresStatusUpdater:
             return True
         except Exception:
             return False
+
+    def _index_training_log(self, task_code: str, entry: dict[str, Any]) -> None:
+        """Best-effort ES write kept independent from backend imports."""
+        try:
+            from elasticsearch import Elasticsearch
+
+            url = os.environ.get("ELASTICSEARCH_URL", "http://localhost:9200")
+            username = os.environ.get("ELASTICSEARCH_USERNAME")
+            password = os.environ.get("ELASTICSEARCH_PASSWORD")
+            index_name = os.environ.get("ELASTICSEARCH_INDEX_LOGS", "system-logs")
+            timeout = float(os.environ.get("ELASTICSEARCH_REQUEST_TIMEOUT_SECONDS", "1.0"))
+            client_kwargs = {"request_timeout": timeout, "retry_on_timeout": False, "max_retries": 0}
+            if username and password:
+                client = Elasticsearch(url, basic_auth=(username, password), **client_kwargs)
+            else:
+                client = Elasticsearch(url, **client_kwargs)
+            document = {
+                "timestamp": entry["timestamp"],
+                "created_at": entry["timestamp"],
+                "level": (entry.get("level") or "INFO").upper(),
+                "category": "training",
+                "module": "training",
+                "message": entry.get("message", ""),
+                "detail": entry.get("message", ""),
+                "task_code": task_code,
+                "step": entry.get("step"),
+                "action": "training_log",
+                "resource": "training_task",
+            }
+            client.index(index=index_name, body=document)
+        except Exception:
+            pass
 
     def _update_via_api(self, task_code: str, **kwargs: Any) -> bool:
         """Update via HTTP API call (for separate training processes)."""

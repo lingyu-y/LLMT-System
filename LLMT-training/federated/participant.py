@@ -13,6 +13,11 @@ from torch.utils.data import DataLoader
 from llmt_training.federated.config import FederatedConfig, ParticipantConfig
 from llmt_training.federated.privacy import DPMechanism
 from llmt_training.federated.shared_memory import SharedMemoryManager
+from llmt_training.trainers.batch_validation import (
+    model_vocab_size,
+    sanitize_token_batch,
+    validate_token_batch,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +102,7 @@ class FederatedParticipant:
 
         self._current_round = round_num
         self.model.train()
+        vocab_size = model_vocab_size(self.model, {"model": self.config.get_model_config_dict()})
 
         # Store global model parameters for FedProx proximal term
         global_params = (
@@ -133,6 +139,12 @@ class FederatedParticipant:
             for step, batch in enumerate(self.train_dataloader):
                 if step == 0:
                     logger.info("Participant %s: first batch loaded, starting forward pass...", self.participant_id)
+                sanitize_token_batch(batch, pad_token_id=0)
+                validate_token_batch(
+                    batch,
+                    vocab_size=vocab_size,
+                    step=step + 1,
+                )
                 # Split full batch into micro-batches to limit peak logits memory.
                 full_bs = len(batch["input_ids"])
                 micro_bs = max(1, full_bs // accum_steps)

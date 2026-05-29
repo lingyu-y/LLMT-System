@@ -37,9 +37,26 @@ export interface SecurityReport {
   model_code: string
   version: string
   status: string
+  scanner?: string
+  image_ref?: string | null
+  scan_error?: string | null
   score?: number
-  summary?: string
-  vulnerabilities: unknown[]
+  summary?: {
+    total: number
+    critical: number
+    high: number
+    medium: number
+    low: number
+  }
+  vulnerabilities: Array<{
+    cve_id: string
+    severity: 'Critical' | 'High' | 'Medium' | 'Low' | string
+    pkg_name: string
+    pkg_version: string
+    fixed_version: string
+    description: string
+    fix_suggestion: string
+  }>
   scanned_at?: string
 }
 
@@ -79,8 +96,8 @@ export const exportModel = async (payload: { model_code: string; version: string
 export const createModelVersion = async (modelCode: string, payload: Record<string, unknown>) =>
   unwrap(await post<ApiMessage<BackendModel>>(`/models/${modelCode}/versions`, payload))
 
-export const triggerSecurityScan = async (modelCode: string) =>
-  unwrap(await post<ApiMessage<Record<string, unknown>>>(`/models/${modelCode}/security/scan`))
+export const triggerSecurityScan = async (modelCode: string, imageRef?: string) =>
+  unwrap(await post<ApiMessage<SecurityReport & { alerts_triggered?: number }>>(`/models/${modelCode}/security/scan`, imageRef ? { image_ref: imageRef } : {}))
 
 export const getSecurityReports = async (modelCode: string) =>
   unwrap(await get<ApiMessage<SecurityReport[]>>(`/models/${modelCode}/security/reports`))

@@ -39,21 +39,13 @@ class FinetuneDataset(BaseDataset):
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         sample = self.samples[index]
-        text = sample.get("text", "")
 
         if self.tokenizer is not None:
-            encoding = self.tokenizer(
-                text,
-                max_length=self.seq_length,
-                padding="max_length",
-                truncation=True,
-                return_tensors="pt",
+            input_ids, attention_mask, labels = _encode_causal_sample(
+                sample,
+                self.tokenizer,
+                self.seq_length,
             )
-            input_ids = encoding["input_ids"].squeeze(0).long()
-            attention_mask = encoding["attention_mask"].squeeze(0).long()
-            labels = input_ids.clone().long()
-            # Mask padding tokens in labels
-            labels[labels == self.tokenizer.pad_token_id] = -100
         else:
             # Return raw text (collate_fn must handle tokenization)
             input_ids = torch.zeros(self.seq_length, dtype=torch.long)
@@ -243,20 +235,13 @@ class ShardedFinetuneDataset(BaseDataset):
 
         local_idx = min(local_idx, len(self._loaded_samples) - 1)
         sample = self._loaded_samples[local_idx]
-        text = sample.get("text", "")
 
         if self.tokenizer is not None:
-            encoding = self.tokenizer(
-                text,
-                max_length=self.seq_length,
-                padding="max_length",
-                truncation=True,
-                return_tensors="pt",
+            input_ids, attention_mask, labels = _encode_causal_sample(
+                sample,
+                self.tokenizer,
+                self.seq_length,
             )
-            input_ids = encoding["input_ids"].squeeze(0).long()
-            attention_mask = encoding["attention_mask"].squeeze(0).long()
-            labels = input_ids.clone().long()
-            labels[labels == self.tokenizer.pad_token_id] = -100
         else:
             input_ids = torch.zeros(self.seq_length, dtype=torch.long)
             attention_mask = torch.zeros(self.seq_length, dtype=torch.long)
@@ -295,3 +280,95 @@ class ShardedFinetuneDataset(BaseDataset):
             seq_length=model_cfg.get("seq_length", 512),
             tokenizer=tokenizer,
         )
+
+
+_PROMPT_KEYS = ("prompt", "instruction", "question", "input")
+_RESPONSE_KEYS = ("response", "completion", "answer", "output")
+
+
+def _first_text(sample: dict[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = sample.get(key)
+        if value is not None:
+            text = str(value).strip()
+            if text:
+                return text
+    return ""
+
+
+def _build_sample_text(sample: dict[str, Any]) -> tuple[str, str | None]:
+    prompt = _first_text(sample, _PROMPT_KEYS)
+    response = _first_text(sample, _RESPONSE_KEYS)
+    if prompt and response:
+        prompt_part = f"{prompt}\n"
+        return f"{prompt_part}{response}", prompt_part
+
+    text = str(sample.get("text", "")).strip()
+    return text, None
+
+
+def _tokenize_1d(
+    tokenizer,
+    text: str,
+    max_length: int,
+    padding: str | bool | None = False,
+    truncation: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    kwargs: dict[str, Any] = {
+        "max_length": max_length,
+        "truncation": truncation,
+        "return_tensors": "pt",
+    }
+    if padding:
+        kwargs["padding"] = padding
+    encoding = tokenizer(
+        text,
+        **kwargs,
+    )
+    return encoding["input_ids"].squeeze(0).long(), encoding["attention_mask"].squeeze(0).long()
+
+
+def _pad_to_length(values: torch.Tensor, length: int, pad_value: int) -> torch.Tensor:
+    if values.numel() >= length:
+        return values[:length]
+    pad = torch.full((length - values.numel(),), pad_value, dtype=values.dtype)
+    return torch.cat([values, pad], dim=0)
+
+
+def _encode_causal_sample(
+    sample: dict[str, Any],
+    tokenizer,
+    seq_length: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    text, prompt_part = _build_sample_text(sample)
+    pad_id = int(getattr(tokenizer, "pad_token_id", 0) or 0)
+
+    token_ids, token_mask = _tokenize_1d(
+        tokenizer,
+        text,
+        max_length=seq_length + 1,
+        padding=None,
+        truncation=True,
+    )
+
+    input_ids = _pad_to_length(token_ids[:-1], seq_length, pad_id)
+    attention_mask = _pad_to_length(token_mask[:-1], seq_length, 0)
+    labels = _pad_to_length(token_ids[1:], seq_length, -100)
+
+    input_ids[input_ids < 0] = pad_id
+    labels[attention_mask == 0] = -100
+    labels[labels == pad_id] = -100
+
+    if prompt_part is not None:
+        prompt_ids, _ = _tokenize_1d(
+            tokenizer,
+            prompt_part,
+            max_length=seq_length + 1,
+            padding=None,
+            truncation=True,
+        )
+        prompt_label_cutoff = max(min(prompt_ids.numel(), seq_length) - 1, 0)
+        if prompt_label_cutoff:
+            labels[:prompt_label_cutoff] = -100
+
+    return input_ids.long(), attention_mask.long(), labels.long()

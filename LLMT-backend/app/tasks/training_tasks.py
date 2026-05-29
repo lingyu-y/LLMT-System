@@ -227,12 +227,14 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
         import llmt_training.data.finetune_dataset as _fdm
         import llmt_training.data.pretrain_dataset as _pdm
         import llmt_training.data.data_utils as _dum
+        import llmt_training.trainers.batch_validation as _bvm
         import llmt_training.trainers.deepspeed_trainer as _dsm
         import llmt_training.trainers.pytorch_trainer as _ptm
         import llmt_training.trainers.factory as _tf
         importlib.reload(_fdm)
         importlib.reload(_pdm)
         importlib.reload(_dum)
+        importlib.reload(_bvm)
         importlib.reload(_dsm)
         importlib.reload(_ptm)
         importlib.reload(_tf)
@@ -246,7 +248,10 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
         # --- Fine-tune: load pretrained weights from a previous ModelVersion ---
         base_model_version_id = config_dict.get("base_model_version_id")
         if base_model_version_id is not None:
-            _load_pretrained_weights(model, base_model_version_id)
+            if not _load_pretrained_weights(model, base_model_version_id):
+                msg = f"基础模型权重加载失败：base_model_version_id={base_model_version_id}"
+                _update_task_status(task_code, "failed", error_message=msg)
+                return {"task_code": task_code, "status": "failed", "error_message": msg}
 
         # Build dataloaders from config
         from llmt_training.data.data_utils import create_dataset_from_config, build_dataloaders
@@ -319,8 +324,11 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
 
         # On resume, load the last checkpoint so training continues from there.
         if resume_step > 0:
+            ckpt_dir = config_dict.get("checkpoint", {}).get("checkpoint_dir", "/tmp/llmt_checkpoints")
             ckpt_candidates = [
                 resume_ckpt,
+                os.path.join(ckpt_dir, "ckpt"),
+                os.path.join(ckpt_dir, "ckpt", "checkpoint.pt"),
                 # New format: ckpt/ subdirectory (matching DeepSpeed structure)
                 "/tmp/llmt_checkpoints/ckpt",
                 "/tmp/llmt_checkpoints/ckpt/checkpoint.pt",
@@ -373,6 +381,9 @@ def run_training_task(self, task_code: str) -> dict[str, Any]:
 
         # Save tokenizer vocab alongside checkpoint for inference
         _save_tokenizer_vocab(dataset, config_dict)
+        privacy_report = final_state.custom_metrics.get("privacy_report") if final_state.custom_metrics else None
+        if privacy_report:
+            _store_privacy_report(task_code, privacy_report)
         if final_state.status == "completed":
             _promote_to_model(task_code)
 
@@ -479,11 +490,35 @@ def _prepopulate_tokenizer_vocab(dataset) -> None:
         if tokenizer is None or not hasattr(tokenizer, "build_vocab_from_texts"):
             return
 
+        def _sample_text(sample) -> str:
+            if not isinstance(sample, dict):
+                return str(sample)
+            text = str(sample.get("text") or "").strip()
+            if text:
+                return text
+            prompt = str(
+                sample.get("prompt")
+                or sample.get("instruction")
+                or sample.get("question")
+                or sample.get("input")
+                or "",
+            ).strip()
+            response = str(
+                sample.get("response")
+                or sample.get("completion")
+                or sample.get("answer")
+                or sample.get("output")
+                or "",
+            ).strip()
+            if prompt and response:
+                return f"{prompt}\n{response}"
+            return prompt or response
+
         texts: list[str] = []
         # FinetuneDataset stores samples in self.samples
         if hasattr(dataset, "samples"):
             for s in dataset.samples:
-                t = s.get("text", "") if isinstance(s, dict) else str(s)
+                t = _sample_text(s)
                 if t:
                     texts.append(t)
         # ShardedFinetuneDataset has per-shard samples
@@ -492,7 +527,7 @@ def _prepopulate_tokenizer_vocab(dataset) -> None:
                 try:
                     from llmt_training.data.finetune_dataset import _parse_file_samples
                     for s in _parse_file_samples(path):
-                        t = s.get("text", "") if isinstance(s, dict) else str(s)
+                        t = _sample_text(s)
                         if t:
                             texts.append(t)
                 except Exception:
@@ -721,6 +756,8 @@ def _download_dataset_from_minio(
     """
     import logging
     import tempfile
+
+    import torch
     logger = logging.getLogger(__name__)
 
     try:
@@ -758,7 +795,7 @@ def _download_dataset_from_minio(
         return None
 
 
-def _load_pretrained_weights(model, base_model_version_id: int) -> None:
+def _load_pretrained_weights(model, base_model_version_id: int) -> bool:
     """Load pretrained model weights from a previous ModelVersion for fine-tuning.
 
     Downloads checkpoint.pt from MinIO models bucket, then loads the state_dict
@@ -766,6 +803,8 @@ def _load_pretrained_weights(model, base_model_version_id: int) -> None:
     """
     import logging
     import tempfile
+
+    import torch
 
     _log = logging.getLogger(__name__)
 
@@ -784,7 +823,7 @@ def _load_pretrained_weights(model, base_model_version_id: int) -> None:
                     "training from scratch",
                     flush=True,
                 )
-                return
+                return False
 
             model_code = mv.model_code
             version = mv.version
@@ -831,13 +870,15 @@ def _load_pretrained_weights(model, base_model_version_id: int) -> None:
 
         import shutil
         shutil.rmtree(local_dir, ignore_errors=True)
+        return True
     except Exception as exc:
         print(
             f"[TrainingTask] WARNING: Failed to load pretrained weights: {exc}. "
-            "Training from scratch.",
+            "Aborting fine-tune task.",
             flush=True,
         )
         _log.exception("_load_pretrained_weights failed")
+        return False
 
 
 def _build_training_config(
@@ -858,6 +899,7 @@ def _build_training_config(
         "hyperparams": {},
         "strategy": {},
         "checkpoint": {},
+        "privacy": {},
         "reporting": {
             "influxdb_url": settings.INFLUXDB_URL,
             "influxdb_token": settings.INFLUXDB_TOKEN,
@@ -871,7 +913,7 @@ def _build_training_config(
 
     # Map flat keys to nested structure
     model_keys = {
-        "vocab_size", "hidden_size", "num_layers",
+        "vocab_size", "tokenizer_type", "tokenizer_path", "hidden_size", "num_layers",
         "num_attention_heads", "intermediate_size", "seq_length",
         "max_position_embeddings", "dropout", "layer_norm_eps", "activation",
     }
@@ -891,6 +933,10 @@ def _build_training_config(
         "save_interval", "eval_interval", "max_checkpoints", "upload_to_minio",
         "checkpoint_dir",
     }
+    privacy_keys = {
+        "enable_dp", "dp_epsilon", "dp_delta", "dp_noise_mechanism",
+        "dp_noise_multiplier", "dp_max_grad_norm",
+    }
 
     for key, value in config_json.items():
         if value is None:
@@ -905,6 +951,16 @@ def _build_training_config(
             config["strategy"][key] = value
         elif key in checkpoint_keys:
             config["checkpoint"][key] = value
+        elif key in privacy_keys:
+            mapped = {
+                "enable_dp": "enable_dp",
+                "dp_epsilon": "epsilon",
+                "dp_delta": "delta",
+                "dp_noise_mechanism": "noise_mechanism",
+                "dp_noise_multiplier": "noise_multiplier",
+                "dp_max_grad_norm": "max_grad_norm",
+            }[key]
+            config["privacy"][mapped] = value
         elif key == "deepspeed_overrides":
             config["deepspeed_overrides"] = value
         elif key == "megatron_overrides":
@@ -913,7 +969,56 @@ def _build_training_config(
             config["base_model_version_id"] = value
 
     config["model"]["model_type"] = "gpt2"
+    config["model"]["vocab_size"] = 32000
+    config["model"]["tokenizer_type"] = "sentencepiece"
+    config["model"]["tokenizer_path"] = "tokenizers/industry_spm.model"
+    config["checkpoint"]["checkpoint_dir"] = os.path.join(
+        config["checkpoint"].get("checkpoint_dir", "/tmp/llmt_checkpoints"),
+        task_code,
+    )
     return config
+
+
+def _store_privacy_report(task_code: str, report: dict[str, Any]) -> None:
+    """Persist the privacy audit report into task config_json and logs."""
+    import json as _json
+    try:
+        from sqlalchemy import create_engine as _ce, text as _txt
+        from sqlalchemy.orm import Session as _S
+        _engine = _ce(settings.postgres_database_url)
+        with _S(_engine) as db:
+            row = db.execute(
+                _txt("SELECT config_json FROM training_tasks WHERE task_code = :tc"),
+                {"tc": task_code},
+            ).fetchone()
+            if row is None:
+                return
+            raw = row[0]
+            if isinstance(raw, str):
+                cfg = _json.loads(raw) if raw else {}
+            elif isinstance(raw, dict):
+                cfg = dict(raw)
+            else:
+                cfg = {}
+            cfg["privacy_audit_report"] = report
+            logs = list(cfg.get("_training_log", []))
+            logs.append({
+                "timestamp": __import__("datetime").datetime.utcnow().isoformat(),
+                "level": "WARN" if report.get("budget_exhausted") else "INFO",
+                "message": (
+                    "隐私审计报告已生成 — "
+                    f"ε消耗 {report.get('spent_epsilon')}/{report.get('total_epsilon')}, "
+                    f"δ={report.get('delta')}, 噪声机制={report.get('noise_mechanism')}"
+                ),
+            })
+            cfg["_training_log"] = logs[-200:]
+            db.execute(
+                _txt("UPDATE training_tasks SET config_json = :cfg WHERE task_code = :tc"),
+                {"cfg": _json.dumps(cfg, ensure_ascii=False), "tc": task_code},
+            )
+            db.commit()
+    except Exception:
+        pass
 
 
 def _store_total_steps(task_code: str, total_steps: int, steps_per_epoch: int) -> None:
@@ -959,6 +1064,7 @@ def _update_task_status(
         from sqlalchemy import create_engine as _ce, update as _upd
         from sqlalchemy.orm import Session as _S
         from app.models.training_task import TrainingTask as _TT
+        from app.repositories import log_repository
         _engine = _ce(settings.postgres_database_url)
         with _S(_engine) as db:
             values: dict[str, Any] = {"status": status}
@@ -967,6 +1073,23 @@ def _update_task_status(
             if status in ("completed", "failed", "cancelled"):
                 values["ended_at"] = _dt.now(_tz.utc)
             db.execute(_upd(_TT).where(_TT.task_code == task_code).values(**values))
+            if status == "failed":
+                task = db.query(_TT).filter(_TT.task_code == task_code).first()
+                detail = (
+                    f"训练任务失败：{task.task_name if task else task_code}"
+                    f"（{task_code}）"
+                )
+                if error_message:
+                    detail = f"{detail}；原因：{error_message}"
+                log_repository.create_log(
+                    db,
+                    user_id=getattr(task, "creator_id", None) if task else None,
+                    username="system",
+                    action="training_failed",
+                    resource="training_task",
+                    resource_id=getattr(task, "id", None) if task else None,
+                    detail=detail,
+                )
             db.commit()
 
     except Exception:
@@ -1047,9 +1170,12 @@ def _promote_to_model(task_code: str) -> dict | None:
                 "seq_length", "hidden_size", "num_layers", "num_attention_heads",
                 "precision", "optimizer", "weight_decay", "warmup_steps",
                 "gradient_accumulation_steps", "vocab_size", "train_split",
+                "tokenizer_type", "tokenizer_path",
             ):
                 if key in config:
                     hyperparams[key] = config[key]
+            hyperparams.setdefault("tokenizer_type", "sentencepiece")
+            hyperparams.setdefault("tokenizer_path", "tokenizers/industry_spm.model")
 
             # Copy checkpoints from checkpoints bucket → models bucket
             version_str = model_repository.auto_version(db, model_code)
@@ -1058,6 +1184,23 @@ def _promote_to_model(task_code: str) -> dict | None:
             ckpt_uploaded = False
 
             def _upload_local_tokenizer_vocab(minio, model_bucket: str) -> None:
+                if hyperparams.get("tokenizer_type") == "sentencepiece":
+                    spm_candidates = [
+                        "LLMT-training/tokenizers/industry_spm.model",
+                        "../LLMT-training/tokenizers/industry_spm.model",
+                        "/home/cst/LLMT-System/LLMT-training/tokenizers/industry_spm.model",
+                    ]
+                    for spm_path in spm_candidates:
+                        if os.path.isfile(spm_path):
+                            minio.fput_object(
+                                model_bucket,
+                                f"{storage_path}/tokenizer/sentencepiece.model",
+                                spm_path,
+                            )
+                            logger.info("Uploaded SentencePiece tokenizer %s -> %s/%s/tokenizer", spm_path, model_bucket, storage_path)
+                            break
+                    return
+
                 candidates = [
                     "/tmp/llmt_checkpoints/ckpt/tokenizer_vocab.json",
                     "/tmp/llmt_checkpoints/tokenizer_vocab.json",
@@ -1099,6 +1242,12 @@ def _promote_to_model(task_code: str) -> dict | None:
                     "./checkpoints/ckpt/tokenizer",
                     "./checkpoints/tokenizer",
                 ]
+                for base in ("/tmp/llmt_checkpoints", "./checkpoints"):
+                    latest_file = os.path.join(base, "latest")
+                    if os.path.isfile(latest_file):
+                        with open(latest_file, "r") as f:
+                            latest_dir = f.read().strip()
+                        tokenizer_dirs.append(os.path.join(base, latest_dir, "tokenizer"))
                 for tokenizer_dir in tokenizer_dirs:
                     if not os.path.isdir(tokenizer_dir):
                         continue
@@ -1137,44 +1286,49 @@ def _promote_to_model(task_code: str) -> dict | None:
                         o for o in ckpt_files
                         if not latest_group or o.object_name.startswith(f"{prefix}{latest_group}/")
                     ]
-                    for obj in selected_files:
-                        if latest_group:
-                            rel = obj.object_name[len(f"{prefix}{latest_group}/"):]
-                            target_name = f"{storage_path}/{rel}".replace("\\", "/")
-                        else:
-                            target_name = obj.object_name.replace(prefix, storage_path + "/", 1)
-                        minio.copy_object(model_bucket, target_name, CopySource(ckpt_bucket, obj.object_name))
-                    if selected_files:
-                        ckpt_uploaded = True
-                        _upload_local_tokenizer_vocab(minio, model_bucket)
-                        logger.info("Copied latest checkpoint (%d files): %s -> %s", len(selected_files), f"{ckpt_bucket}/{prefix}{latest_group}", f"{model_bucket}/{storage_path}")
-                        if not settings.KEEP_TRAINING_CHECKPOINTS:
-                            for obj in ckpt_files:
-                                try:
-                                    minio.remove_object(ckpt_bucket, obj.object_name)
-                                except Exception:
-                                    pass
-                            logger.info("Removed %d source checkpoint files for task %s", len(ckpt_files), task_code)
-                        else:
-                            logger.info("Kept %d source checkpoint files for task %s", len(ckpt_files), task_code)
+                for obj in selected_files:
+                    if latest_group:
+                        rel = obj.object_name[len(f"{prefix}{latest_group}/"):]
+                        target_name = f"{storage_path}/{rel}".replace("\\", "/")
+                    else:
+                        rel = obj.object_name.replace(prefix, "", 1)
+                        target_name = obj.object_name.replace(prefix, storage_path + "/", 1)
+                    if hyperparams.get("tokenizer_type") == "sentencepiece" and (
+                        rel == "tokenizer_vocab.json" or rel.startswith("tokenizer/")
+                    ):
+                        continue
+                    minio.copy_object(model_bucket, target_name, CopySource(ckpt_bucket, obj.object_name))
+                if selected_files:
+                    ckpt_uploaded = True
+                    _upload_local_tokenizer_vocab(minio, model_bucket)
+                    logger.info("Copied latest checkpoint (%d files): %s -> %s", len(selected_files), f"{ckpt_bucket}/{prefix}{latest_group}", f"{model_bucket}/{storage_path}")
+                    if not settings.KEEP_TRAINING_CHECKPOINTS:
+                        for obj in ckpt_files:
+                            try:
+                                minio.remove_object(ckpt_bucket, obj.object_name)
+                            except Exception:
+                                pass
+                        logger.info("Removed %d source checkpoint files for task %s", len(ckpt_files), task_code)
+                    else:
+                        logger.info("Kept %d source checkpoint files for task %s", len(ckpt_files), task_code)
             except Exception as exc:
                 logger.warning("MinIO checkpoint copy failed: %s", exc)
 
             # Fallback: upload from local checkpoint directories if MinIO copy failed
+            task_checkpoint_dir = config.get("checkpoint_dir") or "/tmp/llmt_checkpoints"
+            task_checkpoint_dir = os.path.join(task_checkpoint_dir, task_code)
             local_ckpt_dirs = [
-                "/tmp/llmt_checkpoints/ckpt",
-                "/tmp/llmt_checkpoints/latest",
-                "/tmp/llmt_checkpoints",
-                "./checkpoints",
-                "./checkpoints/step-500",
+                os.path.join(task_checkpoint_dir, "ckpt"),
+                os.path.join(task_checkpoint_dir, "latest"),
+                task_checkpoint_dir,
             ]
-            # Also include any DeepSpeed step subdirectories under ./checkpoints/
-            if os.path.isdir("./checkpoints"):
-                latest_file = os.path.join("./checkpoints", "latest")
+            # Also include any DeepSpeed step subdirectory under this task's checkpoint dir.
+            if os.path.isdir(task_checkpoint_dir):
+                latest_file = os.path.join(task_checkpoint_dir, "latest")
                 if os.path.isfile(latest_file):
                     with open(latest_file, "r") as f:
                         latest_dir = f.read().strip()
-                    local_ckpt_dirs.append(os.path.join("./checkpoints", latest_dir))
+                    local_ckpt_dirs.append(os.path.join(task_checkpoint_dir, latest_dir))
             if not ckpt_uploaded:
                 try:
                     minio = get_minio_client()
@@ -1186,6 +1340,10 @@ def _promote_to_model(task_code: str) -> dict | None:
                             for fn in files:
                                 local_path = os.path.join(root, fn)
                                 rel = os.path.relpath(local_path, local_dir)
+                                if hyperparams.get("tokenizer_type") == "sentencepiece" and (
+                                    rel == "tokenizer_vocab.json" or rel.startswith("tokenizer/")
+                                ):
+                                    continue
                                 object_name = f"{storage_path}/{rel}".replace("\\", "/")
                                 minio.fput_object(model_bucket, object_name, local_path)
                         _upload_local_tokenizer_vocab(minio, model_bucket)
@@ -1196,7 +1354,10 @@ def _promote_to_model(task_code: str) -> dict | None:
                     logger.warning("Local checkpoint upload failed: %s", exc)
 
             if not ckpt_uploaded:
-                logger.info("No checkpoint files found, model version created without weights")
+                raise RuntimeError(
+                    f"No checkpoint files found for task {task_code}; "
+                    "skip model promotion to avoid publishing an untrained model"
+                )
 
             # Build metrics placeholder (will be populated from actual training metrics)
             metrics: dict[str, Any] = {}

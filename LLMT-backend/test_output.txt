@@ -1,0 +1,69 @@
+.................................F...................                    [100%]
+=================================== FAILURES ===================================
+___________ test_model_rollback_validates_version_and_returns_result ___________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f5f7f74a1d0>
+app_client = <starlette.testclient.TestClient object at 0x7f5f7f608dc0>
+db_session = <sqlalchemy.orm.session.Session object at 0x7f5f7f60abc0>
+current_model = <app.models.model_version.ModelVersion object at 0x7f5f7f6095d0>
+fake_minio = <conftest.FakeMinio object at 0x7f5f7f673730>
+auth_headers = <function auth_headers.<locals>.build at 0x7f5f7f62f250>
+
+    def test_model_rollback_validates_version_and_returns_result(
+        monkeypatch, app_client, db_session, current_model, fake_minio, auth_headers
+    ):
+        second = model_repository.create_model(
+            db_session,
+            model_name=current_model.model_name,
+            model_code=current_model.model_code,
+            framework="pytorch",
+        )
+        fake_minio.objects[("models", f"{current_model.storage_path}/weights.bin")] = b"weights"
+    
+        import app.api.v1.models as models_api
+    
+        monkeypatch.setattr(models_api, "get_minio_client", lambda: fake_minio)
+    
+        response = app_client.post(
+            f"/api/v1/models/{current_model.model_code}/versions/{current_model.version}/rollback",
+            headers=auth_headers("admin"),
+            json={"reason": "module test"},
+        )
+    
+        assert second.version == "v1.0.1"
+        assert response.status_code == 200
+>       assert response.json()["data"]["rolled_back_to"]["version"] == "v1.0.0"
+E       KeyError: 'rolled_back_to'
+
+tests/module/test_dataset_training_model_document_system.py:183: KeyError
+------------------------------ Captured log call -------------------------------
+WARNING  elastic_transport.node_pool:_node_pool.py:249 Node <Urllib3HttpNode(http://localhost:9200)> has failed for 1 times in a row, putting on 1 second timeout
+=============================== warnings summary ===============================
+app/main.py:21
+  /home/cst/LLMT-System/LLMT-backend/app/main.py:21: DeprecationWarning: 
+          on_event is deprecated, use lifespan event handlers instead.
+  
+          Read more about it in the
+          [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+          
+    @app.on_event("startup")
+
+../../anaconda3/envs/llmt-backend/lib/python3.10/site-packages/fastapi/applications.py:4495
+  /home/cst/anaconda3/envs/llmt-backend/lib/python3.10/site-packages/fastapi/applications.py:4495: DeprecationWarning: 
+          on_event is deprecated, use lifespan event handlers instead.
+  
+          Read more about it in the
+          [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+          
+    return self.router.on_event(event_type)
+
+tests/module/test_dataset_training_model_document_system.py: 13 warnings
+tests/integration/test_cross_module_flows.py: 4 warnings
+tests/system/test_api_business_flows.py: 6 warnings
+  /home/cst/anaconda3/envs/llmt-backend/lib/python3.10/site-packages/httpx/_client.py:680: DeprecationWarning: The 'app' shortcut is now deprecated. Use the explicit style 'transport=WSGITransport(app=...)' instead.
+    warnings.warn(message, DeprecationWarning)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/module/test_dataset_training_model_document_system.py::test_model_rollback_validates_version_and_returns_result
+1 failed, 52 passed, 25 warnings in 99.42s (0:01:39)
