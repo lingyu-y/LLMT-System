@@ -15,9 +15,13 @@ import MyLogs from '@/views/MyLogs.vue'
 import Register from '@/views/Register.vue'
 import SystemManagement from '@/views/SystemManagement.vue'
 
+// 前端路由统一在这里注册。meta 中的字段会被导航守卫、侧边栏和页面标题等逻辑使用：
+// public: true 表示不需要登录即可访问；menuKeys 表示进入页面需要具备的菜单权限；
+// menuMode: 'any' 表示满足任意一个 menuKey 即可访问；systemTab 用于系统管理页切换默认 Tab。
 const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
   routes: [
+    // 登录、注册页是公开页面，不放在主布局 AppLayout 下面。
     {
       path: '/login',
       name: 'login',
@@ -30,6 +34,7 @@ const router = createRouter({
       component: Register,
       meta: { public: true, title: '注册' },
     },
+    // 业务页面统一挂在 AppLayout 下，共用顶部栏、侧边栏和主体内容区域。
     {
       path: '/',
       component: AppLayout,
@@ -71,12 +76,14 @@ const router = createRouter({
           component: DocGeneration,
           meta: { title: '文档生成', menuKeys: ['document'] },
         },
+        // /system 是系统管理总入口，只要拥有任意系统子菜单权限即可进入。
         {
           path: 'system',
           name: 'system',
           component: SystemManagement,
           meta: { title: '系统管理', menuKeys: systemMenuKeys, menuMode: 'any' },
         },
+        // 系统管理的几个子页面复用同一个组件，通过 systemTab 决定默认展示哪个 Tab。
         {
           path: 'system/users',
           name: 'system-users',
@@ -115,15 +122,19 @@ const router = createRouter({
         },
       ],
     },
+    // 未匹配到的地址统一回到仪表盘，避免空白页。
     { path: '/:pathMatch(.*)*', redirect: '/dashboard' },
   ],
 })
 
+// 全局导航守卫：先处理登录态，再处理菜单权限。
 router.beforeEach((to) => {
   const authStore = useAuthStore()
 
+  // 已登录用户再次访问登录/注册页时，直接回到首页。
   if ((to.path === '/login' || to.path === '/register') && authStore.isLoggedIn) return '/dashboard'
 
+  // 非公开页面必须登录；redirect 用于登录成功后回到原目标页面。
   if (!to.meta.public && !authStore.isLoggedIn) {
     return {
       path: '/login',
@@ -131,13 +142,16 @@ router.beforeEach((to) => {
     }
   }
 
+  // 页面配置了 menuKeys 时，需要校验当前用户是否拥有对应菜单权限。
   const requiredMenuKeys = to.meta.menuKeys as string[] | undefined
   if (requiredMenuKeys?.length) {
+    // 默认要求拥有全部权限；menuMode 为 any 时，只需拥有其中一个权限。
     const allowed =
       to.meta.menuMode === 'any'
         ? authStore.hasAnyPermission(requiredMenuKeys)
         : requiredMenuKeys.every((menuKey) => authStore.hasPermission(menuKey))
 
+    // 已登录但权限不足，跳转到 403 页面。
     if (!allowed) return '/403'
   }
 

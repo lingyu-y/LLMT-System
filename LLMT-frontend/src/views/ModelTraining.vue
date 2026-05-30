@@ -1,5 +1,6 @@
 <template>
   <div>
+    <!-- 页面头部：说明训练模块的主要操作路径。 -->
     <div class="page-header">
       <div>
         <h1 class="page-title">模型训练</h1>
@@ -7,7 +8,7 @@
       </div>
     </div>
 
-    <!-- 统计卡片 -->
+    <!-- 统计卡片：按任务状态展示运行、排队、完成、失败/取消数量。 -->
     <div class="grid-4 stats">
       <div v-for="item in trainingStats" :key="item.label" class="stat-tile" :class="item.cls">
         <span>{{ item.label }}</span>
@@ -15,12 +16,12 @@
       </div>
     </div>
 
-    <!-- 训练配置 -->
+    <!-- 训练配置：左侧基础信息和超参数，右侧资源策略与操作按钮。 -->
     <div class="card config-card">
       <div class="card-header"><h3 class="card-title">训练配置</h3></div>
       <div class="card-body">
         <div class="config-grid">
-          <!-- 左列 -->
+          <!-- 左列：任务基本信息、基础模型、数据集和训练超参数。 -->
           <div>
             <el-form label-position="top">
               <el-row :gutter="16">
@@ -66,6 +67,7 @@
               </el-row>
             </el-form>
             <el-collapse style="margin-top:8px">
+              <!-- 可折叠的训练超参数，避免主表单过长。 -->
               <el-collapse-item title="训练超参数（点击展开）" name="hp">
                 <el-form label-position="top">
                   <el-row :gutter="12">
@@ -108,6 +110,7 @@
                   </el-row>
                 </el-form>
               </el-collapse-item>
+              <!-- 差分隐私配置：启用后训练侧会尝试进行梯度裁剪和噪声注入。 -->
               <el-collapse-item title="差分隐私保护（点击展开）" name="dp">
                 <div class="dp-header">
                   <span>启用后训练 Step 会执行梯度裁剪与噪声注入</span>
@@ -157,7 +160,7 @@
             </el-collapse>
           </div>
 
-          <!-- 右列 -->
+          <!-- 右列：GPU 资源、并行策略、推荐策略和提交动作。 -->
           <div>
             <el-form label-position="top">
               <el-row :gutter="16">
@@ -194,9 +197,9 @@
       </div>
     </div>
 
-    <!-- 任务列表 + 日志 -->
+    <!-- 下方区域：左侧任务列表，右侧所选任务日志。 -->
     <div class="bottom-panels">
-      <!-- 左侧：任务列表 -->
+      <!-- 左侧：训练任务列表，点击行后会加载任务详情和日志。 -->
       <div class="card task-list-card">
         <div class="card-header">
           <h3 class="card-title">训练任务</h3>
@@ -240,7 +243,7 @@
         </div>
       </div>
 
-      <!-- 右侧：训练日志 -->
+      <!-- 右侧：训练日志，支持级别筛选、关键词搜索和自动滚动。 -->
       <div class="card log-card">
         <div class="card-header">
           <div class="log-header-left">
@@ -259,6 +262,7 @@
           </div>
         </div>
         <div class="card-body log-body" ref="logContainer">
+          <!-- 任务完成差分隐私训练后，后端可能在 config_json 中回填审计报告。 -->
           <div v-if="selectedPrivacyReport" class="privacy-report">
             <div><span>隐私预算</span><strong>{{ selectedPrivacyReport.spent_epsilon }} / {{ selectedPrivacyReport.total_epsilon }}</strong></div>
             <div><span>δ</span><strong>{{ selectedPrivacyReport.delta }}</strong></div>
@@ -278,7 +282,7 @@
       </div>
     </div>
 
-    <!-- 扩缩容弹窗 -->
+    <!-- 扩缩容弹窗：对运行中或暂停中的任务修改 GPU 数和并行策略。 -->
     <el-dialog v-model="scaleDialogVisible" title="训练任务扩缩容" width="520px">
       <el-form label-position="top">
         <el-form-item label="任务">
@@ -330,16 +334,26 @@ import {
   type TrainingLog,
 } from '@/api/training'
 import StatusBadge from '@/components/StatusBadge.vue'
+import { formatBeijingTime } from '@/utils/time'
 
 // ── State ──
+// 训练配置草稿保存在 localStorage，方便刷新页面后恢复表单。
 const TRAINING_CONFIG_STORAGE_KEY = 'llmt_training_config_draft'
+
+// 页面级加载与提交状态。
 const loading = ref(false)
 const submitting = ref(false)
+
+// 任务列表、当前选中任务和其日志。
 const tasks = ref<TrainingTaskListItem[]>([])
 const selectedTask = ref<TrainingTaskListItem | null>(null)
 const trainingLogs = ref<TrainingLog[]>([])
+
+// 扩缩容弹窗状态和当前目标任务。
 const scaleDialogVisible = ref(false)
 const scaleTarget = ref<TrainingTaskListItem | null>(null)
+
+// 任务状态统计、日志筛选条件和自动滚动配置。
 const statsCounts = ref<Record<string, number>>({})
 const logLevel = ref('')
 const logSearch = ref('')
@@ -348,6 +362,7 @@ const logScroll = ref<HTMLDivElement>()
 const logContainer = ref<HTMLDivElement>()
 let refreshTimer: number | null = null
 
+// 训练选项来自后端 /training/options；这里提供默认值，后端接口失败时页面仍可使用。
 const options = reactive<TrainingOptions>({
   base_models: [],
   datasets: [],
@@ -369,10 +384,13 @@ const options = reactive<TrainingOptions>({
   ],
 })
 
+// GPU 选择控件使用字符串值，提交前会转换为数字。
 const gpuOptionValue = ref('1')
 
+// 选择基础模型时表示继续训练；为空表示从零训练。
 const baseModelId = ref<number | undefined>(undefined)
 
+// 训练任务表单。config 会作为后端训练配置透传给训练服务。
 const form = reactive({
   task_name: '',
   dataset_id: undefined as number | undefined,
@@ -392,20 +410,24 @@ const form = reactive({
   },
 })
 
+// 扩缩容表单：修改目标 GPU 数和并行策略。
 const scaleForm = reactive({ gpu_count: 1, parallel_strategy: 'ddp' as string })
 const scaleSubmitting = ref(false)
 
 // ── Scale helpers ──
+// 任务操作按钮可用性判断。
 const canPause = (row: TrainingTaskListItem) => row.status === 'running'
 const canResume = (row: TrainingTaskListItem) => row.status === 'paused'
 const canScale = (row: TrainingTaskListItem) =>
   row.status === 'running' || row.status === 'paused'
 
+// 扩缩容弹窗可选 GPU 数，优先使用后端返回的资源选项。
 const scaleGpuOptions = computed(() => {
   if (options.gpu_options.length > 0) return options.gpu_options.map(o => ({ value: Number(o.value), label: o.label }))
   return [1, 2, 4, 8].map(n => ({ value: n, label: `${n} × GPU` }))
 })
 
+// 根据目标 GPU 数限制可选并行策略，避免明显不合理的组合。
 const scaleStrategies = computed(() => {
   const n = scaleForm.gpu_count
   if (n <= 1) {
@@ -422,6 +444,7 @@ const scaleStrategies = computed(() => {
   return options.parallel_strategies
 })
 
+// 扩缩容配置风险提示。
 const scaleWarning = computed(() => {
   if (scaleForm.gpu_count <= 1 && scaleForm.parallel_strategy !== 'ddp') {
     return '单卡只能使用 DDP 策略'
@@ -432,6 +455,7 @@ const scaleWarning = computed(() => {
   return ''
 })
 
+// 当前任务配置摘要，用于扩缩容弹窗展示。
 const scaleCurrentCfg = computed(() => {
   if (!scaleTarget.value) return ''
   const cfg = scaleTarget.value.config_json || {} as Record<string, unknown>
@@ -439,6 +463,7 @@ const scaleCurrentCfg = computed(() => {
   return `${gpu} GPU · ${scaleTarget.value.parallel_strategy || 'ddp'}`
 })
 
+// 只有 GPU 数或并行策略发生变化时才允许提交扩缩容。
 const canSubmitScale = computed(() => {
   if (!scaleTarget.value) return false
   const curGpu = (scaleTarget.value.config_json as Record<string, unknown> | null)?.num_gpus ?? 1
@@ -447,6 +472,7 @@ const canSubmitScale = computed(() => {
   return scaleForm.gpu_count !== curGpu || scaleForm.parallel_strategy !== curStrat
 })
 
+// 打开扩缩容弹窗，并用当前任务配置初始化表单。
 const openScaleDialog = (row: TrainingTaskListItem) => {
   scaleTarget.value = row
   const cfg = (row.config_json || {}) as Record<string, unknown>
@@ -455,14 +481,15 @@ const openScaleDialog = (row: TrainingTaskListItem) => {
   scaleDialogVisible.value = true
 }
 
+// GPU 数变化后，如果原策略不可用，则自动切到第一个合法策略。
 const onScaleGpuChange = () => {
-  // Auto-pick a valid strategy when GPU count changes
   const valid = scaleStrategies.value.map(s => s.value)
   if (!valid.includes(scaleForm.parallel_strategy)) {
     scaleForm.parallel_strategy = valid[0]!
   }
 }
 
+// 提交扩缩容请求，后端会负责暂停/重启任务。
 const submitScale = async () => {
   if (!scaleTarget.value || !canSubmitScale.value) return
   scaleSubmitting.value = true
@@ -482,8 +509,10 @@ const submitScale = async () => {
 }
 
 // ── Computed ──
+// 创建训练任务的最小条件：任务名和数据集。
 const canSubmit = computed(() => form.task_name && form.dataset_id)
 
+// 顶部统计卡片数据，由后端状态计数转换而来。
 const trainingStats = computed(() => {
   const c = statsCounts.value
   return [
@@ -494,6 +523,7 @@ const trainingStats = computed(() => {
   ]
 })
 
+// 日志筛选：按级别和关键词在前端本地过滤。
 const filteredLogs = computed(() => {
   let logs = trainingLogs.value
   if (logLevel.value) logs = logs.filter(l => l.level.toUpperCase() === logLevel.value!.toUpperCase())
@@ -504,11 +534,13 @@ const filteredLogs = computed(() => {
   return logs
 })
 
+// 差分隐私审计报告，从所选任务 config_json 中读取。
 const selectedPrivacyReport = computed(() => {
   const report = selectedTask.value?.config_json?.privacy_audit_report
   return report && typeof report === 'object' ? report as Record<string, any> : null
 })
 
+// 根据框架和 GPU 数给出推荐策略文案。
 const recommendedStrategy = computed(() => {
   const n = Number(gpuOptionValue.value)
   if (form.framework === 'megatron') return '张量并行 + 流水线并行'
@@ -516,12 +548,14 @@ const recommendedStrategy = computed(() => {
   return 'ZeRO Stage 2 (推荐)'
 })
 
+// 根据 GPU 数给出资源使用建议。
 const resourceAdvice = computed(() => {
   const n = Number(gpuOptionValue.value)
   if (n <= 1) return '单卡适合小规模微调，建议使用 DDP。'
   return '当前资源满足混合并行训练，可在任务运行中发起扩缩容请求。'
 })
 
+// 前端估算每步隐私预算消耗，仅用于提示；最终结果以训练后端审计报告为准。
 const dpStepEstimate = computed(() => {
   if (!form.config.enable_dp) return '-'
   const delta = Math.max(form.config.dp_delta || 1e-5, 1e-12)
@@ -532,6 +566,7 @@ const dpStepEstimate = computed(() => {
   return (Math.sqrt(2 * Math.log(1.25 / delta)) / Math.max(multiplier, 1e-6)).toFixed(4)
 })
 
+// 差分隐私配置提示，避免用户选择明显不推荐的参数。
 const dpWarning = computed(() => {
   if (!form.config.enable_dp) return ''
   if (form.framework !== 'pytorch') return '当前普通训练的梯度加噪仅在 PyTorch/DDP 路径生效'
@@ -541,12 +576,14 @@ const dpWarning = computed(() => {
 })
 
 // ── Align parallel_strategy with framework on change ──
+// 切换训练框架时自动切换默认并行策略。
 const strategyDefaults: Record<string, string> = { pytorch: 'ddp', deepspeed: 'zero2', megatron: 'tp' }
 watch(() => form.framework, (fw) => {
   form.parallel_strategy = strategyDefaults[fw] ?? 'ddp'
 })
 
 // ── Auto-scroll logs ──
+// 日志更新后，如果启用自动滚动，则滚到日志容器底部。
 watch(filteredLogs, () => {
   if (logAutoScroll.value) {
     nextTick(() => {
@@ -556,6 +593,7 @@ watch(filteredLogs, () => {
 })
 
 // ── Methods ──
+// 加载训练表单下拉选项：基础模型、数据集、框架、GPU、并行策略。
 const loadOptions = async () => {
   try {
     const res = await fetchTrainingOptions()
@@ -569,6 +607,7 @@ const loadOptions = async () => {
   } catch { /* use defaults */ }
 }
 
+// 加载训练任务列表。
 const loadTasks = async () => {
   loading.value = true
   try { const res = await fetchTrainingTasks(); tasks.value = res.data ?? [] }
@@ -576,16 +615,19 @@ const loadTasks = async () => {
   finally { loading.value = false }
 }
 
+// 加载任务状态计数，用于顶部统计卡片。
 const loadStats = async () => {
   try { const res = await fetchTrainingStats(); statsCounts.value = (res ?? {}) as Record<string, number> }
   catch { /* ignore */ }
 }
 
+// 加载所选训练任务日志。
 const loadLogs = async (taskId: number) => {
   try { const res = await fetchTrainingLogs(taskId); trainingLogs.value = res.data?.logs ?? [] }
   catch { trainingLogs.value = [] }
 }
 
+// 选择任务：先更新选中项，再拉任务详情和日志。
 const selectTask = async (row: TrainingTaskListItem) => {
   selectedTask.value = row
   try { const res = await fetchTrainingTask(row.id); if (res.data) Object.assign(row, res.data) }
@@ -593,8 +635,9 @@ const selectTask = async (row: TrainingTaskListItem) => {
   await loadLogs(row.id)
 }
 
+// 选择基础模型时，将模型超参数同步到训练配置，保证继续训练结构一致。
 const onBaseModelChange = (selectedId: number | undefined) => {
-  if (selectedId == null) return  // cleared, unlock is automatic via isBaseModelSelected
+  if (selectedId == null) return
   const found = options.base_models.find(m => m.value === selectedId)
   if (!found) return
   const hp = found.hyperparams_json || {}
@@ -614,8 +657,10 @@ const onBaseModelChange = (selectedId: number | undefined) => {
   if (hp.seq_length != null) form.config.seq_length = hp.seq_length as number
 }
 
+// 只清空当前页面日志，不影响后端日志。
 const clearLogs = () => { trainingLogs.value = [] }
 
+// 组装提交给后端的训练任务 payload，统一固定 tokenizer 相关配置。
 const buildTrainingPayload = () => {
   const gpuCount = Number(gpuOptionValue.value)
   const cfg: Record<string, any> = { ...form.config, num_gpus: gpuCount }
@@ -631,6 +676,7 @@ const buildTrainingPayload = () => {
   }
 }
 
+// 创建训练任务。
 const startTraining = async () => {
   if (!canSubmit.value) { ElMessage.warning('请填写任务名称并选择数据集'); return }
   submitting.value = true
@@ -643,16 +689,19 @@ const startTraining = async () => {
   finally { submitting.value = false }
 }
 
+// 暂停训练任务。
 const handlePause = async (row: TrainingTaskListItem) => {
   try { await pauseTrainingTask(row.id); ElMessage.success(`已暂停 ${row.task_code}`); await loadTasks(); await loadStats() }
   catch (e: unknown) { ElMessage.error((e as Error).message || '暂停失败') }
 }
 
+// 恢复训练任务。
 const handleResume = async (row: TrainingTaskListItem) => {
   try { await resumeTrainingTask(row.id); ElMessage.success(`已恢复 ${row.task_code}`); await loadTasks(); await loadStats() }
   catch (e: unknown) { ElMessage.error((e as Error).message || '恢复失败') }
 }
 
+// 将已完成训练任务提升为模型版本，后续可在模型管理页面查看。
 const handlePromote = async (row: TrainingTaskListItem) => {
   try {
     const res = await promoteTrainingTask(row.id)
@@ -661,11 +710,13 @@ const handlePromote = async (row: TrainingTaskListItem) => {
   } catch (e: unknown) { ElMessage.error((e as Error).message || '转为模型失败') }
 }
 
+// 删除训练任务。
 const handleDeleteTask = async (row: TrainingTaskListItem) => {
   try { await deleteTrainingTask(row.id); ElMessage.success(`已删除 ${row.task_code}`); await loadTasks(); await loadStats() }
   catch (e: unknown) { ElMessage.error((e as Error).message || '删除失败') }
 }
 
+// 保存当前训练配置草稿到浏览器，方便下次打开页面继续编辑。
 const handleSaveConfig = () => {
   localStorage.setItem(TRAINING_CONFIG_STORAGE_KEY, JSON.stringify({
     form,
@@ -675,6 +726,8 @@ const handleSaveConfig = () => {
   }))
   ElMessage.success(`配置已保存到浏览器 localStorage：${TRAINING_CONFIG_STORAGE_KEY}`)
 }
+
+// 调后端配置校验接口，提前发现训练配置错误或警告。
 const handleValidateConfig = async () => {
   if (!canSubmit.value) { ElMessage.warning('请先填写任务名称和数据集'); return }
   try {
@@ -687,13 +740,15 @@ const handleValidateConfig = async () => {
 }
 
 // ── Helpers ──
-const formatTime = (ts: string) => ts ? new Date(ts).toLocaleTimeString() : ''
+// 日志时间统一按北京时间显示。
+const formatTime = (ts: string) => formatBeijingTime(ts)
 const frameworkLabel = (f?: string) => ({ pytorch: 'PyTorch', deepspeed: 'DeepSpeed', megatron: 'Megatron-LM' } as Record<string, string>)[f ?? ''] ?? f ?? '-'
 const statusLabel = (s: string) => ({ created: '已创建', queued: '排队中', running: '运行中', pausing: '暂停中…', paused: '已暂停', resuming: '恢复中…', completed: '已完成', failed: '失败', cancelled: '已取消' } as Record<string, string>)[s] ?? s
 const statusType = (s: string): 'success' | 'warning' | 'danger' | 'info' => ({ created: 'info', queued: 'warning', running: 'success', pausing: 'warning', paused: 'warning', resuming: 'info', completed: 'success', failed: 'danger', cancelled: 'info' } as Record<string, any>)[s] ?? 'info'
 
 // ── Lifecycle ──
 onMounted(() => {
+  // 页面打开时先恢复本地保存的训练配置草稿。
   const saved = localStorage.getItem(TRAINING_CONFIG_STORAGE_KEY)
   if (saved) {
     try {
@@ -709,7 +764,11 @@ onMounted(() => {
       localStorage.removeItem(TRAINING_CONFIG_STORAGE_KEY)
     }
   }
+
+  // 初次加载下拉选项、任务列表和状态统计。
   loadOptions(); loadTasks(); loadStats()
+
+  // 训练任务是长任务，使用定时轮询刷新任务状态、统计和当前任务日志。
   refreshTimer = window.setInterval(async () => {
     await loadTasks(); await loadStats()
     if (selectedTask.value) await loadLogs(selectedTask.value.id)
@@ -717,6 +776,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  // 离开页面时清理轮询，避免后台继续请求接口。
   if (refreshTimer !== null) { window.clearInterval(refreshTimer); refreshTimer = null }
 })
 </script>

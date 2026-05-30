@@ -1,4 +1,4 @@
-import { get, post, del, type PageResult } from './http'
+import { get, post, del, type ApiMessage, type PageResult } from './http'
 
 export interface ParticipantConfig {
   participant_id: string
@@ -109,8 +109,8 @@ export interface CreateFederatedTask {
 export const fetchFederatedTasks = (params?: Record<string, string | number>) =>
   get<PageResult<FederatedTaskListItem>>('/federated/tasks', params)
 
-export const fetchFederatedTask = (id: number) =>
-  get<{ message: string; data: FederatedTask }>(`/federated/tasks/${id}`)
+export const fetchFederatedTask = async (id: number) =>
+  unwrapData(await get<ApiMessage<FederatedTask> | FederatedTask>(`/federated/tasks/${id}`))
 
 export const createFederatedTask = (body: CreateFederatedTask) =>
   post<{ message: string; data: FederatedTask }>('/federated/tasks', body)
@@ -121,11 +121,11 @@ export const startFederatedTask = (id: number) =>
 export const cancelFederatedTask = (id: number) =>
   post<{ message: string; data: FederatedTask }>(`/federated/tasks/${id}/cancel`)
 
-export const fetchFederatedMetrics = (id: number) =>
-  get<{ message: string; data: Record<string, unknown> }>(`/federated/tasks/${id}/metrics`)
+export const fetchFederatedMetrics = async (id: number) =>
+  unwrapData(await get<ApiMessage<Record<string, unknown>> | Record<string, unknown>>(`/federated/tasks/${id}/metrics`))
 
-export const fetchFederatedLogs = (id: number) =>
-  get<{ message: string; data: { task_id: number; logs: unknown[]; total: number } }>(`/federated/tasks/${id}/logs`)
+export const fetchFederatedLogs = async (id: number) =>
+  unwrapData(await get<ApiMessage<{ task_id: number; logs: { timestamp: string | number; level: string; message: string }[]; total: number }> | { task_id: number; logs: { timestamp: string | number; level: string; message: string }[]; total: number }>(`/federated/tasks/${id}/logs`))
 
 export const addParticipant = (taskId: number, body: ParticipantConfig) =>
   post<{ message: string; data: FederatedParticipant }>(`/federated/tasks/${taskId}/participants`, body)
@@ -150,5 +150,17 @@ export interface FederatedOptions {
   datasets: DatasetOption[]
 }
 
-export const fetchFederatedOptions = () =>
-  get<{ message: string; data: FederatedOptions }>('/federated/options')
+const unwrapData = <T>(response: ApiMessage<T> | T): T => {
+  if (
+    response
+    && typeof response === 'object'
+    && 'data' in response
+    && 'message' in response
+  ) {
+    return (response as ApiMessage<T>).data as T
+  }
+  return response as T
+}
+
+export const fetchFederatedOptions = async () =>
+  unwrapData(await get<ApiMessage<FederatedOptions> | FederatedOptions>('/federated/options'))

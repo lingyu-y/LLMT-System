@@ -24,13 +24,12 @@ logger = logging.getLogger(__name__)
 
 
 def _normalize_federated_config(config: dict[str, Any] | None) -> dict[str, Any]:
-    """Ensure federated tasks use the current SentencePiece tokenizer defaults."""
+    """Ensure federated tasks use the original local GPT-2 tokenizer defaults."""
     normalized = dict(config or {})
     if normalized.get("model_type", "gpt2") == "gpt2":
-        normalized["tokenizer_type"] = normalized.get("tokenizer_type") or "sentencepiece"
-        normalized["tokenizer_path"] = normalized.get("tokenizer_path") or "tokenizers/industry_spm.model"
-        if normalized["tokenizer_type"] == "sentencepiece":
-            normalized["vocab_size"] = 32000
+        normalized["tokenizer_type"] = "gpt2"
+        normalized["tokenizer_path"] = ""
+        normalized["vocab_size"] = 50257
     return normalized
 
 
@@ -54,6 +53,7 @@ def create_task(db: Session, body: FederatedTaskCreate, creator_id: int) -> Fede
         "seq_length": body.seq_length,
         "dropout": body.dropout,
     }
+    model_config = _normalize_federated_config(model_config)
 
     # Build full config JSON – only fields that FederatedConfig accepts
     from llmt_training.federated.config import FederatedConfig, ParticipantConfig

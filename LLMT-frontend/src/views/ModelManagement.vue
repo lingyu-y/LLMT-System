@@ -1,10 +1,12 @@
 <template>
   <div>
+    <!-- 页面头部：模型管理承接训练产物，负责版本、产物、安全和推理能力。 -->
     <div class="page-header">
       <h1 class="page-title">模型版本管理</h1>
       <p class="page-description">管理模型版本、训练超参数和性能指标，支持一键回滚</p>
     </div>
 
+    <!-- 未选中模型时展示模型列表。 -->
     <template v-if="!selectedModel">
       <div class="card">
         <div class="card-header">
@@ -13,14 +15,15 @@
             <el-input v-model="keyword" placeholder="搜索模型..." clearable />
             <el-select v-model="typeFilter">
               <el-option label="全部类型" value="全部类型" />
-              <el-option label="NLP" value="NLP" />
+              <!-- <el-option label="NLP" value="NLP" />
               <el-option label="CV" value="CV" />
               <el-option label="Audio" value="Audio" />
-              <el-option label="MultiModal" value="MultiModal" />
+              <el-option label="MultiModal" value="MultiModal" /> -->
             </el-select>
           </div>
         </div>
         <div class="card-body model-grid">
+          <!-- 点击模型卡片进入详情页，并加载版本、扫描报告和限流配置。 -->
           <button v-for="model in filteredModels" :key="model.id" class="model-card" @click="selectModel(model)">
             <span class="model-icon" :style="{ background: model.color }"><el-icon><Management /></el-icon></span>
             <span class="model-info">
@@ -36,6 +39,7 @@
       </div>
     </template>
 
+    <!-- 选中模型后展示详情页。 -->
     <template v-else>
       <div class="detail-header">
         <el-button :icon="ArrowLeft" @click="selectedModel = null">返回模型列表</el-button>
@@ -56,6 +60,7 @@
         </div>
       </div>
 
+      <!-- 当前模型关键指标摘要。 -->
       <div class="metrics-bar">
         <div class="metric-stat">
           <span class="metric-stat-label">当前版本</span>
@@ -75,6 +80,7 @@
         </div>
       </div>
 
+      <!-- 训练配置和模型产物信息。 -->
       <div class="grid-2">
         <div class="card">
           <div class="card-header"><h3 class="card-title">训练配置</h3></div>
@@ -100,7 +106,8 @@
         </div>
       </div>
 
-      <div class="grid-2 security-policy">
+      <!-- 安全扫描与 API 限流配置。 -->
+      <div class="grid security-policy">
         <div class="card">
           <div class="card-header">
             <h3 class="card-title">容器镜像漏洞扫描</h3>
@@ -118,7 +125,7 @@
               </div>
               <div>
                 <span>扫描时间</span>
-                <strong>{{ latestSecurityReport?.scanned_at?.replace('T', ' ').slice(0, 16) ?? '-' }}</strong>
+                <strong>{{ formatBeijingDateTime(latestSecurityReport?.scanned_at).slice(0, 16) }}</strong>
               </div>
             </div>
             <el-alert
@@ -152,7 +159,7 @@
           </div>
         </div>
 
-        <div class="card">
+        <!-- <div class="card">
           <div class="card-header">
             <h3 class="card-title">API调用频率限制</h3>
             <el-button size="small" type="primary" :icon="Setting" :loading="savingRateLimit" @click="saveRateLimit">保存</el-button>
@@ -176,9 +183,10 @@
               </el-form-item>
             </el-form>
           </div>
-        </div>
+        </div> -->
       </div>
 
+      <!-- 在线推理试跑：调用当前模型的同步推理接口。 -->
       <div class="card inference-card">
         <div class="card-header">
           <h3 class="card-title">在线推理试跑</h3>
@@ -204,6 +212,7 @@
       </div>
     </template>
 
+    <!-- 版本历史抽屉：展示所有版本，并支持回滚、下载和对比。 -->
     <el-drawer v-model="versionHistoryDrawerVisible" title="版本历史" size="480px">
       <div class="timeline">
         <div v-for="item in versionHistory" :key="item.version" class="timeline-item" :class="{ current: item.current }">
@@ -227,6 +236,7 @@
       </div>
     </el-drawer>
 
+    <!-- 版本对比抽屉：对比当前版本和历史版本的指标、配置、产物。 -->
     <el-drawer v-model="compareDrawerVisible" title="版本对比" size="720px">
       <div v-if="compareVersion && currentVersion" class="compare-drawer">
         <div class="compare-summary">
@@ -305,6 +315,7 @@
       </div>
     </el-drawer>
 
+    <!-- 从模型仓库导入模型版本。 -->
     <el-dialog v-model="importDialogVisible" title="从模型仓库导入" width="560px">
       <el-form label-position="top">
         <el-form-item label="源路径"><el-input v-model="importForm.source_path" placeholder="models/source/path" /></el-form-item>
@@ -318,6 +329,7 @@
       </template>
     </el-dialog>
 
+    <!-- 将当前模型版本导出到指定仓库路径。 -->
     <el-dialog v-model="exportDialogVisible" title="导出到模型仓库" width="520px">
       <el-form label-position="top">
         <el-form-item label="目标路径"><el-input v-model="exportForm.target_path" placeholder="exports/models/current" /></el-form-item>
@@ -354,7 +366,9 @@ import {
   type ModelRateLimit,
   type SecurityReport,
 } from '@/api/models'
+import { formatBeijingDateTime } from '@/utils/time'
 
+// 模型列表卡片使用的前端展示结构，由 BackendModel 映射而来。
 type ModelItem = {
   id: string
   name: string
@@ -365,6 +379,8 @@ type ModelItem = {
   color: string
   raw: BackendModel
 }
+
+// 版本历史抽屉使用的前端展示结构。
 type VersionItem = {
   version: string
   status: string
@@ -376,28 +392,42 @@ type VersionItem = {
   raw: BackendModel
 }
 
+// 列表筛选条件和当前选中的模型。
 const keyword = ref('')
 const typeFilter = ref('全部类型')
 const selectedModel = ref<ModelItem | null>(null)
+
+// 抽屉/弹窗显隐状态。
 const compareDrawerVisible = ref(false)
 const versionHistoryDrawerVisible = ref(false)
 
 const importDialogVisible = ref(false)
 const exportDialogVisible = ref(false)
+
+// 当前要对比的历史版本。
 const compareVersion = ref<VersionItem>()
+
+// 模型列表与当前模型版本历史。
 const models = ref<ModelItem[]>([])
 const versionHistory = ref<VersionItem[]>([])
+
+// 异步操作 loading 状态。
 const predicting = ref(false)
 const scanning = ref(false)
 const savingRateLimit = ref(false)
+
+// 在线推理、安全扫描和限流相关状态。
 const inferenceInput = ref('请对当前模型做一次测试推理')
 const prediction = ref<PredictResult>()
 const securityReports = ref<SecurityReport[]>([])
 const rateLimit = ref<ModelRateLimit>()
 const scanImageRef = ref('')
 
+// 导入/导出表单。
 const importForm = ref({ source_path: '', model_name: '', model_code: '', version: 'v1.0.0' })
 const exportForm = ref({ target_path: '' })
+
+// 模型 API 限流表单，加载模型时会用后端配置覆盖默认值。
 const rateLimitForm = reactive({
   enabled: true,
   requests_per_minute: 100,
@@ -406,6 +436,7 @@ const rateLimitForm = reactive({
   max_tokens_per_request: 4096,
 })
 
+// 模型卡片颜色池。
 const colors = [
   'linear-gradient(135deg, #3b82f6, #2563eb)',
   'linear-gradient(135deg, #10b981, #059669)',
@@ -414,6 +445,7 @@ const colors = [
   'linear-gradient(135deg, #06b6d4, #0891b2)',
 ]
 
+// 从 metrics_json 中提取主要评估指标；优先展示 accuracy，其次展示最终 loss。
 const getMetricText = (metrics?: Record<string, unknown>) => {
   if (!metrics || Object.keys(metrics).length === 0) return '-'
   const accuracy = metrics.accuracy_train ?? metrics.accuracy_val ?? metrics.accuracy ?? metrics.acc ?? metrics.score
@@ -425,6 +457,7 @@ const getMetricText = (metrics?: Record<string, unknown>) => {
   return '-'
 }
 
+// 从 hyperparams_json 中提取模型参数摘要。
 const getParamsText = (hyperparams?: Record<string, unknown>) => {
   if (!hyperparams) return '-'
   const { hidden_size, num_layers, num_attention_heads, vocab_size } = hyperparams
@@ -434,6 +467,7 @@ const getParamsText = (hyperparams?: Record<string, unknown>) => {
   return parts.length ? parts.join('·') : '-'
 }
 
+// 将超参数字典转换成“中文标签 -> 展示值”，用于训练配置卡片。
 const getHyperSummary = (hyperparams?: Record<string, unknown>): Record<string, string> => {
   if (!hyperparams) return {}
   const result: Record<string, string> = {}
@@ -453,6 +487,7 @@ const getHyperSummary = (hyperparams?: Record<string, unknown>): Record<string, 
   return result
 }
 
+// 将后端模型版本映射为模型列表卡片结构。
 const mapModel = (item: BackendModel, index = 0): ModelItem => ({
   id: item.model_code,
   name: item.model_name,
@@ -464,10 +499,11 @@ const mapModel = (item: BackendModel, index = 0): ModelItem => ({
   raw: item,
 })
 
+// 将后端模型版本映射为版本历史结构。
 const mapVersion = (item: BackendModel): VersionItem => ({
   version: item.version,
   status: item.is_current ? '当前版本' : item.tag ?? '',
-  date: item.created_at?.replace('T', ' ').slice(0, 16) ?? '-',
+  date: formatBeijingDateTime(item.created_at).slice(0, 16),
   metrics: getMetricText(item.metrics_json),
   params: getParamsText(item.hyperparams_json),
   training: item.dataset_version ? `数据集 ${item.dataset_version}` : `模型 ${item.model_code}`,
@@ -475,15 +511,18 @@ const mapVersion = (item: BackendModel): VersionItem => ({
   raw: item,
 })
 
+// 加载模型列表。
 const loadModels = async () => {
   const page = await listModels({ page: 1, page_size: 100, keyword: keyword.value })
   models.value = page.data.map(mapModel)
 }
 
+// 加载某个模型的所有版本。
 const loadVersions = async (modelCode: string) => {
   versionHistory.value = (await getModelVersions(modelCode)).map(mapVersion)
 }
 
+// 前端本地筛选模型列表。
 const filteredModels = computed(() =>
   models.value.filter((item) => {
     const matchText = `${item.name}${item.type}`.toLowerCase().includes(keyword.value.toLowerCase())
@@ -492,6 +531,7 @@ const filteredModels = computed(() =>
   }),
 )
 
+// 当前模型的训练来源、资源、checkpoint 等元信息。
 const selectedTrainingMeta = computed(() => {
   const raw = selectedModel.value?.raw
   const hp = raw?.hyperparams_json ?? {}
@@ -511,11 +551,13 @@ const selectedTrainingMeta = computed(() => {
   }
 })
 
+// 当前模型超参数摘要。
 const hyperParamsSummary = computed(() => {
   const hp = selectedModel.value?.raw?.hyperparams_json
   return hp ? getHyperSummary(hp) : {}
 })
 
+// 训练配置卡片展示项。
 const trainingConfigItems = computed<[string, string][]>(() => {
   const meta = selectedTrainingMeta.value
   const hp = hyperParamsSummary.value
@@ -531,14 +573,18 @@ const trainingConfigItems = computed<[string, string][]>(() => {
   return items
 })
 
+// 模型产物列表，展示模型文件、checkpoint 和训练配置路径。
 const artifacts = computed(() => [
   { label: '模型文件', path: `models/${selectedModel.value?.id}/${selectedModel.value?.version}/model.bin`, status: '已归档', type: 'success' as const },
   { label: 'Checkpoint', path: selectedTrainingMeta.value.checkpoint, status: '可恢复', type: 'info' as const },
   { label: '训练配置', path: selectedTrainingMeta.value.config, status: '已保存', type: 'success' as const },
 ])
 
+// 版本对比所需的当前版本和历史 checkpoint 展示路径。
 const currentVersion = computed(() => versionHistory.value.find((item) => item.current) ?? versionHistory.value[0])
 const historicalCheckpoint = computed(() => `ckpt/${compareVersion.value?.version ?? 'history'}/best`)
+
+// 最新安全扫描报告及漏洞列表。
 const latestSecurityReport = computed(() => securityReports.value[0])
 const latestVulnerabilities = computed(() => latestSecurityReport.value?.vulnerabilities ?? [])
 const criticalHighCount = computed(() => {
@@ -546,6 +592,7 @@ const criticalHighCount = computed(() => {
   return summary ? `${summary.critical} / ${summary.high}` : '-'
 })
 
+// 漏洞等级到 Element Plus Tag 类型的映射。
 const severityTagType = (severity: string) => {
   if (severity === 'Critical') return 'danger'
   if (severity === 'High') return 'warning'
@@ -553,6 +600,7 @@ const severityTagType = (severity: string) => {
   return 'success'
 }
 
+// 将后端限流配置同步到表单。
 const applyRateLimit = (config: ModelRateLimit) => {
   rateLimit.value = config
   rateLimitForm.enabled = config.enabled
@@ -562,19 +610,23 @@ const applyRateLimit = (config: ModelRateLimit) => {
   rateLimitForm.max_tokens_per_request = config.limits.max_tokens_per_request
 }
 
+// 加载模型安全扫描报告，并按扫描时间倒序排列。
 const loadSecurityReports = async (modelCode: string) => {
   const reports = await getSecurityReports(modelCode)
   securityReports.value = [...reports].sort((a, b) => String(b.scanned_at ?? '').localeCompare(String(a.scanned_at ?? '')))
 }
 
+// 将新扫描报告合并到列表头部，避免重复 scan_id。
 const mergeSecurityReport = (report: SecurityReport) => {
   securityReports.value = [report, ...securityReports.value.filter((item) => item.scan_id !== report.scan_id)]
 }
 
+// 加载并应用模型限流配置。
 const loadRateLimit = async (modelCode: string) => {
   applyRateLimit(await getModelRateLimit(modelCode))
 }
 
+// 打开版本对比抽屉；后端对比接口失败也允许前端展示本地可比信息。
 const openCompareDrawer = async (version: VersionItem) => {
   compareVersion.value = version
   if (selectedModel.value && currentVersion.value) {
@@ -583,6 +635,7 @@ const openCompareDrawer = async (version: VersionItem) => {
   compareDrawerVisible.value = true
 }
 
+// 删除当前模型及其版本。
 const handleDeleteModel = async () => {
   if (!selectedModel.value?.id) return
   try {
@@ -595,11 +648,13 @@ const handleDeleteModel = async () => {
   }
 }
 
+// 打开导出弹窗，并生成默认导出路径。
 const openExportDialog = () => {
   exportForm.value = { target_path: selectedModel.value ? `exports/${selectedModel.value.id}/${selectedModel.value.version}` : '' }
   exportDialogVisible.value = true
 }
 
+// 版本回滚：后端更新当前版本后，前端刷新版本历史并同步详情页当前版本信息。
 const rollback = async (version: string) => {
   await ElMessageBox.confirm(`确认回滚到 ${version}？该操作会生成回滚记录。`, '版本回滚确认', { type: 'warning' })
   if (selectedModel.value) {
@@ -620,11 +675,13 @@ const rollback = async (version: string) => {
   ElMessage.success(`已回滚到 ${version}`)
 }
 
+// 下载指定模型版本。
 const downloadVersion = (version: string) => {
   if (!selectedModel.value) return
   window.open(getModelDownloadUrl(selectedModel.value.id, version), '_blank')
 }
 
+// 进入模型详情页，同时加载版本、扫描报告和限流策略。
 const selectModel = async (model: ModelItem) => {
   selectedModel.value = model
   prediction.value = undefined
@@ -634,6 +691,7 @@ const selectModel = async (model: ModelItem) => {
   await Promise.all([loadVersions(model.id), loadSecurityReports(model.id), loadRateLimit(model.id)])
 }
 
+// 触发容器镜像漏洞扫描。后端可能调用 Clair，也可能返回模拟扫描报告。
 const runSecurityScan = async () => {
   if (!selectedModel.value) return
   scanning.value = true
@@ -651,6 +709,7 @@ const runSecurityScan = async () => {
   }
 }
 
+// 保存当前模型的 API 调用限流策略。
 const saveRateLimit = async () => {
   if (!selectedModel.value) return
   savingRateLimit.value = true
@@ -664,6 +723,7 @@ const saveRateLimit = async () => {
   }
 }
 
+// 调用当前模型的同步推理接口，结果展示在右侧结果框。
 const runPredict = async () => {
   if (!selectedModel.value || !inferenceInput.value.trim()) return
   predicting.value = true
@@ -677,6 +737,7 @@ const runPredict = async () => {
   }
 }
 
+// 从模型仓库导入模型版本。
 const submitImport = async () => {
   if (!importForm.value.source_path || !importForm.value.model_name || !importForm.value.model_code) {
     ElMessage.warning('请填写导入信息')
@@ -688,6 +749,7 @@ const submitImport = async () => {
   ElMessage.success('模型导入成功')
 }
 
+// 导出当前模型版本到指定仓库路径。
 const submitExport = async () => {
   if (!selectedModel.value || !exportForm.value.target_path) return
   await exportModel({
@@ -700,6 +762,7 @@ const submitExport = async () => {
 }
 
 onMounted(() => {
+  // 进入页面时加载模型列表。
   loadModels().catch((error) => {
     ElMessage.error(error instanceof Error ? error.message : '模型列表加载失败')
   })

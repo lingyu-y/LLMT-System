@@ -1,17 +1,21 @@
 <template>
+  <!-- 通用指标卡片：用于仪表盘等页面展示单个统计指标。 -->
   <div class="metric-card">
     <div class="metric-head">
       <span>{{ title }}</span>
+      <!-- 图标和颜色由父组件传入，方便不同指标使用不同视觉标识。 -->
       <span class="metric-icon" :style="{ background: colorBg, color }">
         <el-icon><component :is="icon" /></el-icon>
       </span>
     </div>
     <div class="metric-value">{{ value }}</div>
+    <!-- change 可选，用于展示同比、环比、状态变化等补充信息。 -->
     <div v-if="change" class="metric-change" :class="changeType">{{ change }}</div>
   </div>
 </template>
 
 <script setup lang="ts">
+// 纯展示组件：不请求接口，只渲染父组件传入的指标标题、数值、图标和变化趋势。
 defineProps<{
   title: string
   value: string | number
@@ -19,6 +23,7 @@ defineProps<{
   color?: string
   colorBg?: string
   change?: string
+  // up/down 只控制变化文案颜色，不做数值计算。
   changeType?: 'up' | 'down'
 }>()
 </script>

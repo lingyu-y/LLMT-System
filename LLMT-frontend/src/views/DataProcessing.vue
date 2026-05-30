@@ -1,14 +1,17 @@
 <template>
   <div>
+    <!-- 页面标题区，说明当前模块覆盖数据加载、质量校验、血缘追踪三条主线。 -->
     <div class="page-header">
-      <h1 class="page-title">多模态数据处理</h1>
+      <h1 class="page-title">数据处理</h1>
       <p class="page-description">对接数据集接口，覆盖数据加载、质量校验和血缘追踪能力</p>
     </div>
 
+    <!-- 顶部统计卡片，数据由 datasetStats computed 汇总得到。 -->
     <div class="grid-4 stats">
       <MetricCard v-for="item in datasetStats" :key="item.title" :title="item.title" :value="item.value" />
     </div>
 
+    <!-- 主工作区：左侧数据集列表，右侧当前数据集的处理工作台。 -->
     <div class="data-workbench">
       <div class="card dataset-list-panel">
         <div class="card-header">
@@ -19,6 +22,7 @@
           <el-button type="primary" :icon="Upload" @click="openCreateDialog">数据加载</el-button>
         </div>
         <div class="card-body dataset-list-body">
+          <!-- 本地搜索，不重新请求后端；搜索范围在 filteredDatasets 中定义。 -->
           <el-input
             v-model="datasetKeyword"
             class="dataset-search"
@@ -66,6 +70,7 @@
           <el-empty v-if="!selectedDataset" description="暂无数据集，请先通过数据加载创建或导入数据集" />
 
           <template v-else>
+            <!-- 当前选中数据集的摘要信息。 -->
             <div class="dataset-context">
               <div>
                 <span class="context-label">当前数据集</span>
@@ -94,6 +99,7 @@
             </div>
 
           <el-tabs v-model="activeDataTab">
+            <!-- 数据加载 Tab：追加文件、启动预处理、查看处理任务。 -->
             <el-tab-pane label="数据加载" name="load">
               <div class="feature-grid">
                 <div class="feature-panel load-actions-panel">
@@ -124,6 +130,7 @@
                     <p>展示本次选择文件的校验、上传和后端处理结果。</p>
                   </div>
                   <div v-if="uploadRecords.length" class="upload-records">
+                    <!-- 上传记录展示本次选择文件的前端校验、上传进度和最终结果。 -->
                     <div v-for="file in uploadRecords" :key="file.uid" class="upload-record">
                       <div>
                         <strong>{{ file.name }}</strong>
@@ -139,6 +146,7 @@
                 </div>
               </div>
 
+              <!-- 后端处理任务列表，包括预处理任务进度。 -->
               <div class="job-list">
                 <h4>处理任务</h4>
                 <el-table :data="processingJobs" stripe>
@@ -159,6 +167,7 @@
               </div>
             </el-tab-pane>
 
+            <!-- 质量校验 Tab：展示后端质量报告，并提供校验和修复入口。 -->
             <el-tab-pane label="质量校验" name="quality">
               <div class="quality-toolbar">
                 <div>
@@ -168,7 +177,7 @@
                 <div class="button-row">
                   <el-button type="primary" :loading="checking" :icon="VideoPlay" @click="startQualityCheck">开始校验</el-button>
                   <el-button :icon="Document" @click="openQualityReport">查看报告</el-button>
-                  <el-button :loading="repairing" :icon="Tools" @click="repairQuality">自动修复/标记修复</el-button>
+                  <!-- <el-button :loading="repairing" :icon="Tools" @click="repairQuality">自动修复/标记修复</el-button> -->
                 </div>
               </div>
 
@@ -197,6 +206,7 @@
               </div>
             </el-tab-pane>
 
+            <!-- 血缘追踪 Tab：展示转换链路和下游影响分析入口。 -->
             <el-tab-pane label="血缘追踪" name="lineage">
               <div class="quality-toolbar">
                 <div>
@@ -206,7 +216,7 @@
                 <div class="button-row">
                   <el-button type="primary" :icon="Share" @click="openLineageDrawer">查看血缘链路</el-button>
                   <el-button :loading="impactLoading" :icon="Connection" @click="openImpactDrawer">影响分析</el-button>
-                  <el-button :icon="Clock" @click="showVersionTip">查看历史版本</el-button>
+                  <!-- <el-button :icon="Clock" @click="showVersionTip">查看历史版本</el-button> -->
                 </div>
               </div>
 
@@ -234,6 +244,7 @@
       </div>
     </div>
 
+    <!-- 数据加载弹窗：创建数据集和追加文件复用同一弹窗，通过 uploadMode 区分。 -->
     <el-dialog v-model="dialogVisible" :title="dialogTitle" width="680px">
       <el-form :model="importForm" label-position="top">
         <el-form-item label="批量上传入口">
@@ -269,9 +280,9 @@
           <el-form-item label="数据类型">
             <el-select v-model="importForm.type" class="full">
               <el-option label="文本数据" value="text" />
-              <el-option label="图像数据" value="image" />
+              <!-- <el-option label="图像数据" value="image" />
               <el-option label="音频数据" value="audio" />
-              <el-option label="表格数据" value="tabular" />
+              <el-option label="表格数据" value="tabular" /> -->
             </el-select>
           </el-form-item>
         </div>
@@ -280,7 +291,7 @@
           <el-input v-model="importForm.desc" type="textarea" :rows="3" placeholder="输入数据集描述..." />
         </el-form-item>
 
-        <el-form-item label="断点续传">
+        <!-- <el-form-item label="断点续传">
           <div class="resume-option">
             <el-switch v-model="resumeEnabled" />
             <div>
@@ -288,7 +299,7 @@
               <p>启用后上传过程保留本地文件状态，失败后可重新提交同一批文件继续处理。</p>
             </div>
           </div>
-        </el-form-item>
+        </el-form-item> -->
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
@@ -296,6 +307,7 @@
       </template>
     </el-dialog>
 
+    <!-- 质量报告抽屉：展示已加载的 qualityReport 明细。 -->
     <el-drawer v-model="qualityDrawerVisible" title="质量校验报告" size="520px">
       <el-descriptions v-if="selectedDataset" :column="1" border>
         <el-descriptions-item label="数据集">{{ selectedDataset.name }}</el-descriptions-item>
@@ -309,6 +321,7 @@
       </el-descriptions>
     </el-drawer>
 
+    <!-- 血缘链路抽屉：展示来源和 transformations 转换记录。 -->
     <el-drawer v-model="lineageDrawerVisible" title="数据血缘链路" size="560px">
       <el-descriptions v-if="selectedDataset" :column="1" border>
         <el-descriptions-item label="数据来源">{{ selectedDataset.ownerLabel }}</el-descriptions-item>
@@ -327,21 +340,60 @@
       </div>
     </el-drawer>
 
-    <el-drawer v-model="impactDrawerVisible" title="影响分析" size="520px">
+    <!-- 影响分析抽屉：展示删除或变更当前数据集可能影响的任务、模型和下游数据集。 -->
+    <el-drawer v-model="impactDrawerVisible" title="影响分析" size="560px">
+      <el-alert
+        :title="impactRiskTitle"
+        :type="impactRiskType"
+        :closable="false"
+        show-icon
+      >
+        <template #default>
+          <span>{{ impactRiskMessage }}</span>
+        </template>
+      </el-alert>
+
+      <div class="impact-summary">
+        <div v-for="item in impactSummary" :key="item.label" class="impact-stat">
+          <span>{{ item.label }}</span>
+          <strong>{{ item.value }}</strong>
+        </div>
+      </div>
+
+      <el-descriptions v-if="selectedDataset" :column="1" border>
+        <el-descriptions-item label="分析对象">{{ selectedDataset.name }}</el-descriptions-item>
+        <el-descriptions-item label="建议动作">{{ impactRecommendation }}</el-descriptions-item>
+      </el-descriptions>
+
       <div class="impact-group">
         <h4>受影响训练任务</h4>
-        <el-empty v-if="lineageImpact.affected_tasks.length === 0" description="暂无记录" :image-size="70" />
-        <el-tag v-for="item in lineageImpact.affected_tasks" v-else :key="item" effect="plain">{{ item }}</el-tag>
+        <el-empty v-if="lineageImpact.affected_tasks.length === 0" description="暂无训练任务依赖" :image-size="70" />
+        <div v-else class="impact-list">
+          <div v-for="item in lineageImpact.affected_tasks" :key="item" class="impact-item">
+            <span>训练任务</span>
+            <strong>{{ item }}</strong>
+          </div>
+        </div>
       </div>
       <div class="impact-group">
         <h4>受影响模型版本</h4>
-        <el-empty v-if="lineageImpact.affected_models.length === 0" description="暂无记录" :image-size="70" />
-        <el-tag v-for="item in lineageImpact.affected_models" v-else :key="item" effect="plain">{{ item }}</el-tag>
+        <el-empty v-if="lineageImpact.affected_models.length === 0" description="暂无模型版本依赖" :image-size="70" />
+        <div v-else class="impact-list">
+          <div v-for="item in lineageImpact.affected_models" :key="item" class="impact-item">
+            <span>模型版本</span>
+            <strong>{{ item }}</strong>
+          </div>
+        </div>
       </div>
       <div class="impact-group">
-        <h4>受影响下游数据集</h4>
-        <el-empty v-if="lineageImpact.affected_datasets.length === 0" description="暂无记录" :image-size="70" />
-        <el-tag v-for="item in lineageImpact.affected_datasets" v-else :key="item" effect="plain">{{ item }}</el-tag>
+        <h4>关联下游数据集</h4>
+        <el-empty v-if="lineageImpact.affected_datasets.length === 0" description="暂无同源或同版本数据集" :image-size="70" />
+        <div v-else class="impact-list">
+          <div v-for="item in lineageImpact.affected_datasets" :key="item" class="impact-item">
+            <span>数据集</span>
+            <strong>{{ item }}</strong>
+          </div>
+        </div>
       </div>
     </el-drawer>
   </div>
@@ -376,9 +428,11 @@ import {
   type ProcessingJob,
   type QualityReport,
 } from '@/api/datasets'
+import { formatBeijingDate, formatBeijingDateTime } from '@/utils/time'
 
 type StatusType = 'success' | 'warning' | 'info' | 'danger'
 
+// 页面内部使用的数据集展示结构：由后端 BackendDataset 转换而来，包含中文标签和状态样式。
 interface DatasetView {
   id: number
   name: string
@@ -396,6 +450,7 @@ interface DatasetView {
   raw: BackendDataset
 }
 
+// 本次上传文件的前端展示状态，用于上传弹窗和工作台里的进度展示。
 interface UploadRecord {
   uid: number
   name: string
@@ -407,8 +462,11 @@ interface UploadRecord {
   progressStatus?: 'success' | 'exception' | 'warning'
 }
 
+// 单文件最大 2GB；前端先做格式和大小校验，减少无效上传请求。
 const MAX_UPLOAD_FILE_SIZE = 2 * 1024 ** 3
 const supportedFormats = ['TXT', 'CSV', 'JSON', 'JSONL', 'DOC', 'DOCX', 'XLS', 'XLSX']
+
+// 不同数据类型对应的建议文件格式，用于页面展示。
 const formatByType: Record<string, string> = {
   text: 'TXT/CSV/JSON/JSONL/DOC/DOCX',
   image: '暂不支持',
@@ -417,6 +475,7 @@ const formatByType: Record<string, string> = {
   video: '暂不支持',
 }
 
+// 后端 data_type 到中文类型的映射。
 const typeMap: Record<string, string> = {
   text: '文本',
   image: '图像',
@@ -425,6 +484,7 @@ const typeMap: Record<string, string> = {
   tabular: '表格',
 }
 
+// 后端质量状态到 StatusBadge 展示文案和颜色的映射。
 const qualityStatusMap: Record<string, { label: string; type: StatusType }> = {
   passed: { label: '合格', type: 'success' },
   unchecked: { label: '待校验', type: 'info' },
@@ -433,6 +493,7 @@ const qualityStatusMap: Record<string, { label: string; type: StatusType }> = {
   failed: { label: '不合格', type: 'danger' },
 }
 
+// 后端血缘状态到 StatusBadge 展示文案和颜色的映射。
 const lineageStatusMap: Record<string, { label: string; type: StatusType }> = {
   tracked: { label: '已追踪', type: 'success' },
   complete: { label: '已追踪', type: 'success' },
@@ -441,6 +502,7 @@ const lineageStatusMap: Record<string, { label: string; type: StatusType }> = {
   missing: { label: '缺失', type: 'warning' },
 }
 
+// 页面 loading 状态按操作拆开，避免一个操作阻塞整页。
 const loading = ref(false)
 const importing = ref(false)
 const checking = ref(false)
@@ -452,9 +514,13 @@ const dialogVisible = ref(false)
 const qualityDrawerVisible = ref(false)
 const lineageDrawerVisible = ref(false)
 const impactDrawerVisible = ref(false)
+
+// 当前右侧工作台 Tab。
 const activeDataTab = ref('load')
 const selectedDatasetId = ref<number>()
 const datasetKeyword = ref('')
+
+// 主要业务数据：数据集列表、统计、上传记录、质量报告、血缘报告、处理任务。
 const datasets = ref<DatasetView[]>([])
 const stats = ref<DatasetStats>()
 const uploadFiles = ref<UploadUserFile[]>([])
@@ -463,9 +529,13 @@ const qualityReport = ref<QualityReport>()
 const lineageReport = ref<Lineage>()
 const lineageImpact = ref<LineageImpact>({ dataset_id: 0, affected_models: [], affected_tasks: [], affected_datasets: [] })
 const processingJobs = ref<ProcessingJob[]>([])
+
+// 预处理任务轮询定时器，启动预处理后会定时刷新处理任务。
 let processingPollTimer: ReturnType<typeof window.setInterval> | undefined
 const resumeEnabled = ref(true)
 const shardSizeMb = ref(512)
+
+// create 表示创建数据集并上传，append 表示向当前数据集追加文件。
 const uploadMode = ref<'create' | 'append'>('create')
 const importForm = reactive({
   name: '',
@@ -473,9 +543,11 @@ const importForm = reactive({
   desc: '',
 })
 
-const dialogTitle = computed(() => (uploadMode.value === 'create' ? '多模态数据加载' : `追加文件到 ${selectedDataset.value?.name ?? '当前数据集'}`))
+// 弹窗标题和提交按钮文案随 uploadMode 自动切换。
+const dialogTitle = computed(() => (uploadMode.value === 'create' ? '数据加载' : `追加文件到 ${selectedDataset.value?.name ?? '当前数据集'}`))
 const submitButtonLabel = computed(() => (uploadMode.value === 'create' ? '创建并上传' : '追加上传'))
 
+// 字节数格式化，用于数据集大小、上传文件大小、处理输出大小展示。
 const formatSize = (size = 0) => {
   if (size >= 1024 ** 4) return `${(size / 1024 ** 4).toFixed(1)} TB`
   if (size >= 1024 ** 3) return `${(size / 1024 ** 3).toFixed(1)} GB`
@@ -484,13 +556,14 @@ const formatSize = (size = 0) => {
   return `${size} B`
 }
 
-const formatDate = (value?: string) => value?.slice(0, 10) || '-'
-const formatDateTime = (value?: string | null) => (value ? value.replace('T', ' ').slice(0, 19) : '接口未返回')
+const formatDate = (value?: string) => formatBeijingDate(value)
+const formatDateTime = (value?: string | null) => formatBeijingDateTime(value, '接口未返回')
 const passLabel = (value: boolean) => (value ? '通过' : '未通过')
 
 const getQualityStatus = (status: string) => qualityStatusMap[status] ?? { label: status || '未知', type: 'info' as const }
 const getLineageStatus = (status: string) => lineageStatusMap[status] ?? { label: status || '未记录', type: 'info' as const }
 
+// 将后端数据集对象转换为页面展示对象，把状态、大小、时间、用户等字段都整理好。
 const mapDataset = (item: BackendDataset): DatasetView => {
   const quality = getQualityStatus(item.quality_status)
   const lineage = getLineageStatus(item.lineage_status)
@@ -513,7 +586,10 @@ const mapDataset = (item: BackendDataset): DatasetView => {
   }
 }
 
+// 当前选中的数据集，右侧工作台所有操作都围绕它展开。
 const selectedDataset = computed(() => datasets.value.find((item) => item.id === selectedDatasetId.value))
+
+// 本地搜索过滤数据集列表。
 const filteredDatasets = computed(() => {
   const keyword = datasetKeyword.value.trim().toLowerCase()
   if (!keyword) return datasets.value
@@ -523,6 +599,7 @@ const filteredDatasets = computed(() => {
   )
 })
 
+// 顶部四个统计卡片的数据，部分来自后端 stats，部分由当前数据集列表聚合。
 const datasetStats = computed(() => {
   const total = stats.value?.total_datasets ?? 0
   const completed = stats.value?.completed ?? 0
@@ -537,6 +614,7 @@ const datasetStats = computed(() => {
   ]
 })
 
+// 质量报告相关 computed：把后端质量报告整理成评分、等级、指标卡和问题清单。
 const qualityScore = computed(() => qualityReport.value?.overall_score)
 const qualityScoreLabel = computed(() => (qualityScore.value === undefined ? '接口未返回' : qualityScore.value.toFixed(1)))
 const qualityLevel = computed(() => {
@@ -579,6 +657,7 @@ const qualityIssues = computed(() =>
   })),
 )
 
+// 血缘报告相关 computed：把 transformations 和 downstream 整理成页面可展示的链路节点。
 const lineageSteps = computed(() =>
   (lineageReport.value?.transformations ?? []).map((step, index) => ({
     key: `${step.rule ?? 'transform'}-${step.timestamp ?? index}`,
@@ -607,9 +686,41 @@ const downstreamLabel = computed(() => {
     .join('、')
 })
 
+// 影响分析相关 computed：根据后端返回的依赖列表推导风险提示和建议动作。
+const impactSummary = computed(() => [
+  { label: '训练任务', value: lineageImpact.value.affected_tasks.length },
+  { label: '模型版本', value: lineageImpact.value.affected_models.length },
+  { label: '关联数据集', value: lineageImpact.value.affected_datasets.length },
+])
+const impactRiskType = computed<'success' | 'warning' | 'info' | 'error'>(() => {
+  const level = lineageImpact.value.risk?.level
+  if (level === 'warning') return 'warning'
+  if (level === 'danger' || level === 'error') return 'error'
+  return impactSummary.value.some((item) => item.value > 0) ? 'warning' : 'success'
+})
+const impactRiskTitle = computed(() => {
+  if (lineageImpact.value.risk?.message) return '存在变更影响'
+  return impactSummary.value.some((item) => item.value > 0) ? '检测到下游依赖' : '未检测到下游影响'
+})
+const impactRiskMessage = computed(() =>
+  lineageImpact.value.risk?.message
+  ?? (impactSummary.value.some((item) => item.value > 0)
+    ? '变更或删除该数据集前，请确认下游训练任务、模型版本和关联数据集是否需要同步更新。'
+    : '当前数据集暂未发现训练任务、模型版本或关联数据集依赖。'),
+)
+const impactRecommendation = computed(() => {
+  const taskCount = lineageImpact.value.affected_tasks.length
+  const modelCount = lineageImpact.value.affected_models.length
+  if (taskCount > 0 || modelCount > 0) return '先暂停相关训练任务，确认模型版本无需回滚后再变更数据集'
+  if (lineageImpact.value.affected_datasets.length > 0) return '变更前同步检查同源或同版本数据集的一致性'
+  return '可按常规流程更新，建议保留变更记录'
+})
+
 const getFileFormat = (filename: string) => filename.split('.').pop()?.toUpperCase() ?? ''
 const isSupportedFile = (filename: string) => supportedFormats.includes(getFileFormat(filename))
 const formatPercent = (value?: number) => (value === undefined || Number.isNaN(value) ? '-' : `${value.toFixed(1)}%`)
+
+// 创建数据集时生成一个相对稳定的存储路径，后端会据此组织文件对象。
 const buildStoragePath = (name: string) => {
   const safe = name
     .trim()
@@ -620,6 +731,7 @@ const buildStoragePath = (name: string) => {
   return `/datasets/${safe || "dataset"}-${Date.now()}`
 }
 
+// 将 Element Plus 上传组件的 file-list 同步成页面自己的 UploadRecord 展示状态。
 const syncUploadRecords = () => {
   uploadRecords.value = uploadFiles.value.map((file) => {
     const format = getFileFormat(file.name)
@@ -640,16 +752,19 @@ const syncUploadRecords = () => {
   })
 }
 
+// 文件选择变化时，重新做格式/大小校验并更新上传记录。
 const handleUploadChange = (_file: UploadFile, files: UploadUserFile[]) => {
   uploadFiles.value = files
   syncUploadRecords()
 }
 
+// 文件移除时同步更新上传记录。
 const handleUploadRemove = (_file: UploadFile, files: UploadUserFile[]) => {
   uploadFiles.value = files
   syncUploadRecords()
 }
 
+// 重置数据加载弹窗表单，创建和追加文件都会复用。
 const resetImportForm = () => {
   importForm.name = ''
   importForm.type = 'text'
@@ -658,12 +773,14 @@ const resetImportForm = () => {
   uploadRecords.value = []
 }
 
+// 打开“创建数据集并上传文件”弹窗。
 const openCreateDialog = () => {
   uploadMode.value = 'create'
   resetImportForm()
   dialogVisible.value = true
 }
 
+// 打开“向当前数据集追加文件”弹窗，需要先选择一个数据集。
 const openAppendDialog = () => {
   if (!selectedDataset.value) {
     ElMessage.warning('请先选择数据集')
@@ -674,6 +791,7 @@ const openAppendDialog = () => {
   dialogVisible.value = true
 }
 
+// 加载数据处理首页所需数据：统计、数据集列表、处理任务列表。
 const loadDatasets = async () => {
   loading.value = true
   try {
@@ -686,6 +804,7 @@ const loadDatasets = async () => {
     datasets.value = datasetPage.data.map(mapDataset)
     processingJobs.value = jobsPage.data
 
+    // 首次进入页面默认选中第一个数据集；如果当前选中的数据集已不存在，则切换到新的第一个。
     if (!selectedDatasetId.value && datasets.value[0]) {
       await selectDataset(datasets.value[0].id)
     } else if (selectedDatasetId.value && !datasets.value.some((item) => item.id === selectedDatasetId.value)) {
@@ -696,6 +815,7 @@ const loadDatasets = async () => {
   }
 }
 
+// 刷新处理任务列表；轮询时 showLoading=false，避免按钮一直闪 loading。
 const refreshProcessingJobs = async (showLoading = true) => {
   if (showLoading) refreshingJobs.value = true
   try {
@@ -706,11 +826,13 @@ const refreshProcessingJobs = async (showLoading = true) => {
   }
 }
 
+// 判断某个数据集是否还有运行中的处理任务，用于决定是否继续轮询。
 const hasRunningProcessingJob = (datasetId: number) =>
   processingJobs.value.some((job) =>
     job.dataset_id === datasetId && ['running', 'processing', 'pending'].includes(String(job.status).toLowerCase()),
   )
 
+// 停止预处理任务轮询。
 const stopProcessingJobPolling = () => {
   if (processingPollTimer) {
     window.clearInterval(processingPollTimer)
@@ -718,6 +840,7 @@ const stopProcessingJobPolling = () => {
   }
 }
 
+// 启动预处理任务轮询：每 2 秒刷新任务，任务结束后刷新数据集详情。
 const startProcessingJobPolling = (datasetId: number) => {
   stopProcessingJobPolling()
   processingPollTimer = window.setInterval(() => {
@@ -737,6 +860,7 @@ const startProcessingJobPolling = (datasetId: number) => {
   }, 2000)
 }
 
+// 加载当前数据集的质量报告和血缘报告。失败时不阻断页面，只展示已有数据。
 const loadDatasetDetails = async (datasetId: number) => {
   qualityReport.value = undefined
   lineageReport.value = undefined
@@ -745,6 +869,7 @@ const loadDatasetDetails = async (datasetId: number) => {
   const [quality, lineage] = await Promise.allSettled([getQualityReport(datasetId), getLineage(datasetId)])
   if (quality.status === 'fulfilled') {
     qualityReport.value = quality.value
+    // 质量报告返回后，同步更新左侧列表里的质量状态，避免等待下一次列表刷新。
     const item = datasets.value.find((dataset) => dataset.id === datasetId)
     if (item && quality.value) {
       item.raw.quality_status = quality.value.passed ? 'passed' : 'failed'
@@ -756,16 +881,19 @@ const loadDatasetDetails = async (datasetId: number) => {
   if (lineage.status === 'fulfilled') lineageReport.value = lineage.value
 }
 
+// 切换当前数据集，可选地切换右侧 Tab。
 const selectDataset = async (datasetId: number, tab?: string) => {
   selectedDatasetId.value = datasetId
   if (tab) activeDataTab.value = tab
   await loadDatasetDetails(datasetId)
 }
 
+// 表格行点击即选中数据集并加载详情。
 const handleRowClick = (row: DatasetView) => {
   void selectDataset(row.id)
 }
 
+// 触发后端质量校验接口，完成后刷新列表和报告。
 const startQualityCheck = async () => {
   if (!selectedDataset.value) {
     ElMessage.warning('请先选择数据集')
@@ -784,6 +912,7 @@ const startQualityCheck = async () => {
   }
 }
 
+// 打开质量报告抽屉。
 const openQualityReport = () => {
   if (!selectedDataset.value) {
     ElMessage.warning('请先选择数据集')
@@ -792,6 +921,7 @@ const openQualityReport = () => {
   qualityDrawerVisible.value = true
 }
 
+// 触发后端质量修复/标记修复，随后刷新数据集和详情。
 const repairQuality = async () => {
   if (!selectedDataset.value) {
     ElMessage.warning('请先选择数据集')
@@ -811,6 +941,7 @@ const repairQuality = async () => {
   }
 }
 
+// 打开血缘链路抽屉，数据来自 loadDatasetDetails 中的 getLineage。
 const openLineageDrawer = () => {
   if (!selectedDataset.value) {
     ElMessage.warning('请先选择数据集')
@@ -819,6 +950,7 @@ const openLineageDrawer = () => {
   lineageDrawerVisible.value = true
 }
 
+// 调用影响分析接口并打开抽屉。
 const openImpactDrawer = async () => {
   if (!selectedDataset.value) {
     ElMessage.warning('请先选择数据集')
@@ -836,10 +968,12 @@ const openImpactDrawer = async () => {
   }
 }
 
+// 历史版本功能目前等待后端接口。
 const showVersionTip = () => {
   ElMessage.info('历史版本需要后端提供版本列表接口后展示')
 }
 
+// 启动预处理任务，并开启处理任务轮询直到后端任务结束。
 const startPreprocessJob = async () => {
   if (!selectedDataset.value) {
     ElMessage.warning('请先选择数据集')
@@ -859,6 +993,7 @@ const startPreprocessJob = async () => {
   }
 }
 
+// 删除数据集，并在删除后选择新的数据集或清空详情。
 const removeDataset = async (datasetId: number) => {
   try {
     await deleteDatasetApi(datasetId)
@@ -878,6 +1013,7 @@ const removeDataset = async (datasetId: number) => {
   }
 }
 
+// 提交数据加载弹窗：根据 uploadMode 决定是先创建数据集再上传，还是直接追加到当前数据集。
 const submitImport = async () => {
   if (uploadMode.value === 'create' && !importForm.name.trim()) {
     ElMessage.warning('请输入数据集名称')
@@ -892,6 +1028,7 @@ const submitImport = async () => {
     return
   }
 
+  // 前端校验发现不支持格式或文件过大时，阻止上传。
   const unsupported = uploadRecords.value.find((file) => file.statusLabel === '格式不支持' || file.statusLabel === '文件过大')
   if (unsupported) {
     ElMessage.warning(`${unsupported.name} ${unsupported.statusLabel}`)
@@ -905,6 +1042,7 @@ const submitImport = async () => {
   let uploadedCount = 0
 
   try {
+    // Element Plus 的 UploadUserFile 需要从 raw 中取浏览器原始 File 对象。
     const rawFiles: File[] = []
     uploadFiles.value.forEach((file) => {
       if (!file.raw) throw new Error('未能读取到浏览器文件对象，请重新选择文件后再上传')
@@ -912,6 +1050,7 @@ const submitImport = async () => {
     })
 
     if (uploadMode.value === 'create') {
+      // 创建模式下先创建空数据集，拿到 datasetId 后再上传文件。
       const datasetName = importForm.name.trim()
       const dataset = await createDataset({
         name: datasetName,
@@ -930,6 +1069,7 @@ const submitImport = async () => {
     if (!targetDatasetId) throw new Error('未找到目标数据集')
     const ensuredTargetDatasetId = targetDatasetId
     if (createdDataset) {
+      // 新建数据集立即插入左侧列表，提升反馈速度；后面仍会重新拉取列表保证一致。
       datasets.value = [mapDataset(createdDataset), ...datasets.value.filter((item) => item.id !== createdDataset?.id)]
       selectedDatasetId.value = ensuredTargetDatasetId
       qualityReport.value = undefined
@@ -939,6 +1079,7 @@ const submitImport = async () => {
     dialogVisible.value = false
 
     if (rawFiles.length > 1) {
+      // 多文件走批量上传接口，通过统一进度回调更新每条记录。
       uploadRecords.value.forEach((record) => {
         record.statusLabel = '批量上传中'
         record.statusType = 'info'
@@ -965,6 +1106,7 @@ const submitImport = async () => {
       if (result.uploaded === 0) throw new Error('批量上传失败，未成功写入任何文件')
       if (result.failed > 0) ElMessage.warning(`已上传 ${result.uploaded} 个文件，${result.failed} 个文件失败`)
     } else {
+      // 单文件走单文件上传接口，进度只更新当前文件记录。
       for (const file of uploadFiles.value) {
         const record = uploadRecords.value.find((item) => item.uid === Number(file.uid))
         if (!file.raw || !record) continue
@@ -991,6 +1133,7 @@ const submitImport = async () => {
     importForm.desc = ''
     ElMessage.success(uploadMode.value === 'create' ? '数据集已创建，文件上传完成' : '文件已追加到当前数据集')
   } catch (error) {
+    // 创建模式下如果文件一个都没上传成功，尝试清理刚创建的空数据集。
     if (uploadMode.value === 'create' && createdDatasetId && uploadedCount === 0) {
       try {
         await deleteDatasetApi(createdDatasetId)
@@ -1000,6 +1143,7 @@ const submitImport = async () => {
         ElMessage.warning('上传未成功，空数据集清理失败，请稍后手动删除')
       }
     }
+    // 将仍处于上传中的记录标记为中断，给用户明确反馈。
     uploadRecords.value = uploadRecords.value.map((file) =>
       file.statusLabel === '上传中' || file.statusLabel === '批量上传中'
         ? { ...file, statusLabel: '上传中断', statusType: 'danger', progressStatus: 'exception' }
@@ -1012,12 +1156,14 @@ const submitImport = async () => {
 }
 
 onMounted(() => {
+  // 进入页面时加载数据集列表和默认选中项。
   loadDatasets().catch((error) => {
     ElMessage.error(error instanceof Error ? error.message : '数据集加载失败')
   })
 })
 
 onBeforeUnmount(() => {
+  // 离开页面时停止预处理轮询，避免后台继续请求接口。
   stopProcessingJobPolling()
 })
 </script>
@@ -1451,6 +1597,62 @@ onBeforeUnmount(() => {
 
 .impact-group {
   flex-direction: column;
+}
+
+.impact-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin: 16px 0;
+}
+
+.impact-stat,
+.impact-item {
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.impact-stat {
+  display: flex;
+  min-height: 72px;
+  flex-direction: column;
+  justify-content: center;
+  padding: 12px;
+}
+
+.impact-stat span,
+.impact-item span {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.impact-stat strong {
+  margin-top: 4px;
+  font-size: 22px;
+}
+
+.impact-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.impact-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+}
+
+.impact-item strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 @media (max-width: 1100px) {
