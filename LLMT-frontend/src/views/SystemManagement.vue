@@ -1,5 +1,6 @@
 <template>
   <div>
+    <!-- 系统管理总页：根据当前用户权限展示用户、角色、菜单、日志 Tab。 -->
     <div class="page-header">
       <h1 class="page-title">系统管理</h1>
       <p class="page-description">管理后端用户、角色、菜单可见性和系统日志</p>
@@ -8,6 +9,7 @@
     <div class="card">
       <div class="card-body system-body">
         <el-tabs v-model="activeTab" @tab-change="handleTabChange">
+          <!-- 用户管理：增删改用户、启停账号、分配角色。 -->
           <el-tab-pane v-if="canUserManage" label="用户管理" name="users">
             <div class="toolbar">
               <el-input v-model="userKeyword" class="toolbar-input" placeholder="搜索用户/账号" clearable />
@@ -39,6 +41,7 @@
             </div>
           </el-tab-pane>
 
+          <!-- 角色管理：维护角色基本信息和启停状态。菜单权限在菜单管理中配置。 -->
           <el-tab-pane v-if="canRoleManage" label="角色管理" name="roles">
             <div class="toolbar">
               <el-alert class="role-tip" title="菜单可见性请在“菜单管理”中配置。" type="info" show-icon :closable="false" />
@@ -66,8 +69,10 @@
             </div>
           </el-tab-pane>
 
+          <!-- 菜单管理：给角色配置可见菜单，影响侧边栏和路由权限。 -->
           <el-tab-pane v-if="canMenuManage" label="菜单管理" name="menus">
             <div class="menu-config">
+              <!-- 左侧角色列表，选择后加载该角色拥有的菜单。 -->
               <aside class="role-list">
                 <button
                   v-for="role in roleRows"
@@ -81,6 +86,7 @@
                 </button>
               </aside>
 
+              <!-- 右侧菜单勾选区域，保存时会把菜单 key 转成后端 menu id。 -->
               <section class="menu-panel">
                 <div class="menu-panel-head">
                   <div>
@@ -112,6 +118,7 @@
             </div>
           </el-tab-pane>
 
+          <!-- 日志管理：按级别、类别、模块和关键词筛选系统日志，可导出 CSV。 -->
           <el-tab-pane v-if="canLogView" label="日志管理" name="logs">
             <div class="toolbar logs-toolbar">
               <el-select v-model="level" class="toolbar-select" placeholder="级别筛选" clearable>
@@ -172,6 +179,7 @@
       </div>
     </div>
 
+    <!-- 新增/编辑用户弹窗。新增用户默认密码为 123456。 -->
     <el-dialog v-model="userDialogVisible" :title="editingUser ? '编辑用户' : '新增用户'" width="520px">
       <el-form :model="userForm" label-position="top">
         <el-form-item label="姓名"><el-input v-model="userForm.name" /></el-form-item>
@@ -189,6 +197,7 @@
       </template>
     </el-dialog>
 
+    <!-- 用户角色分配弹窗。 -->
     <el-dialog v-model="assignDialogVisible" title="分配角色" width="520px">
       <el-form label-position="top">
         <el-form-item label="选择角色">
@@ -203,6 +212,7 @@
       </template>
     </el-dialog>
 
+    <!-- 新增/编辑角色弹窗。编辑时不允许修改角色编码。 -->
     <el-dialog v-model="roleDialogVisible" :title="editingRole ? '编辑角色' : '新增角色'" width="520px">
       <el-form :model="roleForm" label-position="top">
         <el-form-item label="角色名称"><el-input v-model="roleForm.name" /></el-form-item>
@@ -254,7 +264,9 @@ import {
   type SystemUser,
 } from '@/api/system'
 import { useAuthStore } from '@/stores/auth'
+import { formatBeijingDateTime } from '@/utils/time'
 
+// 用户表格使用的前端展示结构。
 interface UserRow {
   id: number
   name: string
@@ -265,6 +277,7 @@ interface UserRow {
   roleIds: number[]
 }
 
+// 角色表格使用的前端展示结构。
 interface RoleRow {
   id: number
   code: string
@@ -278,12 +291,15 @@ const route = useRoute()
 const router = useRouter()
 const authStore = useAuthStore()
 
+// 当前激活 Tab 和日志筛选条件。
 const activeTab = ref('')
 const level = ref('')
 const module = ref('')
 const category = ref('')
 const logKeyword = ref('')
 const userKeyword = ref('')
+
+// 弹窗显隐和当前编辑对象。
 const userDialogVisible = ref(false)
 const assignDialogVisible = ref(false)
 const roleDialogVisible = ref(false)
@@ -291,17 +307,25 @@ const editingUser = ref<UserRow | null>(null)
 const assigningUser = ref<UserRow | null>(null)
 const editingRole = ref<RoleRow | null>(null)
 const assignedRoleCodes = ref<string[]>([])
+
+// 菜单管理：当前选中的角色和已勾选菜单 key。
 const selectedMenuRole = ref('admin')
 const checkedMenuKeys = ref<string[]>([])
+
+// 后端数据：日志、菜单树、菜单 key 到 id 的映射。
 const logs = ref<SystemLog[]>([])
 const menus = ref<SystemMenu[]>([])
 const menuKeyIdMap = ref<Record<string, number>>({})
 
+// 用户和角色表格数据。
 const userRows = ref<UserRow[]>([])
 const roleRows = ref<RoleRow[]>([])
+
+// 用户/角色弹窗表单。
 const userForm = reactive({ name: '', account: '', status: '启用' })
 const roleForm = reactive({ name: '', code: '', desc: '', status: '启用' })
 
+// Tab 和路由保持同步，方便直接访问 /system/users 等子路径。
 const tabRoutes: Record<string, string> = {
   users: '/system/users',
   roles: '/system/roles',
@@ -309,13 +333,17 @@ const tabRoutes: Record<string, string> = {
   logs: '/system/log',
 }
 
+// 菜单树拆成普通业务菜单和系统管理子菜单，便于勾选展示。
 const businessMenuOptions = computed(() => menus.value.filter((item) => !item.children?.length))
 const systemMenuOptions = computed(() => menus.value.find((item) => item.key === 'system')?.children ?? [])
 
+// 当前用户是否有对应系统管理子模块权限。
 const canUserManage = computed(() => authStore.canViewMenu('system:user'))
 const canRoleManage = computed(() => authStore.canViewMenu('system:role'))
 const canMenuManage = computed(() => authStore.canViewMenu('system:menu'))
 const canLogView = computed(() => authStore.canViewMenu('system:log'))
+
+// 当前用户实际可访问的 Tab，用于路由兜底选择。
 const accessibleTabs = computed(() =>
   [
     { name: 'users', visible: canUserManage.value },
@@ -324,12 +352,17 @@ const accessibleTabs = computed(() =>
     { name: 'logs', visible: canLogView.value },
   ].filter((item) => item.visible),
 )
+
 const selectedMenuRoleName = computed(() => roleRows.value.find((item) => item.code === selectedMenuRole.value)?.name)
+
+// 用户搜索在前端本地完成。
 const filteredUsers = computed(() => {
   const keyword = userKeyword.value.trim().toLowerCase()
   if (!keyword) return userRows.value
   return userRows.value.filter((item) => `${item.name}${item.account}`.toLowerCase().includes(keyword))
 })
+
+// 日志级别到标签颜色的映射。
 const logLevelTagType = (logLevel?: string) => {
   if (logLevel === 'CRITICAL') return 'danger'
   if (logLevel === 'ERROR') return 'danger'
@@ -337,6 +370,7 @@ const logLevelTagType = (logLevel?: string) => {
   return 'info'
 }
 
+// 日志类别后端值到中文文案的映射。
 const logCategoryLabel = (value?: string) => ({
   audit: '审计',
   training: '训练',
@@ -344,6 +378,7 @@ const logCategoryLabel = (value?: string) => ({
   application: '应用',
 }[value ?? ''] ?? value ?? '-')
 
+// 日志模块/资源后端值到中文文案的映射。
 const logModuleLabel = (value?: string) => ({
   training: '训练任务',
   dataset: '数据集',
@@ -354,22 +389,26 @@ const logModuleLabel = (value?: string) => ({
   'app.exception': '应用异常',
 }[value ?? ''] ?? value ?? '-')
 
+// 将角色编码列表格式化为中文角色名。
 const formatRoleNames = (roleCodes: string[]) =>
   roleCodes.map((roleCode) => roleRows.value.find((role) => role.code === roleCode)?.name ?? roleCode).join('、')
 
+// 前端中文启用/禁用与后端 active/disabled 的转换。
 const statusToLabel = (status: string) => (status === 'active' ? '启用' : '禁用')
 const labelToStatus = (status: string) => (status === '启用' ? 'active' : 'disabled')
 
+// 将后端用户对象映射为表格行。
 const mapUser = (user: SystemUser): UserRow => ({
   id: user.id,
   name: user.real_name ?? user.username,
   account: user.username,
   status: statusToLabel(user.status),
-  lastLogin: user.last_login_at?.replace('T', ' ').slice(0, 16) ?? '-',
+  lastLogin: formatBeijingDateTime(user.last_login_at).slice(0, 16),
   roleCodes: user.roles.map((role) => role.name),
   roleIds: user.roles.map((role) => role.id),
 })
 
+// 将后端角色对象映射为表格行。
 const mapRole = (role: SystemRole): RoleRow => ({
   id: role.id,
   code: role.name,
@@ -379,6 +418,7 @@ const mapRole = (role: SystemRole): RoleRow => ({
   status: statusToLabel(role.status),
 })
 
+// 遍历菜单树，建立 menu key 到后端 menu id 的映射，保存角色菜单时会用到。
 const collectMenuIds = (items: SystemMenu[]) => {
   const result: Record<string, number> = {}
   const walk = (menu: SystemMenu) => {
@@ -389,6 +429,7 @@ const collectMenuIds = (items: SystemMenu[]) => {
   return result
 }
 
+// 加载系统管理所需的用户、角色、菜单和日志数据。
 const loadSystemData = async () => {
   const [usersPage, rolesPage, menuTree] = await Promise.all([
     listUsers({ page: 1, page_size: 100 }),
@@ -407,6 +448,7 @@ const loadSystemData = async () => {
   await selectMenuRole(selectedMenuRole.value)
 }
 
+// 按当前筛选条件加载系统日志。
 const loadLogs = async () => {
   const logsPage = await listLogs({
     page: 1,
@@ -419,12 +461,14 @@ const loadLogs = async () => {
   logs.value = logsPage.data
 }
 
+// 重置用户表单。
 const resetUserForm = () => {
   userForm.name = ''
   userForm.account = ''
   userForm.status = '启用'
 }
 
+// 打开新增/编辑用户弹窗。
 const openUserDialog = (row?: UserRow) => {
   editingUser.value = row ?? null
   if (row) {
@@ -437,6 +481,7 @@ const openUserDialog = (row?: UserRow) => {
   userDialogVisible.value = true
 }
 
+// 保存用户信息。新增用户使用默认密码 123456。
 const saveUser = async () => {
   if (!userForm.name || !userForm.account) {
     ElMessage.warning('请填写姓名和账号')
@@ -464,12 +509,14 @@ const saveUser = async () => {
   ElMessage.success('用户信息已保存')
 }
 
+// 打开角色分配弹窗。
 const openAssignDialog = (row: UserRow) => {
   assigningUser.value = row
   assignedRoleCodes.value = [...row.roleCodes]
   assignDialogVisible.value = true
 }
 
+// 保存用户角色分配，前端用 role code 选择，提交时转换为 role id。
 const saveAssignedRoles = async () => {
   if (!assigningUser.value) return
   const roleIds = assignedRoleCodes.value
@@ -481,11 +528,13 @@ const saveAssignedRoles = async () => {
   ElMessage.success('用户角色已分配')
 }
 
+// 启用/禁用用户。
 const toggleUserStatus = async (row: UserRow) => {
   await updateUserStatus(row.id, row.status === '启用' ? 'disabled' : 'active')
   await loadSystemData()
 }
 
+// 删除用户。
 const deleteUser = async (row: UserRow) => {
   await ElMessageBox.confirm(`确认删除用户 ${row.name}？`, '删除用户', { type: 'warning' })
   await deleteUserApi(row.id)
@@ -493,6 +542,7 @@ const deleteUser = async (row: UserRow) => {
   ElMessage.success('用户已删除')
 }
 
+// 打开新增/编辑角色弹窗。
 const openRoleDialog = (row?: RoleRow) => {
   editingRole.value = row ?? null
   roleForm.name = row?.name ?? ''
@@ -502,6 +552,7 @@ const openRoleDialog = (row?: RoleRow) => {
   roleDialogVisible.value = true
 }
 
+// 保存角色信息。角色菜单权限不在这里保存。
 const saveRole = async () => {
   if (!roleForm.name || !roleForm.code) {
     ElMessage.warning('请填写角色名称和编码')
@@ -518,11 +569,13 @@ const saveRole = async () => {
   ElMessage.success('角色信息已保存')
 }
 
+// 启用/禁用角色。
 const toggleRoleStatus = async (row: RoleRow) => {
   await updateRoleStatus(row.id, row.status === '启用' ? 'disabled' : 'active')
   await loadSystemData()
 }
 
+// 删除角色。
 const deleteRole = async (row: RoleRow) => {
   await ElMessageBox.confirm(`确认删除角色 ${row.name}？`, '删除角色', { type: 'warning' })
   await deleteRoleApi(row.id)
@@ -530,6 +583,7 @@ const deleteRole = async (row: RoleRow) => {
   ElMessage.success('角色已删除')
 }
 
+// 选择角色后加载该角色已拥有的菜单。
 const selectMenuRole = async (roleCode: string) => {
   selectedMenuRole.value = roleCode
   const role = roleRows.value.find((item) => item.code === roleCode)
@@ -538,6 +592,7 @@ const selectMenuRole = async (roleCode: string) => {
   checkedMenuKeys.value = roleMenus.map((menu) => menu.key)
 }
 
+// 保存角色菜单可见性，并同步更新 authStore 中的前端权限映射。
 const saveMenuVisibility = async () => {
   const role = roleRows.value.find((item) => item.code === selectedMenuRole.value)
   if (!role) return
@@ -549,6 +604,7 @@ const saveMenuVisibility = async () => {
   ElMessage.success(`${selectedMenuRoleName.value} 的菜单可见性已保存`)
 }
 
+// Tab 切换时同步路由地址。
 const handleTabChange = (name: string | number) => {
   const tabName = String(name)
   if (tabRoutes[tabName] && route.path !== tabRoutes[tabName]) {
@@ -556,6 +612,7 @@ const handleTabChange = (name: string | number) => {
   }
 }
 
+// 导出当前筛选条件下的日志 CSV。
 const handleExportLogs = async () => {
   const blob = await exportLogs({
     keyword: logKeyword.value,
@@ -572,6 +629,7 @@ const handleExportLogs = async () => {
   ElMessage.success('日志 CSV 已开始下载')
 }
 
+// 根据路由 meta.systemTab 和当前用户权限，决定默认打开哪个 Tab。
 watch(
   () => [route.meta.systemTab, accessibleTabs.value.map((item) => item.name).join(',')],
   () => {
@@ -582,6 +640,7 @@ watch(
   { immediate: true },
 )
 
+// 菜单管理中切换角色时，自动加载该角色菜单。
 watch(
   selectedMenuRole,
   (roleCode) => {
@@ -590,6 +649,7 @@ watch(
   { immediate: true },
 )
 
+// 日志筛选条件变化时自动刷新日志。
 watch(
   [level, module, category],
   () => {
@@ -602,6 +662,7 @@ watch(
 )
 
 onMounted(() => {
+  // 页面进入时加载系统管理基础数据。
   loadSystemData().catch((error) => {
     ElMessage.error(error instanceof Error ? error.message : '系统数据加载失败')
   })

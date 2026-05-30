@@ -141,6 +141,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Download, Management, Promotion } from '@element-plus/icons-vue'
 import { chatGenerate, createDraft, deleteDraft, getDraft, listDocumentModels, listDrafts } from '@/api/documents'
 import type { Draft } from '@/api/documents'
+import { formatBeijingMonthDayTime } from '@/utils/time'
 
 interface Message {
   id: number
@@ -277,10 +278,7 @@ const renderContent = (text: string) => {
 }
 
 const formatTime = (iso: string) => {
-  try {
-    const d = new Date(iso)
-    return d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
-  } catch { return iso }
+  return formatBeijingMonthDayTime(iso, iso)
 }
 
 // ---- conversation management ----
@@ -372,7 +370,7 @@ const saveDraftMsg = async (msg: Message) => {
   const content = msg.content.startsWith('#') ? msg.content : `# ${title}\n\n${msg.content}`
   await createDraft({
     model_code: selectedModel.value.id,
-    doc_type: '对话草稿',
+    doc_type: 'summary',
     title,
     content,
   })

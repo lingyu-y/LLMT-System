@@ -14,7 +14,7 @@
 
     <div class="card">
       <div class="card-body">
-        <el-tabs v-model="activeTab">
+        <el-tabs v-model="activeTab" @tab-change="handleTabChange">
           <!-- 任务列表 -->
           <el-tab-pane label="任务列表" name="list">
             <div class="tab-toolbar">
@@ -52,10 +52,10 @@
             </el-table>
           </el-tab-pane>
 
-          <!-- 任务配置 -->
+          <!-- 任务配置：模型、联邦策略和差分隐私三块并排展示，减少创建区空白。 -->
           <el-tab-pane label="创建任务" name="create">
-            <div class="grid-2">
-              <div class="card">
+            <div class="create-config-row">
+              <div class="card config-panel">
                 <div class="card-header"><h3 class="card-title">模型配置</h3></div>
                 <div class="card-body">
                   <el-form label-position="top">
@@ -84,7 +84,7 @@
                 </div>
               </div>
 
-              <div class="card">
+              <div class="card config-panel">
                 <div class="card-header"><h3 class="card-title">联邦配置</h3></div>
                 <div class="card-body">
                   <el-form label-position="top">
@@ -113,25 +113,20 @@
                   </el-form>
                 </div>
               </div>
-            </div>
 
-            <!-- 差分隐私配置 -->
-            <div class="card" style="margin-top: 18px">
-              <div class="card-header">
-                <h3 class="card-title">差分隐私配置</h3>
-                <el-switch v-model="form.enable_dp" />
-              </div>
-              <div class="card-body" v-if="form.enable_dp">
-                <div class="grid-2">
+              <div class="card config-panel">
+                <div class="card-header">
+                  <h3 class="card-title">差分隐私配置</h3>
+                  <el-switch v-model="form.enable_dp" />
+                </div>
+                <div class="card-body dp-config-body" v-if="form.enable_dp">
                   <el-form label-position="top">
                     <el-form-item label="隐私预算 ε">
-                      <el-slider v-model="form.dp_epsilon" :min="0.1" :max="100" :step="0.1" show-input />
+                      <el-input-number v-model="form.dp_epsilon" :min="0.1" :max="100" :step="0.1" :precision="1" />
                     </el-form-item>
                     <el-form-item label="噪声乘数">
-                      <el-slider v-model="form.dp_noise_multiplier" :min="0.1" :max="5" :step="0.1" show-input />
+                      <el-input-number v-model="form.dp_noise_multiplier" :min="0.1" :max="5" :step="0.1" :precision="1" />
                     </el-form-item>
-                  </el-form>
-                  <el-form label-position="top">
                     <el-form-item label="隐私保证 δ">
                       <el-input-number v-model="form.dp_delta" :min="0" :max="1" :step="1e-6" :precision="7" />
                     </el-form-item>
@@ -139,10 +134,13 @@
                       <el-input-number v-model="form.dp_max_grad_norm" :min="0.1" :step="0.1" :precision="1" />
                     </el-form-item>
                   </el-form>
+                  <div class="dp-note">
+                    <strong>隐私保证说明：</strong>ε 越小隐私保护越强但模型精度越低；噪声乘数越大隐私保护越强但收敛越慢。
+                    当前配置下，每轮训练消耗约 ε ≈ {{ dpPerRoundEstimate }} 的隐私预算。
+                  </div>
                 </div>
-                <div class="dp-note">
-                  <strong>隐私保证说明：</strong>ε 越小隐私保护越强但模型精度越低；噪声乘数越大隐私保护越强但收敛越慢。
-                  当前配置下，每轮训练消耗约 ε ≈ {{ dpPerRoundEstimate }} 的隐私预算。
+                <div class="card-body dp-disabled" v-else>
+                  差分隐私未启用，参与方本地训练不会额外执行梯度裁剪和噪声注入。
                 </div>
               </div>
             </div>
@@ -218,42 +216,45 @@
                     动态加入
                   </el-button>
                 </div>
-                <div class="card-body">
-                  <el-table :data="selectedTask.participants || []" stripe>
-                    <el-table-column prop="participant_id" label="ID" width="120" />
-                    <el-table-column prop="name" label="名称" width="140" />
-                    <el-table-column label="数据集" width="140">
+                <div class="card-body participant-table-body">
+                  <div class="participant-table-wrap">
+                  <el-table :data="selectedTask.participants || []" stripe class="participant-table">
+                    <el-table-column prop="participant_id" label="ID" min-width="120" show-overflow-tooltip />
+                    <el-table-column prop="name" label="名称" min-width="120" show-overflow-tooltip />
+                    <el-table-column label="数据集" min-width="130" show-overflow-tooltip>
                       <template #default="{ row }">{{ row.dataset_name ?? (row.dataset_id ? `#${row.dataset_id}` : '-') }}</template>
                     </el-table-column>
-                    <el-table-column label="数据量" width="100">
+                    <el-table-column label="数据量" min-width="96" align="right">
                       <template #default="{ row }">{{ row.data_size?.toLocaleString() }}</template>
                     </el-table-column>
-                    <el-table-column prop="weight" label="权重" width="80" />
-                    <el-table-column label="状态" width="100">
+                    <el-table-column prop="weight" label="权重" min-width="72" align="right" />
+                    <el-table-column label="状态" min-width="88" align="center">
                       <template #default="{ row }">
                         <StatusBadge :label="row.status === 'active' ? '活跃' : row.status === 'malicious' ? '异常' : '离线'" :type="row.status === 'active' ? 'success' : row.status === 'malicious' ? 'danger' : 'info'" />
                       </template>
                     </el-table-column>
-                    <el-table-column label="最近轮次" width="100">
+                    <el-table-column label="最近轮次" min-width="88" align="right">
                       <template #default="{ row }">{{ row.last_round_completed ?? '-' }}</template>
                     </el-table-column>
-                    <el-table-column label="最近Loss" width="100">
+                    <el-table-column label="最近Loss" min-width="92" align="right">
                       <template #default="{ row }">{{ row.last_loss?.toFixed(4) ?? '-' }}</template>
                     </el-table-column>
-                    <el-table-column label="异常分数" width="100">
+                    <el-table-column label="异常分数" min-width="88" align="right">
                       <template #default="{ row }">{{ row.anomaly_score?.toFixed(2) ?? '-' }}</template>
                     </el-table-column>
-                    <el-table-column label="操作" width="100">
+                    <el-table-column label="操作" width="76" fixed="right" align="center">
                       <template #default="{ row }">
                         <el-button size="small" type="danger" text :disabled="row.status === 'inactive'" @click="handleRemoveParticipant(row)">移除</el-button>
                       </template>
                     </el-table-column>
                   </el-table>
+                  </div>
+                  <el-empty v-if="(selectedTask.participants || []).length === 0" description="暂无参与方状态" />
                 </div>
               </div>
 
               <!-- 训练指标图表 -->
-              <div class="card" style="margin-top: 18px">
+              <!-- <div class="card" style="margin-top: 18px">
                 <div class="card-header"><h3 class="card-title">训练指标</h3></div>
                 <div class="card-body">
                   <div class="metrics-grid">
@@ -270,19 +271,21 @@
                       </div>
                     </div>
                   </div>
+                  <el-empty v-if="metricCharts.length === 0" description="暂无训练指标" />
                 </div>
-              </div>
+              </div> -->
 
               <!-- 训练日志 -->
               <div class="card" style="margin-top: 18px">
                 <div class="card-header"><h3 class="card-title">训练日志</h3></div>
                 <div class="card-body">
                   <div class="log-container">
-                    <div v-for="(log, i) in trainingLogs" :key="i" class="log-entry" :class="log.level.toLowerCase()">
+                    <div v-for="(log, i) in trainingLogs" :key="i" class="log-entry" :class="(log.level || 'info').toLowerCase()">
                       <span class="log-time">{{ formatTime(log.timestamp) }}</span>
-                      <span class="log-level">{{ log.level }}</span>
+                      <span class="log-level">{{ log.level || 'INFO' }}</span>
                       <span class="log-msg">{{ log.message }}</span>
                     </div>
+                    <el-empty v-if="trainingLogs.length === 0" description="暂无训练日志" />
                   </div>
                 </div>
               </div>
@@ -369,6 +372,7 @@ import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
 import StatusBadge from '@/components/StatusBadge.vue'
+import { formatBeijingTime } from '@/utils/time'
 import {
   type CreateFederatedTask,
   type DatasetOption,
@@ -389,24 +393,34 @@ import {
 } from '@/api/federated'
 
 // State
+// 当前 Tab：list/create/monitor/guide。
 const activeTab = ref('list')
 const loading = ref(false)
+
+// 任务列表和当前正在查看的任务详情。
 const tasks = ref<FederatedTaskListItem[]>([])
 const selectedTask = ref<FederatedTask | null>(null)
+
+// 弹窗状态。
 const showCreateDialog = ref(false)
 const showAddParticipantDialog = ref(false)
-const trainingLogs = ref<{ timestamp: string; level: string; message: string }[]>([])
+
+// 训练监控页日志与轮询定时器。
+const trainingLogs = ref<{ timestamp: string | number; level: string; message: string }[]>([])
 const logPollTimer = ref<ReturnType<typeof setInterval> | null>(null)
+
+// 创建任务/动态加入参与方时可选的数据集。
 const datasetOptions = ref<DatasetOption[]>([])
 
 // Form
+// 完整创建表单，提交时会直接传给 createFederatedTask。
 const form = reactive<CreateFederatedTask & { min_participants: number; max_rounds_no_improve: number; fedprox_mu: number; anomaly_threshold: number; auto_remove_malicious: boolean; checkpoint_dir: string; save_every_n_rounds: number }>({
   task_name: '多医院协作医疗模型训练',
   description: '联邦学习分布式协作训练任务',
   model_type: 'gpt2',
-  vocab_size: 32000,
-  tokenizer_type: 'sentencepiece',
-  tokenizer_path: 'tokenizers/industry_spm.model',
+  vocab_size: 50257,
+  tokenizer_type: 'gpt2',
+  tokenizer_path: '',
   hidden_size: 256,
   num_layers: 4,
   num_attention_heads: 4,
@@ -433,6 +447,7 @@ const form = reactive<CreateFederatedTask & { min_participants: number; max_roun
   ],
 })
 
+// 快速创建表单：只收集关键参数，提交时自动生成参与方列表和默认模型配置。
 const quickForm = reactive({
   task_name: '联邦协作训练任务',
   num_participants: 2,
@@ -441,6 +456,7 @@ const quickForm = reactive({
   enable_dp: true,
 })
 
+// 动态加入参与方表单。
 const newParticipant = reactive<ParticipantConfig>({
   participant_id: '',
   name: '',
@@ -453,6 +469,7 @@ const newParticipant = reactive<ParticipantConfig>({
 })
 
 // Computed
+// 顶部统计卡片，基于当前任务列表即时计算。
 const statsData = computed(() => [
   { label: '运行任务', value: String(tasks.value.filter(t => t.status === 'running').length) },
   { label: '总任务数', value: String(tasks.value.length) },
@@ -460,6 +477,7 @@ const statsData = computed(() => [
   { label: '差分隐私', value: tasks.value.some(t => t.enable_dp) ? '已启用' : '未启用' },
 ])
 
+// 训练监控页摘要指标。
 const monitorItems = computed(() => {
   if (!selectedTask.value) return []
   const t = selectedTask.value
@@ -472,6 +490,7 @@ const monitorItems = computed(() => {
   ]
 })
 
+// 前端估算每轮隐私预算消耗，仅用于提示，最终以训练后端计算为准。
 const dpPerRoundEstimate = computed(() => {
   if (!form.enable_dp) return 0
   const n = form.dp_noise_multiplier
@@ -479,25 +498,50 @@ const dpPerRoundEstimate = computed(() => {
   return Math.sqrt(2 * Math.log(1.25 / form.dp_delta)) / n
 })
 
+// 训练指标图表数据，目前从 result_json.round_results 中提取每轮 Loss。
 const metricCharts = computed(() => {
   if (!selectedTask.value?.result_json) return []
-  const rounds = (selectedTask.value.result_json as Record<string, unknown>).round_results as Array<Record<string, unknown>> ?? []
+  const metrics = selectedTask.value.result_json as Record<string, unknown>
+  const rounds = (metrics.round_results ?? metrics.rounds ?? []) as Array<Record<string, unknown>>
   if (rounds.length === 0) return []
-  const maxLoss = Math.max(...rounds.map((r: Record<string, unknown>) => (r.round_loss as number) ?? 0))
+  const losses = rounds.map((r: Record<string, unknown>) => Number(r.round_loss ?? r.loss ?? 0))
+  const maxLoss = Math.max(...losses, 0.0001)
 
   return [
     {
       title: '每轮训练 Loss',
       color: '#3b82f6',
-      values: rounds.map((r: Record<string, unknown>) => ({
-        value: ((r.round_loss as number) ?? 0).toFixed(4),
-        percent: Math.round(((r.round_loss as number) ?? 0) / maxLoss * 100),
+      values: losses.map(loss => ({
+        value: loss.toFixed(4),
+        percent: Math.round(loss / maxLoss * 100),
       })),
     },
   ]
 })
 
+const normalizeTaskDetail = (payload: unknown): FederatedTask | null => {
+  if (!payload || typeof payload !== 'object') return null
+  const obj = payload as { data?: unknown; id?: unknown }
+  const data = obj.data && typeof obj.data === 'object' ? obj.data : obj
+  return typeof (data as { id?: unknown }).id === 'number' ? data as FederatedTask : null
+}
+
+const normalizeMetrics = (payload: unknown): Record<string, unknown> | null => {
+  if (!payload || typeof payload !== 'object') return null
+  const obj = payload as { data?: unknown }
+  const data = obj.data && typeof obj.data === 'object' ? obj.data : obj
+  return data as Record<string, unknown>
+}
+
+const normalizeLogs = (payload: unknown): { timestamp: string | number; level: string; message: string }[] => {
+  if (!payload || typeof payload !== 'object') return []
+  const obj = payload as { data?: unknown; logs?: unknown }
+  const data = obj.data && typeof obj.data === 'object' ? obj.data as { logs?: unknown } : obj
+  return Array.isArray(data.logs) ? data.logs as { timestamp: string | number; level: string; message: string }[] : []
+}
+
 // Flow steps
+// 静态流程说明，用于“流程说明” Tab。
 const flowSteps = [
   { title: '创建全局模型', desc: '在内存中创建全局模型，耗时5至15秒，写入共享内存' },
   { title: '分发模型参数', desc: '主进程向各模拟参与方分发模型参数，通过共享内存传递' },
@@ -510,18 +554,50 @@ const flowSteps = [
 ]
 
 // Methods
+// 切换到非监控页时停止轮询，避免监控页异步刷新影响任务列表展示。
+const handleTabChange = (name: string | number) => {
+  if (name !== 'monitor') {
+    stopLogPolling()
+  }
+  if (name === 'list') {
+    selectedTask.value = null
+    trainingLogs.value = []
+    loadTasks()
+  }
+}
+
+// 列表项只有摘要字段，先补齐详情页需要的默认结构，避免接口返回前页面空白。
+const buildMonitorTask = (task: FederatedTaskListItem): FederatedTask => ({
+  ...task,
+  description: '',
+  model_config_json: {},
+  convergence_threshold: 0,
+  dp_epsilon: 0,
+  dp_delta: 0,
+  dp_noise_multiplier: 0,
+  dp_max_grad_norm: 0,
+  config_json: {},
+  result_json: undefined,
+  participants: [],
+})
+
+// 加载联邦学习任务列表。
 const loadTasks = async () => {
   loading.value = true
   try {
     const res = await fetchFederatedTasks()
-    tasks.value = res.data ?? []
+    const page = 'data' in res && Array.isArray(res.data)
+      ? res
+      : ((res as unknown as { data?: { data?: FederatedTaskListItem[] } }).data ?? null)
+    tasks.value = Array.isArray(page?.data) ? page.data : []
   } catch {
-    tasks.value = []
+    ElMessage.error('任务列表加载失败')
   } finally {
     loading.value = false
   }
 }
 
+// 使用完整表单创建联邦学习任务。
 const handleCreate = async () => {
   try {
     await createFederatedTask(form)
@@ -533,6 +609,7 @@ const handleCreate = async () => {
   }
 }
 
+// 快速创建：根据参与方数量自动生成参与方配置，再调用创建接口。
 const handleQuickCreate = async () => {
   const participants: ParticipantConfig[] = []
   for (let i = 0; i < quickForm.num_participants; i++) {
@@ -551,9 +628,9 @@ const handleQuickCreate = async () => {
   const body: CreateFederatedTask = {
     task_name: quickForm.task_name,
     model_type: 'gpt2',
-    vocab_size: 32000,
-    tokenizer_type: 'sentencepiece',
-    tokenizer_path: 'tokenizers/industry_spm.model',
+    vocab_size: 50257,
+    tokenizer_type: 'gpt2',
+    tokenizer_path: '',
     hidden_size: 384,
     num_layers: 6,
     num_attention_heads: 6,
@@ -587,6 +664,7 @@ const handleQuickCreate = async () => {
   }
 }
 
+// 启动已创建的联邦任务。
 const handleStart = async (task: FederatedTaskListItem) => {
   try {
     await startFederatedTask(task.id)
@@ -597,6 +675,7 @@ const handleStart = async (task: FederatedTaskListItem) => {
   }
 }
 
+// 删除联邦任务。运行中的任务不可删除，页面按钮已做禁用。
 const handleDelete = async (task: FederatedTaskListItem) => {
   try {
     await ElMessageBox.confirm(
@@ -606,7 +685,7 @@ const handleDelete = async (task: FederatedTaskListItem) => {
     )
     await deleteFederatedTask(task.id)
     ElMessage.success(`任务 ${task.task_code} 已删除`)
-    // If the deleted task was being viewed, close the detail
+    // 如果当前正在查看被删除任务，退出监控页。
     if (selectedTask.value?.id === task.id) {
       selectedTask.value = null
       activeTab.value = 'list'
@@ -619,6 +698,7 @@ const handleDelete = async (task: FederatedTaskListItem) => {
   }
 }
 
+// 取消运行中的联邦任务。
 const handleCancel = async (task: FederatedTaskListItem) => {
   try {
     await cancelFederatedTask(task.id)
@@ -629,6 +709,7 @@ const handleCancel = async (task: FederatedTaskListItem) => {
   }
 }
 
+// 停止日志轮询。
 const stopLogPolling = () => {
   if (logPollTimer.value) {
     clearInterval(logPollTimer.value)
@@ -636,95 +717,93 @@ const stopLogPolling = () => {
   }
 }
 
+// 轮询训练日志和任务详情；任务结束后停止轮询。
 const pollLogs = async (taskId: number) => {
-  try {
-    const logsRes = await fetchFederatedLogs(taskId)
-    if (logsRes.data) {
-      trainingLogs.value = (logsRes.data as { logs: { timestamp: string; level: string; message: string }[] }).logs ?? []
+  const [logsResult, detailResult] = await Promise.allSettled([
+    fetchFederatedLogs(taskId),
+    fetchFederatedTask(taskId),
+  ])
+
+  if (logsResult.status === 'fulfilled') {
+    trainingLogs.value = normalizeLogs(logsResult.value)
+  }
+  if (detailResult.status === 'fulfilled') {
+    const t = normalizeTaskDetail(detailResult.value)
+    if (t) selectedTask.value = { ...selectedTask.value, ...t }
+    if (t && (t.status === 'completed' || t.status === 'failed' || t.status === 'cancelled')) {
+      stopLogPolling()
     }
-    // Refresh task detail to get latest status
-    const detailRes = await fetchFederatedTask(taskId)
-    if (detailRes.data) {
-      const t = detailRes.data as FederatedTask
-      selectedTask.value = { ...selectedTask.value, ...t }
-      // Stop polling when task finishes
-      if (t.status === 'completed' || t.status === 'failed' || t.status === 'cancelled') {
-        stopLogPolling()
-      }
-    }
-  } catch {
-    // ignore polling errors
   }
 }
 
+// 打开任务详情：并发加载详情、指标、日志，运行中任务开启轮询。
 const openDetail = async (task: FederatedTaskListItem) => {
   stopLogPolling()
-  selectedTask.value = task as unknown as FederatedTask
+  trainingLogs.value = []
+  selectedTask.value = buildMonitorTask(task)
   activeTab.value = 'monitor'
-  try {
-    const [detailRes, metricsRes, logsRes] = await Promise.all([
-      fetchFederatedTask(task.id),
-      fetchFederatedMetrics(task.id),
-      fetchFederatedLogs(task.id),
-    ])
-    if (detailRes.data) {
-      selectedTask.value = detailRes.data as FederatedTask
-    }
-    if (metricsRes.data) {
-      selectedTask.value = { ...(selectedTask.value as FederatedTask), result_json: metricsRes.data as Record<string, unknown> }
-    }
-    if (logsRes.data) {
-      trainingLogs.value = (logsRes.data as { logs: { timestamp: string; level: string; message: string }[] }).logs ?? []
-    }
-    // Start polling if task is still running
-    const t = selectedTask.value as FederatedTask | null
-    if (t && (t.status === 'running' || t.status === 'created' || t.status === 'initializing')) {
-      logPollTimer.value = setInterval(() => pollLogs(task.id), 3000)
-    }
-  } catch {
-    // ignore
+
+  const [detailResult, metricsResult, logsResult] = await Promise.allSettled([
+    fetchFederatedTask(task.id),
+    fetchFederatedMetrics(task.id),
+    fetchFederatedLogs(task.id),
+  ])
+
+  if (detailResult.status === 'fulfilled') {
+    selectedTask.value = normalizeTaskDetail(detailResult.value) ?? selectedTask.value
+  }
+  if (metricsResult.status === 'fulfilled') {
+    selectedTask.value = { ...(selectedTask.value as FederatedTask), result_json: normalizeMetrics(metricsResult.value) ?? {} }
+  }
+  if (logsResult.status === 'fulfilled') {
+    trainingLogs.value = normalizeLogs(logsResult.value)
+  }
+
+  const t = selectedTask.value as FederatedTask | null
+  if (activeTab.value === 'monitor' && t && (t.status === 'running' || t.status === 'created' || t.status === 'initializing')) {
+    logPollTimer.value = setInterval(() => pollLogs(task.id), 3000)
   }
 }
 
+// 给运行中任务动态加入参与方。
 const handleAddParticipant = async () => {
   if (!selectedTask.value) return
   try {
     await addParticipant(selectedTask.value.id, newParticipant)
     ElMessage.success('参与方已加入')
     showAddParticipantDialog.value = false
-    // Re-fetch full task details so participant list is up to date
+    // 重新拉详情，保证参与方列表和状态同步。
     const detailRes = await fetchFederatedTask(selectedTask.value.id)
-    if (detailRes.data) {
-      selectedTask.value = detailRes.data as FederatedTask
-    }
+    selectedTask.value = detailRes
   } catch (e: unknown) {
     ElMessage.error((e as Error).message || '加入失败')
   }
 }
 
+// 移除参与方并刷新任务详情。
 const handleRemoveParticipant = async (participant: { participant_id: string }) => {
   if (!selectedTask.value) return
   try {
     await removeParticipant(selectedTask.value.id, participant.participant_id)
     ElMessage.success('参与方已移除')
-    // Re-fetch full task details so participant list is up to date
+    // 重新拉详情，保证参与方列表和状态同步。
     const detailRes = await fetchFederatedTask(selectedTask.value.id)
-    if (detailRes.data) {
-      selectedTask.value = detailRes.data as FederatedTask
-    }
+    selectedTask.value = detailRes
   } catch (e: unknown) {
     ElMessage.error((e as Error).message || '移除失败')
   }
 }
 
+// 选择数据集后，根据文件数粗略估算参与方数据量。
 const onDatasetSelect = (p: ParticipantConfig, datasetId: number | undefined) => {
   if (!datasetId) return
   const ds = datasetOptions.value.find(d => d.id === datasetId)
   if (ds && ds.file_count > 0 && p.data_size === 0) {
-    p.data_size = ds.file_count * 100  // rough estimate: file_count * 100 samples
+    p.data_size = ds.file_count * 100
   }
 }
 
+// 在创建表单中添加一行参与方。
 const addParticipantRow = () => {
   const idx = form.participants.length + 1
   form.participants.push({
@@ -739,51 +818,61 @@ const addParticipantRow = () => {
   })
 }
 
+// 重置部分创建表单字段。
 const resetForm = () => {
   form.participants = []
-  form.vocab_size = 32000
-  form.tokenizer_type = 'sentencepiece'
-  form.tokenizer_path = 'tokenizers/industry_spm.model'
+  form.vocab_size = 50257
+  form.tokenizer_type = 'gpt2'
+  form.tokenizer_path = ''
   form.num_rounds = 10
   form.aggregation_strategy = 'weighted_fedavg'
   form.enable_dp = true
 }
 
+// 聚合策略后端值到展示文案的映射。
 const strategyLabel = (s: string) => {
   const map: Record<string, string> = { fedavg: 'FedAvg', weighted_fedavg: '加权FedAvg', fedprox: 'FedProx' }
   return map[s] ?? s
 }
 
+// 任务状态后端值到中文文案的映射。
 const statusLabel = (s: string) => {
   const map: Record<string, string> = { created: '已创建', initializing: '初始化', running: '运行中', completed: '已完成', failed: '失败', cancelled: '已取消' }
   return map[s] ?? s
 }
 
+// 任务状态到状态标签颜色的映射。
 const statusType = (s: string): 'success' | 'warning' | 'danger' | 'info' => {
   const map: Record<string, 'success' | 'warning' | 'danger' | 'info'> = { created: 'info', initializing: 'warning', running: 'success', completed: 'success', failed: 'danger', cancelled: 'info' }
   return map[s] ?? 'info'
 }
 
-const formatTime = (ts: string) => {
-  if (!ts) return ''
-  return new Date(ts).toLocaleTimeString()
+// 训练日志时间按北京时间展示。
+const formatTime = (ts: string | number) => {
+  if (typeof ts === 'number') {
+    return formatBeijingTime(new Date(ts * 1000).toISOString())
+  }
+  return formatBeijingTime(ts)
 }
 
+// 加载联邦任务可选数据集。
 const loadDatasetOptions = async () => {
   try {
     const res = await fetchFederatedOptions()
-    datasetOptions.value = res.data?.datasets ?? []
+    datasetOptions.value = res.datasets ?? []
   } catch {
     datasetOptions.value = []
   }
 }
 
 onMounted(() => {
+  // 进入页面时加载任务列表和数据集选项。
   loadTasks()
   loadDatasetOptions()
 })
 
 onUnmounted(() => {
+  // 离开页面时停止日志轮询。
   stopLogPolling()
 })
 </script>
@@ -799,7 +888,7 @@ onUnmounted(() => {
   padding: 16px;
   border: 1px solid var(--border-color);
   border-radius: 8px;
-  background: var(--bg-color);
+  background: #fff;
 }
 
 .stat-tile span,
@@ -834,6 +923,37 @@ onUnmounted(() => {
   gap: 18px;
 }
 
+.create-config-row {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 18px;
+  align-items: stretch;
+}
+
+.config-panel {
+  min-width: 0;
+}
+
+.config-panel :deep(.el-form-item) {
+  margin-bottom: 14px;
+}
+
+.config-panel :deep(.el-input-number) {
+  width: 100%;
+}
+
+.dp-config-body {
+  display: flex;
+  min-height: calc(100% - 58px);
+  flex-direction: column;
+}
+
+.dp-disabled {
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
 .grid-4 {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -848,6 +968,7 @@ onUnmounted(() => {
 }
 
 .dp-note {
+  margin-top: auto;
   padding: 12px;
   border: 1px solid var(--border-color);
   border-radius: 8px;
@@ -888,6 +1009,24 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
+}
+
+.participant-table-body {
+  min-width: 0;
+}
+
+.participant-table-wrap {
+  width: 100%;
+  overflow-x: auto;
+}
+
+.participant-table {
+  width: 100%;
+  min-width: 900px;
+}
+
+.participant-table :deep(.el-table__cell) {
+  padding: 8px 0;
 }
 
 /* Flow steps */
@@ -1016,6 +1155,7 @@ onUnmounted(() => {
 }
 
 @media (max-width: 900px) {
+  .create-config-row,
   .grid-2,
   .grid-4,
   .grid-4.stats,
@@ -1026,6 +1166,7 @@ onUnmounted(() => {
 }
 
 @media (max-width: 640px) {
+  .create-config-row,
   .grid-2,
   .grid-4,
   .grid-4.stats,

@@ -325,10 +325,9 @@ def run_federated_task(self, task_code: str) -> dict:
         # Build config. Older queued tasks may not have tokenizer metadata.
         task_config = dict(task.config_json or {})
         if task_config.get("model_type", "gpt2") == "gpt2":
-            task_config["tokenizer_type"] = task_config.get("tokenizer_type") or "sentencepiece"
-            task_config["tokenizer_path"] = task_config.get("tokenizer_path") or "tokenizers/industry_spm.model"
-            if task_config["tokenizer_type"] == "sentencepiece":
-                task_config["vocab_size"] = 32000
+            task_config["tokenizer_type"] = "gpt2"
+            task_config["tokenizer_path"] = ""
+            task_config["vocab_size"] = 50257
         config = FederatedConfig(**task_config)
         if task_config != task.config_json:
             task.config_json = task_config

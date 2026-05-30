@@ -14,11 +14,13 @@
 
     <nav class="sidebar-nav">
       <div class="nav-section-title">主要功能</div>
+      <!-- 业务菜单会先按当前用户权限过滤，再渲染成路由链接。 -->
       <RouterLink v-for="item in businessMenus" :key="item.path" :to="item.path" class="nav-item">
         <el-icon><component :is="item.icon" /></el-icon>
         <span>{{ item.title }}</span>
       </RouterLink>
 
+      <!-- 系统管理需要拥有任意一个系统子菜单权限才展示入口。 -->
       <template v-if="systemMenu">
         <div class="nav-section-title nav-gap">系统管理</div>
         <RouterLink :to="systemMenu.path" class="nav-item">
@@ -28,6 +30,7 @@
       </template>
     </nav>
 
+    <!-- 底部展示当前登录用户，并提供退出登录入口。 -->
     <div class="sidebar-footer" v-if="currentUser">
       <div class="user-info">
         <div class="user-avatar">{{ userInitials }}</div>
@@ -58,10 +61,12 @@ interface MenuItem {
   title: string
   path: string
   icon?: Component
+  // permission 和路由 meta.menuKeys 使用同一套菜单权限编码。
   permission?: string
   children?: MenuItem[]
 }
 
+// 侧边栏菜单配置。这里负责展示入口，真正的页面访问限制还会在 router/index.ts 中校验。
 const menuItems: MenuItem[] = [
   { title: '仪表盘', path: '/dashboard', icon: Monitor, permission: 'dashboard' },
   { title: '数据处理', path: '/data-processing', icon: Files, permission: 'dataset' },
@@ -84,14 +89,25 @@ const menuItems: MenuItem[] = [
 
 const router = useRouter()
 const authStore = useAuthStore()
+
+// 当前用户信息来自 auth store，登录/刷新页面后由 localStorage 恢复。
 const currentUser = computed(() => authStore.user)
+
+// 头像文字取真实姓名前两个字符，没有用户时兜底显示“用户”。
 const userInitials = computed(() => currentUser.value?.realName.slice(0, 2).toUpperCase() ?? '用户')
+
+// 按当前用户可见权限过滤菜单树，隐藏无权访问的入口。
 const filteredMenus = computed(() => filterMenusByPermission(menuItems, authStore.visibleMenuKeys))
+
+// 普通业务菜单和系统管理菜单分开展示，方便在侧边栏中形成分组。
 const businessMenus = computed(() => filteredMenus.value.filter((item) => item.path !== '/system'))
+
+// 系统管理本身没有 permission，是否展示取决于是否拥有任意系统子权限。
 const systemMenu = computed(() =>
   authStore.hasAnyPermission(systemMenuKeys) ? filteredMenus.value.find((item) => item.path === '/system') : undefined,
 )
 
+// 退出前弹确认框；确认后清理登录态并跳回登录页。
 const handleLogout = async () => {
   try {
     await ElMessageBox.confirm('确认退出当前账号？', '退出登录', {
@@ -102,7 +118,7 @@ const handleLogout = async () => {
     authStore.logout()
     await router.push('/login')
   } catch {
-    // User cancelled logout.
+    // 用户取消退出时不做任何处理。
   }
 }
 </script>

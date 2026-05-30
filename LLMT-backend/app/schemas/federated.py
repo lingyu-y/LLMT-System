@@ -37,9 +37,9 @@ class FederatedTaskCreate(BaseModel):
 
     # Model config
     model_type: str = Field(default="gpt2", description="模型类型")
-    vocab_size: int = Field(default=32000)
-    tokenizer_type: Literal["gpt2", "sentencepiece"] = Field(default="sentencepiece")
-    tokenizer_path: str = Field(default="tokenizers/industry_spm.model")
+    vocab_size: int = Field(default=50257)
+    tokenizer_type: Literal["gpt2", "sentencepiece"] = Field(default="gpt2")
+    tokenizer_path: str = Field(default="")
     hidden_size: int = Field(default=256)
     num_layers: int = Field(default=4)
     num_attention_heads: int = Field(default=4)
